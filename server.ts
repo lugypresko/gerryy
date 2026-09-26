@@ -8,6 +8,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, Modality } from '@google/genai';
 
 const PORT = 3000;
+const JERRY_ENGINE_VERSION = 'jerry-conversation-v3-2026-09-26';
 const KEY_FILE = path.resolve(process.cwd(), '.api-key.json');
 const ALIGNMENT_LOG_FILE = path.resolve(process.cwd(), '.alignment-logs.json');
 const VOICE_LOG_FILE = path.resolve(process.cwd(), '.voice-logs.json');
@@ -962,6 +963,11 @@ CRITICAL RULES:
         }
 
         try {
+          console.info('[Jerry Engine]', {
+            engineVersion: JERRY_ENGINE_VERSION,
+            stage: 'forward-to-jerry-live',
+            transcript,
+          });
           liveSession?.sendRealtimeInput({ text: transcript });
         } catch (err) {
           console.warn('[Jerry STT] failed forwarding transcript to Jerry:', err);
@@ -991,14 +997,6 @@ CRITICAL RULES:
                   }),
                 );
               }
-            }
-
-            const inputTranscription =
-              serverContent?.inputTranscription?.text ||
-              serverContent?.input_transcription?.text ||
-              '';
-            if (inputTranscription) {
-              client.send(JSON.stringify({ type: 'input-transcript', text: inputTranscription }));
             }
 
             const transcription =
@@ -1050,7 +1048,14 @@ CRITICAL RULES:
       });
 
       if (client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify({ type: 'ready' }));
+        client.send(
+          JSON.stringify({
+            type: 'ready',
+            engine: 'gemini-3.8-live',
+            engineVersion: JERRY_ENGINE_VERSION,
+            inputPath: 'push-to-talk -> full-turn Gemini transcription -> text -> Jerry Live',
+          }),
+        );
       }
     } catch (err: any) {
       console.error('[Jerry Live] setup failed:', err);
