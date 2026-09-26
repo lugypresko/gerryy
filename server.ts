@@ -786,123 +786,138 @@ CRITICAL RULES:
     }
 
     let liveSession: any = null;
-    let transcribeSession: any = null;
-    let lastFinalGuestTranscript = '';
+    let guestPcmChunks: Buffer[] = [];
+    let isTranscribingGuest = false;
+
+    const pcm16ToWavBase64 = (pcm: Buffer, sampleRate = 16000) => {
+      const header = Buffer.alloc(44);
+      header.write('RIFF', 0);
+      header.writeUInt32LE(36 + pcm.length, 4);
+      header.write('WAVE', 8);
+      header.write('fmt ', 12);
+      header.writeUInt32LE(16, 16);
+      header.writeUInt16LE(1, 20);
+      header.writeUInt16LE(1, 22);
+      header.writeUInt32LE(sampleRate, 24);
+      header.writeUInt32LE(sampleRate * 2, 28);
+      header.writeUInt16LE(2, 32);
+      header.writeUInt16LE(16, 34);
+      header.write('data', 36);
+      header.writeUInt32LE(pcm.length, 40);
+      return Buffer.concat([header, pcm]).toString('base64');
+    };
 
     try {
       const ai = new GoogleGenAI({ apiKey: key });
 
-      // Dedicated Hebrew STT session. Do not let the conversational model guess
-      // the user's spoken language from raw audio.
-      transcribeSession = await ai.live.connect({
-        model: 'gemini-3.5-transcribe-live',
-        callbacks: {
-          onopen: () => {
-            console.info('[Jerry STT] Hebrew transcription session opened');
-          },
-          onmessage: (message: any) => {
-            if (client.readyState !== WebSocket.OPEN) return;
+      const transcribeGuestTurn = async () => {
+        if (isTranscribingGuest || guestPcmChunks.length === 0) return;
+        isTranscribingGuest = true;
 
-            const serverContent = message?.serverContent || message?.server_content;
+        const pcm = Buffer.concat(guestPcmChunks);
+        guestPcmChunks = [];
 
-            const interim =
-              serverContent?.interimInputTranscription?.text ||
-              serverContent?.interim_input_transcription?.text ||
-              '';
-            if (interim) {
-              client.send(JSON.stringify({ type: 'input-transcript-interim', text: interim }));
-            }
+        // Ignore accidental taps / near-empty turns.
+        if (pcm.length < 3200) {
+          isTranscribingGuest = false;
+          return;
+        }
 
-            const finalText =
-              serverContent?.inputTranscription?.text ||
-              serverContent?.input_transcription?.text ||
-              '';
+        const wavBase64 = pcm16ToWavBase64(pcm, 16000);
+        const models = ['models/gemini-3.8-flash', 'models/gemini-2.5-flash'];
+        let transcript = '';
 
-            if (finalText && finalText.trim()) {
-              const transcript = finalText.trim();
-
-              // Hebrew is a hint in the transcription API, not a hard lock.
-              // Reject obviously foreign-language hallucinations instead of
-              // letting Jerry follow them into German/Korean/etc.
-              const hebrewChars = (transcript.match(/[\u0590-\u05FF]/g) || []).length;
-              const latinChars = (transcript.match(/[A-Za-z]/g) || []).length;
-              const knownTechOnly =
-                /^(kubernetes|production|deploy(?:ment)?|rollback|incident|latency|github|pr|r&d|engineering|ai|gemini)[\s.,!?-]*$/i.test(
-                  transcript,
-                );
-              const looksHebrew = hebrewChars >= 2 && hebrewChars >= Math.floor(latinChars * 0.35);
-
-              if (!looksHebrew && !knownTechOnly) {
-                console.warn('[Jerry STT] rejected non-Hebrew transcript:', transcript);
-                client.send(
-                  JSON.stringify({
-                    type: 'stt-retry',
-                    text: transcript,
-                    message: 'לא הצלחתי לזהות עברית בצורה אמינה. נסה שוב במשפט קצר וברור.',
-                  }),
-                );
-                return;
-              }
-
-              if (transcript !== lastFinalGuestTranscript) {
-                lastFinalGuestTranscript = transcript;
-                client.send(JSON.stringify({ type: 'input-transcript', text: transcript }));
-
-                // Feed Jerry clean Hebrew text instead of raw microphone audio.
-                try {
-                  liveSession?.sendRealtimeInput({ text: transcript });
-                } catch (err) {
-                  console.warn('[Jerry STT] failed forwarding transcript to Jerry:', err);
-                }
-              }
-            }
-          },
-          onerror: (event: any) => {
-            console.error('[Jerry STT] transcription error:', event?.message || event);
-            if (client.readyState === WebSocket.OPEN) {
-              client.send(
-                JSON.stringify({
-                  type: 'stt-error',
-                  message: event?.message || 'Hebrew transcription session error',
+        for (const model of models) {
+          try {
+            const resp = await fetch(
+              `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${encodeURIComponent(key)}`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json; charset=utf-8' },
+                body: JSON.stringify({
+                  contents: [
+                    {
+                      role: 'user',
+                      parts: [
+                        {
+                          inlineData: {
+                            mimeType: 'audio/wav',
+                            data: wavBase64,
+                          },
+                        },
+                        {
+                          text:
+                            'תמלל מילה במילה את הדיבור בקובץ. הדובר מדבר עברית ישראלית ויכול לשלב מונחי הייטק באנגלית. החזר רק את התמלול, ללא הסבר, ללא תרגום וללא ניחוש של שפה אחרת. אם קטע לא ברור, כתוב [לא ברור].',
+                        },
+                      ],
+                    },
+                  ],
+                  generationConfig: {
+                    temperature: 0,
+                    maxOutputTokens: 220,
+                  },
                 }),
-              );
+              },
+            );
+
+            if (!resp.ok) {
+              console.warn('[Jerry STT] turn transcription failed on', model, resp.status);
+              continue;
             }
-          },
-          onclose: (event: any) => {
-            console.info('[Jerry STT] transcription session closed:', event?.reason || '');
-          },
-        },
-        config: {
-          responseModalities: [Modality.TEXT],
-          realtimeInputConfig: {
-            automaticActivityDetection: {
-              disabled: true,
-            },
-          },
-          inputAudioTranscription: {
-            languageCodes: ['he-IL'],
-            customVocabulary: [
-              'Kubernetes',
-              'production',
-              'deploy',
-              'deployment',
-              'rollback',
-              'incident',
-              'latency',
-              'GitHub',
-              'PR',
-              'R&D',
-              'VP R&D',
-              'engineering',
-              'AI',
-              'Gemini',
-              'איתי',
-              'ג\'רי',
-            ],
-            mode: 'VERBATIM',
-          },
-        },
-      });
+
+            const data = await resp.json();
+            const candidate = (data.candidates?.[0]?.content?.parts || [])
+              .map((p: any) => p.text || '')
+              .join('')
+              .trim();
+
+            if (!candidate) continue;
+
+            const cleaned = candidate
+              .replace(/^["'\s]+|["'\s]+$/g, '')
+              .replace(/^תמלול\s*:\s*/i, '')
+              .trim();
+
+            const hebrewChars = (cleaned.match(/[\u0590-\u05FF]/g) || []).length;
+            const latinChars = (cleaned.match(/[A-Za-z]/g) || []).length;
+            const hasHebrew = hebrewChars >= 2;
+            const looksLikeTechMix = hasHebrew && hebrewChars >= Math.floor(latinChars * 0.2);
+
+            if (looksLikeTechMix || cleaned === '[לא ברור]') {
+              transcript = cleaned;
+              break;
+            }
+
+            console.warn('[Jerry STT] rejected non-Hebrew turn transcript:', cleaned);
+          } catch (err) {
+            console.warn('[Jerry STT] turn transcription exception:', err);
+          }
+        }
+
+        isTranscribingGuest = false;
+
+        if (!transcript || transcript === '[לא ברור]') {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(
+              JSON.stringify({
+                type: 'stt-retry',
+                message: 'לא הצלחתי להבין את המשפט בעברית. נסה שוב.',
+              }),
+            );
+          }
+          return;
+        }
+
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: 'input-transcript', text: transcript }));
+        }
+
+        try {
+          liveSession?.sendRealtimeInput({ text: transcript });
+        } catch (err) {
+          console.warn('[Jerry STT] failed forwarding transcript to Jerry:', err);
+        }
+      };
 
       liveSession = await ai.live.connect({
         model: 'gemini-3.8-live',
@@ -1004,18 +1019,14 @@ CRITICAL RULES:
         if (msg.type === 'text' && typeof msg.text === 'string' && msg.text.trim()) {
           liveSession.sendRealtimeInput({ text: msg.text.trim() });
         } else if (msg.type === 'activity-start') {
-          lastFinalGuestTranscript = '';
-          transcribeSession?.sendRealtimeInput({ activityStart: {} });
+          guestPcmChunks = [];
         } else if (msg.type === 'audio' && typeof msg.data === 'string' && msg.data) {
-          // Raw microphone audio goes ONLY to the Hebrew transcription model.
-          transcribeSession?.sendRealtimeInput({
-            audio: {
-              data: msg.data,
-              mimeType: msg.mimeType || 'audio/pcm;rate=16000',
-            },
-          });
+          // Buffer the user's exact 16 kHz PCM for this push-to-talk turn.
+          // We transcribe the complete utterance after activity-end so the STT
+          // sees full Hebrew context instead of guessing language chunk-by-chunk.
+          guestPcmChunks.push(Buffer.from(msg.data, 'base64'));
         } else if (msg.type === 'activity-end') {
-          transcribeSession?.sendRealtimeInput({ activityEnd: {} });
+          void transcribeGuestTurn();
         }
       } catch (err) {
         console.warn('[Jerry Live] bad browser message:', err);
@@ -1026,11 +1037,8 @@ CRITICAL RULES:
       try {
         liveSession?.close();
       } catch {}
-      try {
-        transcribeSession?.close();
-      } catch {}
+      guestPcmChunks = [];
       liveSession = null;
-      transcribeSession = null;
     });
   });
 
