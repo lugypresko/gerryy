@@ -85,6 +85,9 @@ export function JerryPodcastStudio() {
   const liveMicStreamRef = useRef<MediaStream | null>(null);
   const liveMicSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const liveMicProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const liveMicContextRef = useRef<AudioContext | null>(null);
+  const liveMicSilentGainRef = useRef<GainNode | null>(null);
+  const liveMicActiveRef = useRef(false);
   const liveInputTranscriptRef = useRef('');
   const liveUserTurnCommittedRef = useRef(false);
   const smoothedLipLevelRef = useRef(0);
@@ -153,18 +156,32 @@ export function JerryPodcastStudio() {
   }, []);
 
   const stopLiveMic = useCallback(() => {
+    liveMicActiveRef.current = false;
+
     try {
       liveMicProcessorRef.current?.disconnect();
     } catch {}
     try {
       liveMicSourceRef.current?.disconnect();
     } catch {}
+    try {
+      liveMicSilentGainRef.current?.disconnect();
+    } catch {}
+
     liveMicProcessorRef.current = null;
     liveMicSourceRef.current = null;
+    liveMicSilentGainRef.current = null;
 
     if (liveMicStreamRef.current) {
       liveMicStreamRef.current.getTracks().forEach((track) => track.stop());
       liveMicStreamRef.current = null;
+    }
+
+    if (liveMicContextRef.current) {
+      try {
+        void liveMicContextRef.current.close();
+      } catch {}
+      liveMicContextRef.current = null;
     }
 
     if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
@@ -178,6 +195,10 @@ export function JerryPodcastStudio() {
   const startLiveMic = useCallback(async () => {
     if (!isLiveReady || liveSocketRef.current?.readyState !== WebSocket.OPEN) return;
 
+    // Mark Live mic ownership before any async permission prompt. This prevents
+    // a stale Web Speech "onend" event from immediately turning the mic UI off.
+    liveMicActiveRef.current = true;
+    setIsRecordingMic(true);
     setErrorNotice(null);
     liveInputTranscriptRef.current = '';
     liveUserTurnCommittedRef.current = false;
@@ -185,6 +206,13 @@ export function JerryPodcastStudio() {
     setInputText('');
 
     try {
+      // Make sure the fallback recognizer is not holding the browser microphone.
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort?.();
+        } catch {}
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -194,16 +222,33 @@ export function JerryPodcastStudio() {
       });
       liveMicStreamRef.current = stream;
 
+      const [track] = stream.getAudioTracks();
+      if (!track || track.readyState !== 'live') {
+        throw new Error('Microphone track is not live');
+      }
+
+      track.onended = () => {
+        if (!liveMicActiveRef.current) return;
+        liveMicActiveRef.current = false;
+        setIsRecordingMic(false);
+        setErrorNotice('המיקרופון נסגר על ידי הדפדפן או מערכת ההפעלה. בדוק הרשאת מיקרופון ונסה שוב.');
+      };
+
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       const micCtx = new AudioCtx();
+      liveMicContextRef.current = micCtx;
+
+      if (micCtx.state === 'suspended') {
+        await micCtx.resume();
+      }
+
       const source = micCtx.createMediaStreamSource(stream);
-      // ScriptProcessor is intentionally used here for broad browser support in this MVP.
-      // It lets us emit small PCM chunks without waiting for a full recording to finish.
       const processor = micCtx.createScriptProcessor(2048, 1, 1);
       liveMicSourceRef.current = source;
       liveMicProcessorRef.current = processor;
 
       processor.onaudioprocess = (event) => {
+        if (!liveMicActiveRef.current) return;
         const socket = liveSocketRef.current;
         if (!socket || socket.readyState !== WebSocket.OPEN) return;
 
@@ -221,17 +266,41 @@ export function JerryPodcastStudio() {
       };
 
       source.connect(processor);
-      // Keep the processor alive without audible mic monitoring.
       const silentGain = micCtx.createGain();
       silentGain.gain.value = 0;
+      liveMicSilentGainRef.current = silentGain;
       processor.connect(silentGain);
       silentGain.connect(micCtx.destination);
 
-      setIsRecordingMic(true);
       setJerryPose('listening');
+      console.info('[Jerry Live] microphone active', {
+        label: track.label,
+        state: track.readyState,
+        sampleRate: micCtx.sampleRate,
+      });
     } catch (err: any) {
       console.error('[Jerry Live] microphone start failed:', err);
-      setErrorNotice('לא ניתן לפתוח את המיקרופון לשיחה החיה. בדוק הרשאת מיקרופון.');
+      liveMicActiveRef.current = false;
+
+      if (liveMicStreamRef.current) {
+        liveMicStreamRef.current.getTracks().forEach((track) => track.stop());
+        liveMicStreamRef.current = null;
+      }
+      if (liveMicContextRef.current) {
+        try {
+          void liveMicContextRef.current.close();
+        } catch {}
+        liveMicContextRef.current = null;
+      }
+
+      const reason =
+        err?.name === 'NotAllowedError'
+          ? 'הרשאת המיקרופון חסומה בדפדפן. אפשר הרשאה לאתר ונסה שוב.'
+          : err?.name === 'NotFoundError'
+          ? 'לא נמצא מיקרופון זמין במחשב.'
+          : 'לא ניתן לפתוח את המיקרופון לשיחה החיה: ' + (err?.message || 'שגיאה לא ידועה');
+
+      setErrorNotice(reason);
       setIsRecordingMic(false);
     }
   }, [isLiveReady]);
@@ -571,13 +640,17 @@ export function JerryPodcastStudio() {
 
       recognition.onerror = (e: any) => {
         console.warn('Speech recognition warning:', e.error);
-        if (e.error !== 'no-speech') {
+        // The Web Speech recognizer is only the fallback path. Its lifecycle
+        // must never own the Live mic indicator.
+        if (!liveMicActiveRef.current && e.error !== 'no-speech') {
           setIsRecordingMic(false);
         }
       };
 
       recognition.onend = () => {
-        setIsRecordingMic(false);
+        if (!liveMicActiveRef.current) {
+          setIsRecordingMic(false);
+        }
       };
 
       recognitionRef.current = recognition;
