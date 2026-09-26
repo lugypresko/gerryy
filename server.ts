@@ -832,9 +832,95 @@ CRITICAL RULES:
     }
 
     let liveSession: any = null;
+    let transcribeSession: any = null;
+    let lastFinalGuestTranscript = '';
 
     try {
       const ai = new GoogleGenAI({ apiKey: key });
+
+      transcribeSession = await ai.live.connect({
+        model: 'gemini-3.5-transcribe-live',
+        callbacks: {
+          onopen: () => {
+            console.info('[Jerry STT] dedicated Hebrew transcriber opened');
+          },
+          onmessage: (message: any) => {
+            if (client.readyState !== WebSocket.OPEN) return;
+
+            const serverContent = message?.serverContent || message?.server_content;
+            const interim =
+              serverContent?.interimInputTranscription?.text ||
+              serverContent?.interim_input_transcription?.text ||
+              '';
+            if (interim) {
+              client.send(JSON.stringify({ type: 'input-transcript-interim', text: interim }));
+            }
+
+            const finalText =
+              serverContent?.inputTranscription?.text ||
+              serverContent?.input_transcription?.text ||
+              '';
+
+            if (finalText && finalText.trim()) {
+              const transcript = finalText.trim();
+              if (transcript === lastFinalGuestTranscript) return;
+              lastFinalGuestTranscript = transcript;
+
+              console.info('[Jerry STT] final Hebrew transcript:', transcript);
+              client.send(JSON.stringify({ type: 'input-transcript', text: transcript }));
+
+              try {
+                liveSession?.sendClientContent({
+                  turns: [{ role: 'user', parts: [{ text: transcript }] }],
+                  turnComplete: true,
+                });
+              } catch (err) {
+                console.warn('[Jerry STT] failed forwarding transcript to Jerry:', err);
+              }
+            }
+          },
+          onerror: (event: any) => {
+            console.error('[Jerry STT] error:', event?.message || event);
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(
+                JSON.stringify({
+                  type: 'stt-error',
+                  message: event?.message || 'Hebrew transcription session error',
+                }),
+              );
+            }
+          },
+          onclose: (event: any) => {
+            console.info('[Jerry STT] closed:', event?.reason || '');
+          },
+        },
+        config: {
+          responseModalities: [Modality.TEXT],
+          realtimeInputConfig: {
+            automaticActivityDetection: {
+              disabled: true,
+            },
+          },
+          inputAudioTranscription: {
+            languageCodes: ['he-IL'],
+            mode: 'VERBATIM',
+            customVocabulary: [
+              'ג\'רי',
+              'איתי',
+              'Kubernetes',
+              'production',
+              'deploy',
+              'rollback',
+              'incident',
+              'latency',
+              'GitHub',
+              'R&D',
+              'AI',
+              'Gemini',
+            ],
+          },
+        },
+      });
 
       liveSession = await ai.live.connect({
         model: 'gemini-3.8-live',
@@ -859,14 +945,6 @@ CRITICAL RULES:
                   }),
                 );
               }
-            }
-
-            const inputTranscription =
-              serverContent?.inputTranscription?.text ||
-              serverContent?.input_transcription?.text ||
-              '';
-            if (inputTranscription) {
-              client.send(JSON.stringify({ type: 'input-transcript', text: inputTranscription }));
             }
 
             const transcription =
@@ -905,17 +983,7 @@ CRITICAL RULES:
         },
         config: {
           responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: {
-            // Phase 1: lock recognition to Hebrew so we can validate the live path
-            // before re-introducing English/code-switching.
-            languageCodes: ['he-IL'],
-          },
           outputAudioTranscription: {},
-          realtimeInputConfig: {
-            automaticActivityDetection: {
-              disabled: true,
-            },
-          },
           speechConfig: {
             voiceConfig: {
               prebuiltVoiceConfig: {
@@ -933,7 +1001,7 @@ CRITICAL RULES:
             type: 'ready',
             engine: 'gemini-3.8-live',
             engineVersion: JERRY_ENGINE_VERSION,
-            inputPath: 'push-to-talk PCM -> Gemini 3.8 Live native audio understanding -> Jerry response',
+            inputPath: 'push-to-talk PCM -> Gemini 3.5 Transcribe Live (he-IL) -> text -> Gemini 3.8 Live -> Jerry response',
           }),
         );
       }
@@ -947,7 +1015,7 @@ CRITICAL RULES:
     }
 
     client.on('message', (raw) => {
-      if (!liveSession) return;
+      if (!liveSession || !transcribeSession) return;
       try {
         const msg = JSON.parse(raw.toString());
 
@@ -957,15 +1025,14 @@ CRITICAL RULES:
             turnComplete: true,
           });
         } else if (msg.type === 'activity-start') {
+          lastFinalGuestTranscript = '';
           console.info('[Jerry Engine]', {
             engineVersion: JERRY_ENGINE_VERSION,
-            stage: 'native-live-audio-start',
+            stage: 'hebrew-transcribe-start',
           });
-          liveSession.sendRealtimeInput({ activityStart: {} });
+          transcribeSession.sendRealtimeInput({ activityStart: {} });
         } else if (msg.type === 'audio' && typeof msg.data === 'string' && msg.data) {
-          // IMPORTANT: microphone audio goes straight into Gemini Live.
-          // No intermediary STT model, no language classifier, no text firewall.
-          liveSession.sendRealtimeInput({
+          transcribeSession.sendRealtimeInput({
             audio: {
               data: msg.data,
               mimeType: msg.mimeType || 'audio/pcm;rate=16000',
@@ -974,9 +1041,9 @@ CRITICAL RULES:
         } else if (msg.type === 'activity-end') {
           console.info('[Jerry Engine]', {
             engineVersion: JERRY_ENGINE_VERSION,
-            stage: 'native-live-audio-end',
+            stage: 'hebrew-transcribe-end',
           });
-          liveSession.sendRealtimeInput({ activityEnd: {} });
+          transcribeSession.sendRealtimeInput({ activityEnd: {} });
         }
       } catch (err) {
         console.warn('[Jerry Live] bad browser message:', err);
@@ -987,7 +1054,11 @@ CRITICAL RULES:
       try {
         liveSession?.close();
       } catch {}
+      try {
+        transcribeSession?.close();
+      } catch {}
       liveSession = null;
+      transcribeSession = null;
     });
   });
 
