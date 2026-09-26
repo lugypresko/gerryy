@@ -82,6 +82,11 @@ export function JerryPodcastStudio() {
   const livePcmChunksRef = useRef<Uint8Array[]>([]);
   const liveAudioEndTimeRef = useRef(0);
   const liveTurnTimerRef = useRef<number | null>(null);
+  const liveMicStreamRef = useRef<MediaStream | null>(null);
+  const liveMicSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const liveMicProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const liveInputTranscriptRef = useRef('');
+  const liveUserTurnCommittedRef = useRef(false);
 
   // Auto-scroll chat messages
   useEffect(() => {
@@ -94,6 +99,140 @@ export function JerryPodcastStudio() {
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     return bytes;
   };
+
+  const bytesToBase64 = (bytes: Uint8Array) => {
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  };
+
+  const resampleTo16kPcm = (input: Float32Array, inputRate: number) => {
+    const targetRate = 16000;
+    if (!input.length) return new Uint8Array();
+
+    const ratio = inputRate / targetRate;
+    const outputLength = Math.max(1, Math.floor(input.length / ratio));
+    const output = new Int16Array(outputLength);
+
+    for (let i = 0; i < outputLength; i++) {
+      const start = Math.floor(i * ratio);
+      const end = Math.min(input.length, Math.floor((i + 1) * ratio));
+      let sum = 0;
+      let count = 0;
+      for (let j = start; j < end; j++) {
+        sum += input[j];
+        count++;
+      }
+      const sample = Math.max(-1, Math.min(1, count ? sum / count : input[start] || 0));
+      output[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    }
+
+    return new Uint8Array(output.buffer);
+  };
+
+  const commitLiveUserTurn = useCallback(() => {
+    if (liveUserTurnCommittedRef.current) return;
+    const text = liveInputTranscriptRef.current.trim();
+    if (!text) return;
+
+    liveUserTurnCommittedRef.current = true;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `m-${Date.now()}-guest`,
+        sender: 'user',
+        text,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      },
+    ]);
+  }, []);
+
+  const stopLiveMic = useCallback(() => {
+    try {
+      liveMicProcessorRef.current?.disconnect();
+    } catch {}
+    try {
+      liveMicSourceRef.current?.disconnect();
+    } catch {}
+    liveMicProcessorRef.current = null;
+    liveMicSourceRef.current = null;
+
+    if (liveMicStreamRef.current) {
+      liveMicStreamRef.current.getTracks().forEach((track) => track.stop());
+      liveMicStreamRef.current = null;
+    }
+
+    if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
+      liveSocketRef.current.send(JSON.stringify({ type: 'audio-end' }));
+    }
+
+    setIsRecordingMic(false);
+    window.setTimeout(commitLiveUserTurn, 180);
+  }, [commitLiveUserTurn]);
+
+  const startLiveMic = useCallback(async () => {
+    if (!isLiveReady || liveSocketRef.current?.readyState !== WebSocket.OPEN) return;
+
+    setErrorNotice(null);
+    liveInputTranscriptRef.current = '';
+    liveUserTurnCommittedRef.current = false;
+    setMicTranscript('');
+    setInputText('');
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      liveMicStreamRef.current = stream;
+
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const micCtx = new AudioCtx();
+      const source = micCtx.createMediaStreamSource(stream);
+      // ScriptProcessor is intentionally used here for broad browser support in this MVP.
+      // It lets us emit small PCM chunks without waiting for a full recording to finish.
+      const processor = micCtx.createScriptProcessor(2048, 1, 1);
+      liveMicSourceRef.current = source;
+      liveMicProcessorRef.current = processor;
+
+      processor.onaudioprocess = (event) => {
+        const socket = liveSocketRef.current;
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+        const input = event.inputBuffer.getChannelData(0);
+        const pcm = resampleTo16kPcm(input, micCtx.sampleRate);
+        if (!pcm.byteLength) return;
+
+        socket.send(
+          JSON.stringify({
+            type: 'audio',
+            data: bytesToBase64(pcm),
+            mimeType: 'audio/pcm;rate=16000',
+          }),
+        );
+      };
+
+      source.connect(processor);
+      // Keep the processor alive without audible mic monitoring.
+      const silentGain = micCtx.createGain();
+      silentGain.gain.value = 0;
+      processor.connect(silentGain);
+      silentGain.connect(micCtx.destination);
+
+      setIsRecordingMic(true);
+      setJerryPose('listening');
+    } catch (err: any) {
+      console.error('[Jerry Live] microphone start failed:', err);
+      setErrorNotice('לא ניתן לפתוח את המיקרופון לשיחה החיה. בדוק הרשאת מיקרופון.');
+      setIsRecordingMic(false);
+    }
+  }, [isLiveReady]);
 
   const pcm16ChunksToWavUrl = (chunks: Uint8Array[], sampleRate = 24000) => {
     const dataLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
@@ -200,7 +339,14 @@ export function JerryPodcastStudio() {
           }
 
           if (msg.type === 'audio' && msg.data) {
+            commitLiveUserTurn();
             playLivePcmChunk(msg.data);
+            return;
+          }
+
+          if (msg.type === 'input-transcript' && msg.text) {
+            liveInputTranscriptRef.current += msg.text;
+            setMicTranscript(liveInputTranscriptRef.current);
             return;
           }
 
@@ -289,7 +435,7 @@ export function JerryPodcastStudio() {
       } catch {}
       liveSocketRef.current = null;
     };
-  }, [playLivePcmChunk]);
+  }, [playLivePcmChunk, commitLiveUserTurn]);
 
   // Episode Recording Timer
   useEffect(() => {
@@ -470,8 +616,18 @@ export function JerryPodcastStudio() {
     playJerryAudio('/jerry-opening.wav');
   };
 
-  // Toggle Guest Push-to-Talk Mic
+  // Toggle Guest microphone. When Gemini Live is connected we stream raw PCM
+  // directly to the model for natural turn-taking; Web Speech remains as fallback.
   const handleToggleMic = async () => {
+    if (isLiveReady) {
+      if (isRecordingMic) {
+        stopLiveMic();
+      } else {
+        await startLiveMic();
+      }
+      return;
+    }
+
     if (isRecordingMic) {
       if (recognitionRef.current) {
         try {
@@ -1135,10 +1291,12 @@ export function JerryPodcastStudio() {
             <div className="mb-2 bg-red-50 border border-red-200 text-red-800 text-[12px] rounded-[8px] px-3 py-1.5 flex items-center justify-between animate-pulse">
               <div className="flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-red-600 animate-ping" />
-                <span className="font-semibold">מקליט אותך עכשיו:</span>
+                <span className="font-semibold">{isLiveReady ? 'ג\'רי מקשיב בזמן אמת:' : 'מקליט אותך עכשיו:'}</span>
                 <span className="italic text-[#333]">{micTranscript || 'דבר חופשי אל ג\'רי...'}</span>
               </div>
-              <span className="text-[11px] text-red-700">לחץ שוב על המיקרופון לסיום ושליחה</span>
+              <span className="text-[11px] text-red-700">
+                {isLiveReady ? 'אפשר לדבר טבעי; לחץ שוב כשתסיים' : 'לחץ שוב על המיקרופון לסיום ושליחה'}
+              </span>
             </div>
           )}
 
