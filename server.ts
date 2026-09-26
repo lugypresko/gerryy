@@ -968,7 +968,10 @@ CRITICAL RULES:
             stage: 'forward-to-jerry-live',
             transcript,
           });
-          liveSession?.sendRealtimeInput({ text: transcript });
+          liveSession?.sendClientContent({
+            turns: [{ role: 'user', parts: [{ text: transcript }] }],
+            turnComplete: true,
+          });
         } catch (err) {
           console.warn('[Jerry STT] failed forwarding transcript to Jerry:', err);
         }
@@ -1071,7 +1074,10 @@ CRITICAL RULES:
       try {
         const msg = JSON.parse(raw.toString());
         if (msg.type === 'text' && typeof msg.text === 'string' && msg.text.trim()) {
-          liveSession.sendRealtimeInput({ text: msg.text.trim() });
+          liveSession.sendClientContent({
+            turns: [{ role: 'user', parts: [{ text: msg.text.trim() }] }],
+            turnComplete: true,
+          });
         } else if (msg.type === 'activity-start') {
           guestPcmChunks = [];
         } else if (msg.type === 'audio' && typeof msg.data === 'string' && msg.data) {
