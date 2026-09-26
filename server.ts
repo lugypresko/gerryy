@@ -847,7 +847,7 @@ CRITICAL RULES:
                         },
                         {
                           text:
-                            'תמלל מילה במילה את הדיבור בקובץ. הדובר מדבר עברית, אנגלית, או שילוב טבעי ביניהן, ויכול לשלב מונחי הייטק באנגלית. החזר רק את התמלול, ללא הסבר וללא תרגום. לעולם אל תחזיר גרמנית, ספרדית, קוריאנית או שפה אחרת. אם קטע לא ברור, כתוב [לא ברור].',
+                            'תמלל מילה במילה את הדיבור בקובץ וסווג את שפת הדיבור. השפות המותרות הן רק עברית, אנגלית, או שילוב טבעי של עברית+אנגלית. אם הדיבור הוא בגרמנית, ספרדית, צרפתית, קוריאנית, ערבית, רוסית או כל שפה אחרת — סווג כ-other. אל תתרגם. אל תתקן את הדובר. אם קטע לא ברור, החזר [לא ברור] בשדה text.',
                         },
                       ],
                     },
@@ -855,6 +855,18 @@ CRITICAL RULES:
                   generationConfig: {
                     temperature: 0,
                     maxOutputTokens: 220,
+                    responseMimeType: 'application/json',
+                    responseSchema: {
+                      type: 'OBJECT',
+                      properties: {
+                        text: { type: 'STRING' },
+                        language: {
+                          type: 'STRING',
+                          enum: ['hebrew', 'english', 'mixed', 'other'],
+                        },
+                      },
+                      required: ['text', 'language'],
+                    },
                   },
                 }),
               },
@@ -866,30 +878,32 @@ CRITICAL RULES:
             }
 
             const data = await resp.json();
-            const candidate = (data.candidates?.[0]?.content?.parts || [])
+            const raw = (data.candidates?.[0]?.content?.parts || [])
               .map((p: any) => p.text || '')
               .join('')
               .trim();
 
-            if (!candidate) continue;
+            if (!raw) continue;
 
-            const cleaned = candidate
-              .replace(/^["'\s]+|["'\s]+$/g, '')
-              .replace(/^תמלול\s*:\s*/i, '')
-              .trim();
+            let parsed: any = null;
+            try {
+              parsed = JSON.parse(raw);
+            } catch {
+              console.warn('[Jerry STT] invalid JSON transcription payload:', raw);
+              continue;
+            }
 
-            const hebrewChars = (cleaned.match(/[\u0590-\u05FF]/g) || []).length;
-            const latinChars = (cleaned.match(/[A-Za-z]/g) || []).length;
-            const nonAllowedLetters = (cleaned.match(/[^\s\u0590-\u05FFA-Za-z0-9.,!?'"()\-:&/]/g) || []).length;
-            const hasAllowedLanguage = hebrewChars >= 2 || latinChars >= 2;
-            const looksHebrewEnglish = hasAllowedLanguage && nonAllowedLetters === 0;
+            const cleaned = String(parsed?.text || '').trim();
+            const language = String(parsed?.language || '').toLowerCase();
 
-            if (looksHebrewEnglish || cleaned === '[לא ברור]') {
+            if (!cleaned) continue;
+
+            if (language === 'hebrew' || language === 'english' || language === 'mixed') {
               transcript = cleaned;
               break;
             }
 
-            console.warn('[Jerry STT] rejected non Hebrew/English turn transcript:', cleaned);
+            console.warn('[Jerry STT] rejected language:', { language, transcript: cleaned });
           } catch (err) {
             console.warn('[Jerry STT] turn transcription exception:', err);
           }
