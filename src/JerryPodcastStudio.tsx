@@ -57,6 +57,7 @@ export function JerryPodcastStudio() {
   const [isEpisodeRecording, setIsEpisodeRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [episodeAudioUrl, setEpisodeAudioUrl] = useState<string | null>(null);
+  const [episodeFileExtension, setEpisodeFileExtension] = useState('webm');
   const [recordingNotice, setRecordingNotice] = useState<string | null>(null);
 
   // Audio & WebRTC references
@@ -292,107 +293,178 @@ export function JerryPodcastStudio() {
 
   // Start or Stop Master Podcast Recording
   const handleToggleEpisodeRecord = async () => {
-    if (isEpisodeRecording) {
-      // STOP recording
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        try {
-          mediaRecorderRef.current.stop();
-        } catch (e) {
-          console.error('Error stopping MediaRecorder:', e);
-        }
-      }
+    const stopMicTracks = () => {
       if (micMediaStreamRef.current) {
-        micMediaStreamRef.current.getTracks().forEach((t) => t.stop());
+        micMediaStreamRef.current.getTracks().forEach((track) => {
+          try {
+            track.stop();
+          } catch {}
+        });
         micMediaStreamRef.current = null;
       }
-      setIsEpisodeRecording(false);
-    } else {
-      // START recording
-      setErrorNotice(null);
-      setEpisodeAudioUrl(null);
-      setRecordingNotice(null);
+    };
 
-      try {
-        const ctx = getAudioContext();
-        if (ctx && ctx.state === 'suspended') {
-          await ctx.resume();
-        }
-
-        // Try getting user mic stream
-        let streamToRecord: MediaStream;
+    if (isEpisodeRecording) {
+      // STOP recording. Important: do not stop the mic tracks here.
+      // MediaRecorder still needs its source alive while it flushes/finalizes the last chunk.
+      const recorder = mediaRecorderRef.current;
+      if (recorder && recorder.state !== 'inactive') {
         try {
-          const micStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-            },
+          console.info('[Podcast Recorder] stopping', { state: recorder.state, mimeType: recorder.mimeType });
+          recorder.stop();
+          setRecordingNotice('מסיים ושומר את ההקלטה...');
+        } catch (e) {
+          console.error('[Podcast Recorder] error stopping MediaRecorder:', e);
+          stopMicTracks();
+          setErrorNotice('לא ניתן היה לסיים את ההקלטה כראוי.');
+        }
+      } else {
+        stopMicTracks();
+      }
+      setIsEpisodeRecording(false);
+      return;
+    }
+
+    // START recording
+    setErrorNotice(null);
+    if (episodeAudioUrl) {
+      URL.revokeObjectURL(episodeAudioUrl);
+    }
+    setEpisodeAudioUrl(null);
+    setRecordingNotice(null);
+
+    try {
+      const ctx = getAudioContext();
+      if (ctx && ctx.state === 'suspended') {
+        await ctx.resume();
+      }
+
+      // Try getting user mic stream
+      let streamToRecord: MediaStream;
+      try {
+        const micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        micMediaStreamRef.current = micStream;
+
+        if (ctx && mixedDestNodeRef.current) {
+          const micSource = ctx.createMediaStreamSource(micStream);
+          micSource.connect(mixedDestNodeRef.current);
+          streamToRecord = mixedDestNodeRef.current.stream;
+        } else {
+          streamToRecord = micStream;
+        }
+      } catch (micErr: any) {
+        console.warn('[Podcast Recorder] microphone unavailable; trying Jerry-only recording:', micErr);
+        if (mixedDestNodeRef.current && mixedDestNodeRef.current.stream.getAudioTracks().length > 0) {
+          streamToRecord = mixedDestNodeRef.current.stream;
+          setRecordingNotice('ההקלטה פעילה (רק ערוץ הקול של ג\'רי - לא אושרה הרשאת מיקרופון).');
+        } else {
+          throw new Error('יש לאשר גישה למיקרופון בדפדפן כדי להתחיל להקליט את השיחה.');
+        }
+      }
+
+      const tracks = streamToRecord.getAudioTracks();
+      console.info(
+        '[Podcast Recorder] source tracks',
+        tracks.map((track) => ({
+          label: track.label,
+          enabled: track.enabled,
+          muted: track.muted,
+          readyState: track.readyState,
+        })),
+      );
+
+      if (tracks.length === 0 || !tracks.some((track) => track.readyState === 'live' && track.enabled)) {
+        stopMicTracks();
+        throw new Error('לא נמצא ערוץ שמע פעיל להקלטה.');
+      }
+
+      // Determine best supported MIME type
+      const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/mp4',
+        '',
+      ];
+      let chosenMime = '';
+      for (const mime of candidates) {
+        if (!mime || MediaRecorder.isTypeSupported(mime)) {
+          chosenMime = mime;
+          break;
+        }
+      }
+
+      const options: MediaRecorderOptions = chosenMime ? { mimeType: chosenMime } : {};
+      const mediaRecorder = new MediaRecorder(streamToRecord, options);
+      const actualMime = mediaRecorder.mimeType || chosenMime || 'audio/webm';
+      const extension = actualMime.includes('mp4')
+        ? 'm4a'
+        : actualMime.includes('ogg')
+        ? 'ogg'
+        : 'webm';
+
+      setEpisodeFileExtension(extension);
+      recordedChunksRef.current = [];
+
+      mediaRecorder.onstart = () => {
+        console.info('[Podcast Recorder] started', { mimeType: actualMime, tracks: tracks.length });
+      };
+
+      mediaRecorder.ondataavailable = (e) => {
+        console.info('[Podcast Recorder] dataavailable', { size: e.data?.size || 0, type: e.data?.type });
+        if (e.data && e.data.size > 0) {
+          recordedChunksRef.current.push(e.data);
+        }
+      };
+
+      mediaRecorder.onerror = (event: any) => {
+        console.error('[Podcast Recorder] MediaRecorder error:', event?.error || event);
+        setErrorNotice(
+          'שגיאת הקלטה: ' + (event?.error?.message || event?.error?.name || 'MediaRecorder נכשל'),
+        );
+      };
+
+      mediaRecorder.onstop = () => {
+        try {
+          const blob = new Blob(recordedChunksRef.current, { type: actualMime });
+          console.info('[Podcast Recorder] finalized', {
+            chunks: recordedChunksRef.current.length,
+            blobSize: blob.size,
+            mimeType: actualMime,
           });
-          micMediaStreamRef.current = micStream;
 
-          if (ctx && mixedDestNodeRef.current) {
-            const micSource = ctx.createMediaStreamSource(micStream);
-            micSource.connect(mixedDestNodeRef.current);
-            streamToRecord = mixedDestNodeRef.current.stream;
-          } else {
-            streamToRecord = micStream;
-          }
-        } catch (micErr: any) {
-          console.warn('Microphone permission denied or not available, recording Jerry output only:', micErr);
-          if (mixedDestNodeRef.current && mixedDestNodeRef.current.stream.getAudioTracks().length > 0) {
-            streamToRecord = mixedDestNodeRef.current.stream;
-            setRecordingNotice('ההקלטה פעילה (רק ערוץ הקול של ג\'רי - לא אושרה הרשאת מיקרופון).');
-          } else {
-            throw new Error('יש לאשר גישה למיקרופון בדפדפן כדי להתחיל להקליט את השיחה.');
-          }
-        }
-
-        // Determine best supported MIME type
-        const candidates = [
-          'audio/webm;codecs=opus',
-          'audio/webm',
-          'audio/ogg;codecs=opus',
-          'audio/mp4',
-          '',
-        ];
-        let chosenMime = '';
-        for (const mime of candidates) {
-          if (!mime || MediaRecorder.isTypeSupported(mime)) {
-            chosenMime = mime;
-            break;
-          }
-        }
-
-        const options: MediaRecorderOptions = chosenMime ? { mimeType: chosenMime } : {};
-        const mediaRecorder = new MediaRecorder(streamToRecord, options);
-        recordedChunksRef.current = [];
-
-        mediaRecorder.ondataavailable = (e) => {
-          if (e.data && e.data.size > 0) {
-            recordedChunksRef.current.push(e.data);
-          }
-        };
-
-        mediaRecorder.onstop = () => {
-          if (recordedChunksRef.current.length > 0) {
-            const blobType = chosenMime || 'audio/webm';
-            const blob = new Blob(recordedChunksRef.current, { type: blobType });
+          if (blob.size > 0) {
             const url = URL.createObjectURL(blob);
             setEpisodeAudioUrl(url);
             setRecordingNotice('ההקלטה הושלמה בהצלחה! לחץ להורדת הפרק.');
           } else {
             setErrorNotice('ההקלטה נעצרה אך לא נלכדו נתוני שמע.');
+            setRecordingNotice(null);
           }
-        };
+        } finally {
+          // Only now is it safe to release the microphone source.
+          stopMicTracks();
+          mediaRecorderRef.current = null;
+          recordedChunksRef.current = [];
+        }
+      };
 
-        mediaRecorder.start(500);
-        mediaRecorderRef.current = mediaRecorder;
-        setIsEpisodeRecording(true);
-      } catch (err: any) {
-        console.error('Recording setup error:', err);
-        setErrorNotice(err.message || 'שגיאה בהפעלת ההקלטה. ודא הרשאת מיקרופון בדפדפן.');
-        setIsEpisodeRecording(false);
-      }
+      // Let the browser own final chunking. This is more reliable for short podcast recordings.
+      mediaRecorder.start();
+      mediaRecorderRef.current = mediaRecorder;
+      setIsEpisodeRecording(true);
+    } catch (err: any) {
+      console.error('[Podcast Recorder] setup error:', err);
+      stopMicTracks();
+      mediaRecorderRef.current = null;
+      setErrorNotice(err.message || 'שגיאה בהפעלת ההקלטה. ודא הרשאת מיקרופון בדפדפן.');
+      setIsEpisodeRecording(false);
     }
   };
 
@@ -698,7 +770,7 @@ export function JerryPodcastStudio() {
             {episodeAudioUrl && (
               <a
                 href={episodeAudioUrl}
-                download={`jerry-podcast-episode-${Date.now()}.webm`}
+                download={`jerry-podcast-episode-${Date.now()}.${episodeFileExtension}`}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] bg-emerald-600 hover:bg-emerald-500 text-white text-[11.5px] font-semibold transition-colors shadow-xs"
                 title="הורד קובץ הקלטה מלא"
               >
