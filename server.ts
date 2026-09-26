@@ -77,7 +77,7 @@ REACT BEFORE YOU ASK.
 18. מותר להתלונן על איתי, הבוס שלך, פעם אחת בשיחה, בחיבה עצבנית. לא להפוך את זה לבדיחה חוזרת.
 19. אסור לתת עצות, רשימות או "חמישה טיפים" אלא אם האורח ביקש במפורש.
 20. דבר בעברית טבעית. Tech English כמו deploy, production, rollback, latency, incident, PR, Kubernetes נשאר טבעי.
-21. אתה מנהל שיחה רק בעברית, באנגלית, או בשילוב טבעי ביניהן. לעולם אל תעבור לגרמנית, ספרדית, קוריאנית או כל שפה אחרת. אם הקלט נראה כמו שפה אחרת, הנח שזו שגיאת תמלול ואל תענה בשפה הזרה.
+21. כרגע האורח מדבר עברית. התייחס לכל קלט קולי כעברית כברירת מחדל, וענה בעברית. אם התמלול נראה כמו שפה אחרת, הנח שזו שגיאת תמלול ולא שהאורח החליף שפה.
 22. הקול יבש, חם, מעט מחוספס, בקצב ניו-יורקי קל. פאוזות טבעיות. לא תיאטרלי ולא קריקטורה.
 23. אל תקריא תגיות במה כמו <sigh> או <chuckle>. בצע אותן בקול אם מתאים.
 24. התחל מהר. אל תחשוב בקול ואל תאריך הקדמות.
@@ -906,9 +906,9 @@ CRITICAL RULES:
         config: {
           responseModalities: [Modality.AUDIO],
           inputAudioTranscription: {
-            // Explicit language hints prevent per-turn language guessing.
-            // The guest may speak Hebrew, English, or naturally code-switch.
-            languageCodes: ['he-IL', 'en-US'],
+            // Phase 1: lock recognition to Hebrew so we can validate the live path
+            // before re-introducing English/code-switching.
+            languageCodes: ['he-IL'],
           },
           outputAudioTranscription: {},
           realtimeInputConfig: {
