@@ -211,6 +211,7 @@ async function startServer() {
         generationConfig: {
           responseModalities: ['AUDIO'],
           speechConfig: {
+            languageCode: 'he-IL',
             voiceConfig: {
               voice: chosenVoice,
             },
@@ -794,7 +795,28 @@ CRITICAL RULES:
         },
         config: {
           responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: {},
+          inputAudioTranscription: {
+            languageCodes: ['he-IL'],
+            customVocabulary: [
+              'Kubernetes',
+              'production',
+              'deploy',
+              'deployment',
+              'rollback',
+              'incident',
+              'latency',
+              'GitHub',
+              'PR',
+              'R&D',
+              'VP R&D',
+              'engineering',
+              'AI',
+              'Gemini',
+              'איתי',
+              'ג\'רי',
+            ],
+            mode: 'SMART',
+          },
           outputAudioTranscription: {},
           speechConfig: {
             voiceConfig: {
