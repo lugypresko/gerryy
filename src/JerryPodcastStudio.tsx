@@ -507,9 +507,20 @@ export function JerryPodcastStudio() {
             return;
           }
 
+          if (msg.type === 'input-transcript-interim' && msg.text) {
+            setMicTranscript(msg.text);
+            return;
+          }
+
           if (msg.type === 'input-transcript' && msg.text) {
-            liveInputTranscriptRef.current += msg.text;
-            setMicTranscript(liveInputTranscriptRef.current);
+            liveInputTranscriptRef.current = msg.text;
+            setMicTranscript(msg.text);
+            return;
+          }
+
+          if (msg.type === 'stt-error') {
+            console.error('[Jerry STT] server error:', msg.message);
+            setErrorNotice('תמלול העברית נכשל: ' + (msg.message || 'שגיאת STT'));
             return;
           }
 
