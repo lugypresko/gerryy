@@ -750,6 +750,14 @@ CRITICAL RULES:
               }
             }
 
+            const inputTranscription =
+              serverContent?.inputTranscription?.text ||
+              serverContent?.input_transcription?.text ||
+              '';
+            if (inputTranscription) {
+              client.send(JSON.stringify({ type: 'input-transcript', text: inputTranscription }));
+            }
+
             const transcription =
               serverContent?.outputTranscription?.text ||
               serverContent?.output_transcription?.text ||
@@ -786,6 +794,7 @@ CRITICAL RULES:
         },
         config: {
           responseModalities: [Modality.AUDIO],
+          inputAudioTranscription: {},
           outputAudioTranscription: {},
           speechConfig: {
             voiceConfig: {
@@ -816,6 +825,15 @@ CRITICAL RULES:
         const msg = JSON.parse(raw.toString());
         if (msg.type === 'text' && typeof msg.text === 'string' && msg.text.trim()) {
           liveSession.sendRealtimeInput({ text: msg.text.trim() });
+        } else if (msg.type === 'audio' && typeof msg.data === 'string' && msg.data) {
+          liveSession.sendRealtimeInput({
+            audio: {
+              data: msg.data,
+              mimeType: msg.mimeType || 'audio/pcm;rate=16000',
+            },
+          });
+        } else if (msg.type === 'audio-end') {
+          liveSession.sendRealtimeInput({ audioStreamEnd: true });
         }
       } catch (err) {
         console.warn('[Jerry Live] bad browser message:', err);
