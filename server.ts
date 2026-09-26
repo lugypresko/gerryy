@@ -607,6 +607,7 @@ CRITICAL RULES:
 
       // Synthesize audio using Gemini TTS
       let audioBase64 = '';
+      const ttsErrors: string[] = [];
       const ttsModels = ['models/gemini-3.8-flash-lite-tts', 'models/gemini-3.8-flash-tts'];
 
       for (const ttsModel of ttsModels) {
@@ -629,14 +630,23 @@ CRITICAL RULES:
               }),
             },
           );
-          if (!ttsResp.ok) continue;
+          if (!ttsResp.ok) {
+            const errText = await ttsResp.text();
+            const detail = `${ttsModel} HTTP ${ttsResp.status}: ${errText.slice(0, 300)}`;
+            ttsErrors.push(detail);
+            console.error('[Jerry TTS] fallback synthesis failed:', detail);
+            continue;
+          }
           const ttsData = await ttsResp.json();
           const b64 = ttsData.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
           if (b64) {
             audioBase64 = b64;
             break;
           }
-        } catch {
+        } catch (err: any) {
+          const detail = `${ttsModel}: ${err?.message || String(err)}`;
+          ttsErrors.push(detail);
+          console.error('[Jerry TTS] fallback synthesis exception:', detail);
           // retry next TTS model
         }
       }
@@ -644,6 +654,7 @@ CRITICAL RULES:
       res.json({
         replyText,
         audioBase64,
+        audioError: audioBase64 ? null : ttsErrors.join(' | ') || 'No audio returned by Gemini TTS',
       });
     } catch (err: any) {
       res.status(500).json({ error: err?.message || String(err) });
@@ -899,13 +910,15 @@ CRITICAL RULES:
 
             if (!cleaned) continue;
 
-            // Deterministic second firewall: even if the model misclassifies a
-            // foreign transcript as English, only Hebrew letters and plain
-            // ASCII English letters are allowed through to Jerry.
-            const foreignScriptChars =
-              cleaned.match(/[^\u0590-\u05FFA-Za-z0-9\s.,!?'"()\-:&/]/g) || [];
-            const hasAllowedLetters = /[\u0590-\u05FFA-Za-z]/.test(cleaned);
-            const passesScriptFirewall = foreignScriptChars.length === 0 && hasAllowedLetters;
+            // Allow normal punctuation, curly quotes, dashes and bidi marks.
+            // Reject only LETTERS from scripts other than Hebrew/Latin.
+            // Language semantics are enforced separately by the classifier above.
+            const allLetters = cleaned.match(/\p{L}/gu) || [];
+            const foreignLetters = allLetters.filter(
+              (ch) => !/[\p{Script=Hebrew}\p{Script=Latin}]/u.test(ch),
+            );
+            const hasAllowedLetters = allLetters.length > 0;
+            const passesScriptFirewall = foreignLetters.length === 0 && hasAllowedLetters;
 
             if (
               (language === 'hebrew' || language === 'english' || language === 'mixed') &&
@@ -918,7 +931,7 @@ CRITICAL RULES:
             console.warn('[Jerry STT] rejected turn transcript:', {
               language,
               transcript: cleaned,
-              foreignScriptChars,
+              foreignLetters,
             });
           } catch (err) {
             console.warn('[Jerry STT] turn transcription exception:', err);
@@ -939,13 +952,16 @@ CRITICAL RULES:
           return;
         }
 
-        // Final defense-in-depth check before anything reaches Jerry.
-        const finalForeignChars =
-          transcript.match(/[^\u0590-\u05FFA-Za-z0-9\s.,!?'"()\-:&/]/g) || [];
-        if (finalForeignChars.length > 0 || !/[\u0590-\u05FFA-Za-z]/.test(transcript)) {
+        // Final defense-in-depth check: punctuation/bidi are fine; foreign letter
+        // scripts are not. This avoids rejecting valid Hebrew typography.
+        const finalLetters = transcript.match(/\p{L}/gu) || [];
+        const finalForeignLetters = finalLetters.filter(
+          (ch) => !/[\p{Script=Hebrew}\p{Script=Latin}]/u.test(ch),
+        );
+        if (finalForeignLetters.length > 0 || finalLetters.length === 0) {
           console.warn('[Jerry STT] blocked transcript at final firewall:', {
             transcript,
-            finalForeignChars,
+            finalForeignLetters,
           });
           if (client.readyState === WebSocket.OPEN) {
             client.send(
