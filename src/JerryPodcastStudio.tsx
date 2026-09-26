@@ -11,10 +11,8 @@ import {
   Loader2,
   AlertCircle,
   Square,
-  Play,
   Activity,
   PhoneCall,
-  Sparkles,
 } from 'lucide-react';
 
 export interface PodcastMessage {
@@ -50,7 +48,8 @@ export function JerryPodcastStudio() {
   const [micTranscript, setMicTranscript] = useState('');
   const [isMuted, setIsMuted] = useState(false);
 
-  // Audio Analyser & Lip-Sync state
+  // Audio Analyser & Lip-Sync state (0: closed, 1: slightly open, 2: wide open)
+  const [mouthStage, setMouthStage] = useState<0 | 1 | 2>(0);
   const [mouthOpenAmount, setMouthOpenAmount] = useState(0);
   const [audioLevel, setAudioLevel] = useState(0);
 
@@ -58,6 +57,7 @@ export function JerryPodcastStudio() {
   const [isEpisodeRecording, setIsEpisodeRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [episodeAudioUrl, setEpisodeAudioUrl] = useState<string | null>(null);
+  const [recordingNotice, setRecordingNotice] = useState<string | null>(null);
 
   // Audio & WebRTC references
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
@@ -101,7 +101,7 @@ export function JerryPodcastStudio() {
       const ctx = new AudioCtx();
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.25;
+      analyser.smoothingTimeConstant = 0.2; // fast response to syllables
 
       const mixedDest = ctx.createMediaStreamDestination();
 
@@ -118,7 +118,6 @@ export function JerryPodcastStudio() {
         const source = ctx.createMediaElementSource(audioPlayerRef.current);
         source.connect(analyser);
         analyser.connect(ctx.destination);
-        // Also feed Jerry's audio into the podcast recording destination
         source.connect(mixedDest);
       } catch (e) {
         // already connected
@@ -127,26 +126,36 @@ export function JerryPodcastStudio() {
     return audioContextRef.current;
   };
 
-  // Lip-Sync Loop measuring speech frequencies
+  // High-response Lip-Sync Loop measuring speech frequencies
   const runLipSyncLoop = useCallback(() => {
     if (!analyserRef.current) return;
     const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
     analyserRef.current.getByteFrequencyData(dataArray);
 
     let sum = 0;
-    const bins = Math.min(32, dataArray.length);
+    const bins = Math.min(28, dataArray.length);
     for (let i = 2; i < bins; i++) {
       sum += dataArray[i];
     }
     const avg = sum / (bins - 2);
-    const normalized = Math.min(100, Math.max(0, (avg / 130) * 100));
+    const normalized = Math.min(100, Math.max(0, (avg / 115) * 100));
 
     setAudioLevel(normalized);
-    setMouthOpenAmount(normalized > 18 ? normalized : 0);
+    setMouthOpenAmount(normalized);
+
+    // Dynamic 3-stage viseme mapping
+    if (normalized > 36) {
+      setMouthStage(2); // wide open
+    } else if (normalized > 12) {
+      setMouthStage(1); // partially open
+    } else {
+      setMouthStage(0); // closed
+    }
 
     if (isJerrySpeaking) {
       animFrameRef.current = requestAnimationFrame(runLipSyncLoop);
     } else {
+      setMouthStage(0);
       setMouthOpenAmount(0);
       setAudioLevel(0);
     }
@@ -157,6 +166,7 @@ export function JerryPodcastStudio() {
       animFrameRef.current = requestAnimationFrame(runLipSyncLoop);
     } else {
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      setMouthStage(0);
       setMouthOpenAmount(0);
       setAudioLevel(0);
     }
@@ -227,11 +237,13 @@ export function JerryPodcastStudio() {
     audio.onended = () => {
       setIsJerrySpeaking(false);
       setJerryPose('listening');
+      setMouthStage(0);
       setMouthOpenAmount(0);
     };
     audio.onerror = () => {
       setIsJerrySpeaking(false);
       setJerryPose('listening');
+      setMouthStage(0);
       setMouthOpenAmount(0);
     };
 
@@ -261,7 +273,7 @@ export function JerryPodcastStudio() {
     } else {
       setErrorNotice(null);
       if (!recognitionRef.current) {
-        setErrorNotice('הדפדפן שלך אינו תומך בזיהוי קולי (Web Speech). ניתן להקליד ישירות בתיבת הטקסט.');
+        setErrorNotice('הדפדפן אינו תומך בזיהוי קולי (Web Speech). ניתן להקליד ישירות בתיבת הטקסט.');
         return;
       }
       try {
@@ -272,7 +284,7 @@ export function JerryPodcastStudio() {
         setJerryPose('listening');
       } catch (err: any) {
         console.error('Mic start error:', err);
-        setErrorNotice('לא ניתן לגשת למיקרופון. אנא ודא הרשאות בדפדפן.');
+        setErrorNotice('לא ניתן לגשת למיקרופון. אנא אשר הרשאת מיקרופון בדפדפן.');
         setIsRecordingMic(false);
       }
     }
@@ -285,7 +297,9 @@ export function JerryPodcastStudio() {
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
         try {
           mediaRecorderRef.current.stop();
-        } catch {}
+        } catch (e) {
+          console.error('Error stopping MediaRecorder:', e);
+        }
       }
       if (micMediaStreamRef.current) {
         micMediaStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -295,39 +309,62 @@ export function JerryPodcastStudio() {
     } else {
       // START recording
       setErrorNotice(null);
+      setEpisodeAudioUrl(null);
+      setRecordingNotice(null);
+
       try {
         const ctx = getAudioContext();
         if (ctx && ctx.state === 'suspended') {
           await ctx.resume();
         }
 
-        // Capture user mic
-        const micStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-        micMediaStreamRef.current = micStream;
+        // Try getting user mic stream
+        let streamToRecord: MediaStream;
+        try {
+          const micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
+          micMediaStreamRef.current = micStream;
 
-        // Route mic through AudioContext into mixed destination
-        if (ctx && mixedDestNodeRef.current) {
-          const micSource = ctx.createMediaStreamSource(micStream);
-          micSource.connect(mixedDestNodeRef.current);
+          if (ctx && mixedDestNodeRef.current) {
+            const micSource = ctx.createMediaStreamSource(micStream);
+            micSource.connect(mixedDestNodeRef.current);
+            streamToRecord = mixedDestNodeRef.current.stream;
+          } else {
+            streamToRecord = micStream;
+          }
+        } catch (micErr: any) {
+          console.warn('Microphone permission denied or not available, recording Jerry output only:', micErr);
+          if (mixedDestNodeRef.current && mixedDestNodeRef.current.stream.getAudioTracks().length > 0) {
+            streamToRecord = mixedDestNodeRef.current.stream;
+            setRecordingNotice('ההקלטה פעילה (רק ערוץ הקול של ג\'רי - לא אושרה הרשאת מיקרופון).');
+          } else {
+            throw new Error('יש לאשר גישה למיקרופון בדפדפן כדי להתחיל להקליט את השיחה.');
+          }
         }
 
-        // Record the mixed destination (which contains Jerry + User Mic)
-        const recordStream = mixedDestNodeRef.current?.stream || micStream;
-        
-        let mimeType = 'audio/webm';
-        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-          mimeType = 'audio/webm;codecs=opus';
-        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
-          mimeType = 'audio/mp4';
+        // Determine best supported MIME type
+        const candidates = [
+          'audio/webm;codecs=opus',
+          'audio/webm',
+          'audio/ogg;codecs=opus',
+          'audio/mp4',
+          '',
+        ];
+        let chosenMime = '';
+        for (const mime of candidates) {
+          if (!mime || MediaRecorder.isTypeSupported(mime)) {
+            chosenMime = mime;
+            break;
+          }
         }
 
-        const mediaRecorder = new MediaRecorder(recordStream, { mimeType });
+        const options: MediaRecorderOptions = chosenMime ? { mimeType: chosenMime } : {};
+        const mediaRecorder = new MediaRecorder(streamToRecord, options);
         recordedChunksRef.current = [];
 
         mediaRecorder.ondataavailable = (e) => {
@@ -338,9 +375,13 @@ export function JerryPodcastStudio() {
 
         mediaRecorder.onstop = () => {
           if (recordedChunksRef.current.length > 0) {
-            const blob = new Blob(recordedChunksRef.current, { type: mimeType });
+            const blobType = chosenMime || 'audio/webm';
+            const blob = new Blob(recordedChunksRef.current, { type: blobType });
             const url = URL.createObjectURL(blob);
             setEpisodeAudioUrl(url);
+            setRecordingNotice('ההקלטה הושלמה בהצלחה! לחץ להורדת הפרק.');
+          } else {
+            setErrorNotice('ההקלטה נעצרה אך לא נלכדו נתוני שמע.');
           }
         };
 
@@ -349,7 +390,7 @@ export function JerryPodcastStudio() {
         setIsEpisodeRecording(true);
       } catch (err: any) {
         console.error('Recording setup error:', err);
-        setErrorNotice('הרשאת מיקרופון נדרשת להקלטת פרק הפודקאסט: ' + (err.message || ''));
+        setErrorNotice(err.message || 'שגיאה בהפעלת ההקלטה. ודא הרשאת מיקרופון בדפדפן.');
         setIsEpisodeRecording(false);
       }
     }
@@ -447,6 +488,7 @@ export function JerryPodcastStudio() {
     setIsJerryThinking(false);
     setIsRecordingMic(false);
     setJerryPose('speaking');
+    setMouthStage(0);
     setMouthOpenAmount(0);
     setMessages([
       {
@@ -466,18 +508,9 @@ export function JerryPodcastStudio() {
     return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
   };
 
-  // Determine active visual frame based on speech & lip-sync volume
-  let currentJerryImage = '/jerry-portrait.jpg';
-  if (jerryPose === 'phone') {
-    currentJerryImage = '/jerry-phone.jpg';
-  } else if (isJerrySpeaking) {
-    // Dynamic lip-sync viseme: toggle open/closed mouth by audio level
-    currentJerryImage = mouthOpenAmount > 22 ? '/jerry-mouth-open.jpg' : '/jerry-mouth-closed.jpg';
-  } else if (isJerryThinking || jerryPose === 'skeptical') {
-    currentJerryImage = '/jerry-listening.jpg';
-  } else {
-    currentJerryImage = '/jerry-portrait.jpg';
-  }
+  // Jaw Drop & Mouth Shift for puppet Lip-Sync
+  const jawDropPx = isJerrySpeaking ? (mouthStage === 2 ? 14 : mouthStage === 1 ? 6 : 0) : 0;
+  const mouthScaleY = isJerrySpeaking ? (mouthStage === 2 ? 1.35 : mouthStage === 1 ? 1.15 : 1.0) : 1.0;
 
   return (
     <div className="w-full flex flex-col lg:flex-row gap-6 items-stretch">
@@ -499,7 +532,7 @@ export function JerryPodcastStudio() {
             />
             <span className="text-[12px] font-mono uppercase tracking-[0.12em] text-[#D8D6CE] font-semibold">
               {isJerrySpeaking
-                ? 'ON AIR - JERRY SPEAKING'
+                ? 'ON AIR - JERRY LIP-SYNC'
                 : isRecordingMic
                 ? 'GUEST SPEAKING (MIC LIVE)'
                 : 'STUDIO LIVE • PODCAST READY'}
@@ -510,7 +543,7 @@ export function JerryPodcastStudio() {
             {/* Lip-sync indicator */}
             <span className="text-[10px] font-mono bg-red-950/80 border border-red-700/60 text-red-300 px-2 py-0.5 rounded-[4px] flex items-center gap-1">
               <Activity className="w-3 h-3 text-red-400" />
-              <span>LIP-SYNC {isJerrySpeaking ? `${Math.round(audioLevel)}%` : 'READY'}</span>
+              <span>LIP-SYNC: {isJerrySpeaking ? (mouthStage === 2 ? 'WIDE' : mouthStage === 1 ? 'OPEN' : 'REST') : 'IDLE'}</span>
             </span>
 
             <button
@@ -530,15 +563,51 @@ export function JerryPodcastStudio() {
           </div>
         </div>
 
-        {/* Jerry's Avatar Canvas with Lip-Sync */}
-        <div className="relative rounded-[12px] overflow-hidden aspect-[16/10] sm:aspect-[16/9] bg-[#0E0E0D] border border-[#333330] flex items-center justify-center group shadow-inner">
+        {/* Jerry's Visual Puppet Canvas with Precision Lip-Sync Layers */}
+        <div className="relative rounded-[12px] overflow-hidden aspect-[16/10] sm:aspect-[16/9] bg-[#0E0E0D] border border-[#333330] flex items-center justify-center group shadow-inner select-none">
+          {/* Base Layer: Portrait / Pose */}
           <img
-            src={currentJerryImage}
+            src={jerryPose === 'phone' ? '/jerry-phone.jpg' : '/jerry-portrait.jpg'}
             alt="Jerry - Engineering Leaders in Real Life"
-            className={`w-full h-full object-cover transition-all duration-75 ${
-              isJerrySpeaking ? 'scale-[1.01] brightness-105' : 'scale-100'
-            }`}
+            className="w-full h-full object-cover"
           />
+
+          {/* LipSync Overlays (Seamless Viseme Layers) */}
+          {jerryPose !== 'phone' && (
+            <>
+              {/* Partially open mouth frame */}
+              <img
+                src="/jerry-speaking.jpg"
+                alt="Jerry speaking viseme"
+                className="absolute inset-0 w-full h-full object-cover transition-opacity duration-75 pointer-events-none"
+                style={{
+                  opacity: mouthStage === 1 ? 1 : 0,
+                  transform: `scale(${1 + mouthOpenAmount * 0.0003})`,
+                }}
+              />
+
+              {/* Wide open mouth frame */}
+              <img
+                src="/jerry-mouth-open.jpg"
+                alt="Jerry wide open viseme"
+                className="absolute inset-0 w-full h-full object-cover transition-opacity duration-75 pointer-events-none"
+                style={{
+                  opacity: mouthStage === 2 ? 1 : 0,
+                  transform: `translateY(${jawDropPx * 0.15}px) scaleY(${mouthScaleY})`,
+                }}
+              />
+
+              {/* Skeptical listening expression when guest speaks */}
+              <img
+                src="/jerry-listening.jpg"
+                alt="Jerry listening"
+                className="absolute inset-0 w-full h-full object-cover transition-opacity duration-150 pointer-events-none"
+                style={{
+                  opacity: (isJerryThinking || isRecordingMic) && !isJerrySpeaking ? 1 : 0,
+                }}
+              />
+            </>
+          )}
 
           {/* Glowing "ON AIR" Retro Studio Sign */}
           <div className="absolute top-3 left-3 bg-red-600/90 backdrop-blur-xs text-white text-[10px] font-black uppercase tracking-[0.18em] px-2.5 py-0.5 rounded-[4px] border border-red-400/30 flex items-center gap-1.5 shadow-lg">
@@ -556,11 +625,14 @@ export function JerryPodcastStudio() {
 
           {/* VU Meter Bars Active when speaking */}
           {isJerrySpeaking && (
-            <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between bg-black/70 backdrop-blur-md py-1.5 px-3 rounded-full border border-white/10 shadow-lg">
-              <span className="text-[10px] font-mono text-[#DCDAD4] mr-2">VOICE FEED:</span>
+            <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between bg-black/75 backdrop-blur-md py-1.5 px-3 rounded-full border border-white/10 shadow-lg">
+              <span className="text-[10px] font-mono text-[#DCDAD4] mr-2 flex items-center gap-1">
+                <Activity className="w-3 h-3 text-red-400 animate-pulse" />
+                <span>VOICE LIP-SYNC:</span>
+              </span>
               <div className="flex items-center gap-1 flex-1 max-w-[200px] justify-center mx-2">
                 {[50, 85, 95, 60, 100, 75, 45, 90, 65, 80, 40, 70].map((h, i) => {
-                  const barH = Math.max(4, ((mouthOpenAmount * h) / 100) * 0.2);
+                  const barH = Math.max(4, ((mouthOpenAmount * h) / 100) * 0.22);
                   return (
                     <div
                       key={i}
@@ -570,7 +642,7 @@ export function JerryPodcastStudio() {
                   );
                 })}
               </div>
-              <span className="text-[10px] font-mono text-red-300">{Math.round(mouthOpenAmount)}%</span>
+              <span className="text-[10px] font-mono text-red-300">{Math.round(mouthOpenAmount)}% audio</span>
             </div>
           )}
 
@@ -578,14 +650,26 @@ export function JerryPodcastStudio() {
           {isJerryThinking && (
             <div className="absolute inset-0 bg-black/60 backdrop-blur-xs flex flex-col items-center justify-center gap-2">
               <Loader2 className="w-7 h-7 text-amber-400 animate-spin" />
-              <span className="text-[13px] font-medium text-amber-200">ג'רי מתכונן לתגובה חדה...</span>
+              <span className="text-[13px] font-medium text-amber-200">ג'רי מגבש תגובה סרקסטית...</span>
             </div>
           )}
         </div>
 
         {/* Master Podcast Recording Bar */}
         <div className="mt-4 pt-3 border-t border-[#2E2E2B] flex flex-col gap-3">
-          <div className="flex items-center justify-between bg-[#232321] p-2.5 rounded-[10px] border border-[#383835]">
+          {recordingNotice && (
+            <div className="text-[11.5px] bg-emerald-950/70 text-emerald-300 border border-emerald-800/60 rounded-[6px] px-3 py-1.5 flex items-center justify-between">
+              <span>{recordingNotice}</span>
+              <button
+                onClick={() => setRecordingNotice(null)}
+                className="text-emerald-400 hover:text-white cursor-pointer ml-2 text-xs"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
+          <div className="flex items-center justify-between bg-[#232321] p-2.5 rounded-[10px] border border-[#383835] flex-wrap gap-2">
             <div className="flex items-center gap-2.5">
               <button
                 onClick={handleToggleEpisodeRecord}
@@ -657,11 +741,11 @@ export function JerryPodcastStudio() {
             <h2 className="text-[16px] sm:text-[18px] font-semibold text-[#141413] tracking-[-0.015em] flex items-center gap-2">
               <span>שיחה חיה עם ג'רי</span>
               <span className="text-[10px] font-mono bg-red-100 text-red-800 px-2 py-0.5 rounded font-bold">
-                LIP-SYNC & VOICE
+                LIP-SYNC & FAST ENGINE
               </span>
             </h2>
             <p className="text-[12px] text-[#8E8D8A]">
-              דבר אל ג'רי במיקרופון – הוא מקשיב, עונה בקולו ומזיז את הפה בסנכרון מלא
+              דבר אל ג'רי במיקרופון – הוא מקשיב, עונה בקולו ומזיז את השפתיים בסנכרון קולי חי
             </p>
           </div>
 
@@ -737,7 +821,7 @@ export function JerryPodcastStudio() {
           {isJerryThinking && (
             <div className="flex items-center gap-2 text-[12px] text-[#787672] p-2 bg-[#F9F8F5] rounded-[8px] border border-[#EBEAE5] w-fit">
               <Loader2 className="w-3.5 h-3.5 animate-spin text-red-600" />
-              <span>ג'רי חושב על תגובה ספציפית ומקליט קול...</span>
+              <span>ג'רי חושב ומקליט תשובה... (מהיר)</span>
             </div>
           )}
 
@@ -806,8 +890,8 @@ export function JerryPodcastStudio() {
           <div className="flex items-center gap-1.5 flex-wrap mt-2.5 text-[11px] text-[#787672]">
             <span className="font-medium text-[#141413]">רעיונות לתשובה:</span>
             {[
-              'ה-AI ביטל לנו חצי מה-PRs כי הכל קומפייל אוטומטית.',
-              'הצוות שלי החליט להעביר את כל הפרודקשן לקוברנטיס בלי טסטים.',
+              'העברנו הכל לקוברנטיס בלי טסטים וזה עובד מדהים.',
+              'פיטרנו את כל אנשי ה-QA וסומכים רק על ה-AI.',
               'איתי, יש לך שיחה דחופה בטלפון.',
             ].map((suggestion, i) => (
               <button
