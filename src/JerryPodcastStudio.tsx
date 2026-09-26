@@ -278,7 +278,7 @@ export function JerryPodcastStudio() {
     }
 
     if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
-      liveSocketRef.current.send(JSON.stringify({ type: 'audio-end' }));
+      liveSocketRef.current.send(JSON.stringify({ type: 'activity-end' }));
     }
 
     setIsRecordingMic(false);
@@ -314,6 +314,12 @@ export function JerryPodcastStudio() {
         },
       });
       liveMicStreamRef.current = stream;
+
+      // Push-to-talk gives us exact speech boundaries; tell the STT model
+      // explicitly so background tones/silence are not mistaken for speech.
+      if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
+        liveSocketRef.current.send(JSON.stringify({ type: 'activity-start' }));
+      }
 
       const [track] = stream.getAudioTracks();
       if (!track || track.readyState !== 'live') {
@@ -559,6 +565,15 @@ export function JerryPodcastStudio() {
           if (msg.type === 'stt-error') {
             console.error('[Jerry STT] server error:', msg.message);
             setErrorNotice('תמלול העברית נכשל: ' + (msg.message || 'שגיאת STT'));
+            return;
+          }
+
+          if (msg.type === 'stt-retry') {
+            console.warn('[Jerry STT] rejected transcript:', msg.text);
+            liveInputTranscriptRef.current = '';
+            setMicTranscript('');
+            setIsJerryThinking(false);
+            setErrorNotice(msg.message || 'לא הצלחתי לזהות את העברית. נסה שוב.');
             return;
           }
 
