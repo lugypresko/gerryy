@@ -207,7 +207,7 @@ export function JerryPodcastStudio() {
     });
   }, []);
 
-  const startPcmDebugCapture = useCallback(async () => {
+  async function startPcmDebugCapture() {
     setErrorNotice(null);
 
     if (!isLiveReady) {
@@ -229,7 +229,7 @@ export function JerryPodcastStudio() {
     pcmDebugStopTimerRef.current = window.setTimeout(() => {
       finishPcmDebugCapture();
     }, 5000);
-  }, [isLiveReady, startLiveMic, finishPcmDebugCapture]);
+  }
 
   const commitLiveUserTurn = useCallback(() => {
     if (liveUserTurnCommittedRef.current) return;
