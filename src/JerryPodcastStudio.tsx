@@ -288,6 +288,15 @@ export function JerryPodcastStudio() {
   const startLiveMic = useCallback(async () => {
     if (!isLiveReady || liveSocketRef.current?.readyState !== WebSocket.OPEN) return;
 
+    // A new guest turn owns the floor. Stop any previous Jerry replay/opening.
+    if (audioPlayerRef.current && !audioPlayerRef.current.paused) {
+      audioPlayerRef.current.pause();
+      audioPlayerRef.current.currentTime = 0;
+    }
+    livePlaybackQueueRef.current = [];
+    livePlaybackReadOffsetRef.current = 0;
+    liveQueuedSamplesRef.current = 0;
+
     // Mark Live mic ownership before any async permission prompt. This prevents
     // a stale Web Speech "onend" event from immediately turning the mic UI off.
     liveMicActiveRef.current = true;
@@ -495,6 +504,13 @@ export function JerryPodcastStudio() {
   const playLivePcmChunk = useCallback(
     (base64: string) => {
       if (isMuted) return;
+
+      // Audio-source invariant: Jerry may have only ONE audible voice at a time.
+      // Stop any opening/replay/fallback <audio> before streamed Live PCM starts.
+      if (audioPlayerRef.current && !audioPlayerRef.current.paused) {
+        audioPlayerRef.current.pause();
+        audioPlayerRef.current.currentTime = 0;
+      }
 
       const bytes = base64ToBytes(base64);
       livePcmChunksRef.current.push(bytes);
@@ -833,6 +849,13 @@ export function JerryPodcastStudio() {
 
   const playJerryAudio = (audioSrc: string, pose: 'speaking' | 'phone' = 'speaking') => {
     if (isMuted) return;
+
+    // Audio-source invariant: replay/opening/fallback audio must never overlap
+    // with the streamed Gemini Live voice.
+    livePlaybackQueueRef.current = [];
+    livePlaybackReadOffsetRef.current = 0;
+    liveQueuedSamplesRef.current = 0;
+
     const ctx = getAudioContext();
     if (ctx && ctx.state === 'suspended') {
       ctx.resume();
