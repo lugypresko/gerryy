@@ -757,6 +757,30 @@ CRITICAL RULES:
 
             if (finalText && finalText.trim()) {
               const transcript = finalText.trim();
+
+              // Hebrew is a hint in the transcription API, not a hard lock.
+              // Reject obviously foreign-language hallucinations instead of
+              // letting Jerry follow them into German/Korean/etc.
+              const hebrewChars = (transcript.match(/[\u0590-\u05FF]/g) || []).length;
+              const latinChars = (transcript.match(/[A-Za-z]/g) || []).length;
+              const knownTechOnly =
+                /^(kubernetes|production|deploy(?:ment)?|rollback|incident|latency|github|pr|r&d|engineering|ai|gemini)[\s.,!?-]*$/i.test(
+                  transcript,
+                );
+              const looksHebrew = hebrewChars >= 2 && hebrewChars >= Math.floor(latinChars * 0.35);
+
+              if (!looksHebrew && !knownTechOnly) {
+                console.warn('[Jerry STT] rejected non-Hebrew transcript:', transcript);
+                client.send(
+                  JSON.stringify({
+                    type: 'stt-retry',
+                    text: transcript,
+                    message: 'לא הצלחתי לזהות עברית בצורה אמינה. נסה שוב במשפט קצר וברור.',
+                  }),
+                );
+                return;
+              }
+
               if (transcript !== lastFinalGuestTranscript) {
                 lastFinalGuestTranscript = transcript;
                 client.send(JSON.stringify({ type: 'input-transcript', text: transcript }));
@@ -787,6 +811,11 @@ CRITICAL RULES:
         },
         config: {
           responseModalities: [Modality.TEXT],
+          realtimeInputConfig: {
+            automaticActivityDetection: {
+              disabled: true,
+            },
+          },
           inputAudioTranscription: {
             languageCodes: ['he-IL'],
             customVocabulary: [
@@ -807,7 +836,7 @@ CRITICAL RULES:
               'איתי',
               'ג\'רי',
             ],
-            mode: 'SMART',
+            mode: 'VERBATIM',
           },
         },
       });
@@ -911,6 +940,9 @@ CRITICAL RULES:
         const msg = JSON.parse(raw.toString());
         if (msg.type === 'text' && typeof msg.text === 'string' && msg.text.trim()) {
           liveSession.sendRealtimeInput({ text: msg.text.trim() });
+        } else if (msg.type === 'activity-start') {
+          lastFinalGuestTranscript = '';
+          transcribeSession?.sendRealtimeInput({ activityStart: {} });
         } else if (msg.type === 'audio' && typeof msg.data === 'string' && msg.data) {
           // Raw microphone audio goes ONLY to the Hebrew transcription model.
           transcribeSession?.sendRealtimeInput({
@@ -919,9 +951,8 @@ CRITICAL RULES:
               mimeType: msg.mimeType || 'audio/pcm;rate=16000',
             },
           });
-        } else if (msg.type === 'audio-end') {
-          lastFinalGuestTranscript = '';
-          transcribeSession?.sendRealtimeInput({ audioStreamEnd: true });
+        } else if (msg.type === 'activity-end') {
+          transcribeSession?.sendRealtimeInput({ activityEnd: {} });
         }
       } catch (err) {
         console.warn('[Jerry Live] bad browser message:', err);
