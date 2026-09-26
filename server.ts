@@ -56,7 +56,7 @@ REACT BEFORE YOU ASK.
 18. מותר להתלונן על איתי, הבוס שלך, פעם אחת בשיחה, בחיבה עצבנית. לא להפוך את זה לבדיחה חוזרת.
 19. אסור לתת עצות, רשימות או "חמישה טיפים" אלא אם האורח ביקש במפורש.
 20. דבר בעברית טבעית. Tech English כמו deploy, production, rollback, latency, incident, PR, Kubernetes נשאר טבעי.
-21. אתה מדבר ועונה בעברית בלבד. אם קלט נראה כמו שפה אחרת, אל תעבור שפה ואל תתרגם לשפה אחרת.
+21. אתה מנהל שיחה רק בעברית, באנגלית, או בשילוב טבעי ביניהן. לעולם אל תעבור לגרמנית, ספרדית, קוריאנית או כל שפה אחרת. אם הקלט נראה כמו שפה אחרת, הנח שזו שגיאת תמלול ואל תענה בשפה הזרה.
 22. הקול יבש, חם, מעט מחוספס, בקצב ניו-יורקי קל. פאוזות טבעיות. לא תיאטרלי ולא קריקטורה.
 23. אל תקריא תגיות במה כמו <sigh> או <chuckle>. בצע אותן בקול אם מתאים.
 24. התחל מהר. אל תחשוב בקול ואל תאריך הקדמות.
@@ -847,7 +847,7 @@ CRITICAL RULES:
                         },
                         {
                           text:
-                            'תמלל מילה במילה את הדיבור בקובץ. הדובר מדבר עברית ישראלית ויכול לשלב מונחי הייטק באנגלית. החזר רק את התמלול, ללא הסבר, ללא תרגום וללא ניחוש של שפה אחרת. אם קטע לא ברור, כתוב [לא ברור].',
+                            'תמלל מילה במילה את הדיבור בקובץ. הדובר מדבר עברית, אנגלית, או שילוב טבעי ביניהן, ויכול לשלב מונחי הייטק באנגלית. החזר רק את התמלול, ללא הסבר וללא תרגום. לעולם אל תחזיר גרמנית, ספרדית, קוריאנית או שפה אחרת. אם קטע לא ברור, כתוב [לא ברור].',
                         },
                       ],
                     },
@@ -880,15 +880,16 @@ CRITICAL RULES:
 
             const hebrewChars = (cleaned.match(/[\u0590-\u05FF]/g) || []).length;
             const latinChars = (cleaned.match(/[A-Za-z]/g) || []).length;
-            const hasHebrew = hebrewChars >= 2;
-            const looksLikeTechMix = hasHebrew && hebrewChars >= Math.floor(latinChars * 0.2);
+            const nonAllowedLetters = (cleaned.match(/[^\s\u0590-\u05FFA-Za-z0-9.,!?'"()\-:&/]/g) || []).length;
+            const hasAllowedLanguage = hebrewChars >= 2 || latinChars >= 2;
+            const looksHebrewEnglish = hasAllowedLanguage && nonAllowedLetters === 0;
 
-            if (looksLikeTechMix || cleaned === '[לא ברור]') {
+            if (looksHebrewEnglish || cleaned === '[לא ברור]') {
               transcript = cleaned;
               break;
             }
 
-            console.warn('[Jerry STT] rejected non-Hebrew turn transcript:', cleaned);
+            console.warn('[Jerry STT] rejected non Hebrew/English turn transcript:', cleaned);
           } catch (err) {
             console.warn('[Jerry STT] turn transcription exception:', err);
           }
@@ -901,7 +902,7 @@ CRITICAL RULES:
             client.send(
               JSON.stringify({
                 type: 'stt-retry',
-                message: 'לא הצלחתי להבין את המשפט בעברית. נסה שוב.',
+                message: 'לא הצלחתי לזהות עברית או אנגלית בצורה אמינה. נסה שוב.',
               }),
             );
           }
