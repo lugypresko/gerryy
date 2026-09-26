@@ -601,11 +601,16 @@ export function JerryPodcastStudio() {
               }
             }
 
-            if (lastModelIndex >= 0 && socket.readyState === WebSocket.OPEN) {
+            const firstUserIndex = history.findIndex((m) => m.sender === 'user');
+            if (
+              firstUserIndex >= 0 &&
+              lastModelIndex >= firstUserIndex &&
+              socket.readyState === WebSocket.OPEN
+            ) {
               socket.send(
                 JSON.stringify({
                   type: 'restore-history',
-                  turns: history.slice(0, lastModelIndex + 1).map((m) => ({
+                  turns: history.slice(firstUserIndex, lastModelIndex + 1).map((m) => ({
                     role: m.sender === 'user' ? 'user' : 'model',
                     text: m.text,
                   })),
@@ -1241,7 +1246,7 @@ export function JerryPodcastStudio() {
 
     // Fallback path if Live is temporarily unavailable.
     try {
-      const serverHistory = newHistory.map((m) => ({
+      const serverHistory = messages.map((m) => ({
         role: m.sender === 'user' ? 'user' : 'model',
         text: m.text,
       }));
