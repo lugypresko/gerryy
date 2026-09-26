@@ -86,6 +86,10 @@ export function JerryPodcastStudio() {
   const livePcmChunksRef = useRef<Uint8Array[]>([]);
   const liveAudioEndTimeRef = useRef(0);
   const liveTurnTimerRef = useRef<number | null>(null);
+  const livePlaybackProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const livePlaybackQueueRef = useRef<Float32Array[]>([]);
+  const livePlaybackReadOffsetRef = useRef(0);
+  const liveQueuedSamplesRef = useRef(0);
   const liveMicStreamRef = useRef<MediaStream | null>(null);
   const liveMicSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const liveMicProcessorRef = useRef<ScriptProcessorNode | null>(null);
@@ -432,13 +436,59 @@ export function JerryPodcastStudio() {
     return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
   };
 
+  const ensureLivePlaybackProcessor = useCallback(() => {
+    const ctx = getAudioContext();
+    if (!ctx) return null;
+    if (ctx.state === 'suspended') void ctx.resume();
+
+    if (livePlaybackProcessorRef.current) {
+      return livePlaybackProcessorRef.current;
+    }
+
+    // One continuous output node drains a PCM queue. This avoids creating a
+    // separate AudioBufferSourceNode for every network chunk, which can produce
+    // periodic clicks/tones at chunk boundaries.
+    const processor = ctx.createScriptProcessor(2048, 0, 1);
+    processor.onaudioprocess = (event) => {
+      const output = event.outputBuffer.getChannelData(0);
+      output.fill(0);
+
+      let writeOffset = 0;
+      while (writeOffset < output.length && livePlaybackQueueRef.current.length > 0) {
+        const head = livePlaybackQueueRef.current[0];
+        const readOffset = livePlaybackReadOffsetRef.current;
+        const available = head.length - readOffset;
+        const needed = output.length - writeOffset;
+        const count = Math.min(available, needed);
+
+        output.set(head.subarray(readOffset, readOffset + count), writeOffset);
+        writeOffset += count;
+        livePlaybackReadOffsetRef.current += count;
+        liveQueuedSamplesRef.current = Math.max(0, liveQueuedSamplesRef.current - count);
+
+        if (livePlaybackReadOffsetRef.current >= head.length) {
+          livePlaybackQueueRef.current.shift();
+          livePlaybackReadOffsetRef.current = 0;
+        }
+      }
+    };
+
+    if (analyserRef.current) {
+      processor.connect(analyserRef.current);
+    } else {
+      processor.connect(ctx.destination);
+    }
+    if (mixedDestNodeRef.current) {
+      processor.connect(mixedDestNodeRef.current);
+    }
+
+    livePlaybackProcessorRef.current = processor;
+    return processor;
+  }, []);
+
   const playLivePcmChunk = useCallback(
     (base64: string) => {
       if (isMuted) return;
-
-      const ctx = getAudioContext();
-      if (!ctx) return;
-      if (ctx.state === 'suspended') void ctx.resume();
 
       const bytes = base64ToBytes(base64);
       livePcmChunksRef.current.push(bytes);
@@ -446,45 +496,21 @@ export function JerryPodcastStudio() {
       const sampleCount = Math.floor(bytes.byteLength / 2);
       if (!sampleCount) return;
 
-      const audioBuffer = ctx.createBuffer(1, sampleCount, 24000);
-      const channel = audioBuffer.getChannelData(0);
+      const samples = new Float32Array(sampleCount);
       const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-
-      const fadeSamples = Math.min(Math.floor(24000 * 0.004), Math.floor(sampleCount / 2));
       for (let i = 0; i < sampleCount; i++) {
-        let sample = view.getInt16(i * 2, true) / 32768;
-
-        // Tiny edge fades remove occasional clicks/tones at PCM chunk boundaries.
-        if (fadeSamples > 0 && i < fadeSamples) {
-          sample *= i / fadeSamples;
-        } else if (fadeSamples > 0 && i >= sampleCount - fadeSamples) {
-          sample *= (sampleCount - i - 1) / fadeSamples;
-        }
-
-        channel[i] = sample;
+        samples[i] = view.getInt16(i * 2, true) / 32768;
       }
 
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuffer;
-
-      if (analyserRef.current) {
-        source.connect(analyserRef.current);
-      } else {
-        source.connect(ctx.destination);
-      }
-      if (mixedDestNodeRef.current) {
-        source.connect(mixedDestNodeRef.current);
-      }
-
-      const startAt = Math.max(ctx.currentTime + 0.015, liveAudioEndTimeRef.current);
-      source.start(startAt);
-      liveAudioEndTimeRef.current = startAt + audioBuffer.duration;
+      livePlaybackQueueRef.current.push(samples);
+      liveQueuedSamplesRef.current += sampleCount;
+      ensureLivePlaybackProcessor();
 
       setIsJerryThinking(false);
       setIsJerrySpeaking(true);
       setJerryPose('speaking');
     },
-    [isMuted],
+    [isMuted, ensureLivePlaybackProcessor],
   );
 
   // Open one persistent Gemini Live session for the podcast instead of doing
@@ -544,6 +570,9 @@ export function JerryPodcastStudio() {
           if (msg.type === 'interrupted') {
             liveAudioEndTimeRef.current = audioContextRef.current?.currentTime || 0;
             livePcmChunksRef.current = [];
+            livePlaybackQueueRef.current = [];
+            livePlaybackReadOffsetRef.current = 0;
+            liveQueuedSamplesRef.current = 0;
             liveTranscriptRef.current = '';
             setIsJerrySpeaking(false);
             setIsJerryThinking(false);
@@ -570,10 +599,10 @@ export function JerryPodcastStudio() {
             liveTranscriptRef.current = '';
             livePcmChunksRef.current = [];
 
-            const ctx = audioContextRef.current;
-            const remainingMs = ctx
-              ? Math.max(0, (liveAudioEndTimeRef.current - ctx.currentTime) * 1000)
-              : 0;
+            const remainingMs = Math.max(
+              0,
+              (liveQueuedSamplesRef.current / 24000) * 1000,
+            );
 
             if (liveTurnTimerRef.current) window.clearTimeout(liveTurnTimerRef.current);
             liveTurnTimerRef.current = window.setTimeout(() => {
@@ -616,6 +645,13 @@ export function JerryPodcastStudio() {
       disposed = true;
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       if (liveTurnTimerRef.current) window.clearTimeout(liveTurnTimerRef.current);
+      try {
+        livePlaybackProcessorRef.current?.disconnect();
+      } catch {}
+      livePlaybackProcessorRef.current = null;
+      livePlaybackQueueRef.current = [];
+      livePlaybackReadOffsetRef.current = 0;
+      liveQueuedSamplesRef.current = 0;
       try {
         liveSocketRef.current?.close();
       } catch {}
