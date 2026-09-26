@@ -898,12 +898,27 @@ CRITICAL RULES:
 
             if (!cleaned) continue;
 
-            if (language === 'hebrew' || language === 'english' || language === 'mixed') {
+            // Deterministic second firewall: even if the model misclassifies a
+            // foreign transcript as English, only Hebrew letters and plain
+            // ASCII English letters are allowed through to Jerry.
+            const foreignScriptChars =
+              cleaned.match(/[^\u0590-\u05FFA-Za-z0-9\s.,!?'"()\-:&/]/g) || [];
+            const hasAllowedLetters = /[\u0590-\u05FFA-Za-z]/.test(cleaned);
+            const passesScriptFirewall = foreignScriptChars.length === 0 && hasAllowedLetters;
+
+            if (
+              (language === 'hebrew' || language === 'english' || language === 'mixed') &&
+              passesScriptFirewall
+            ) {
               transcript = cleaned;
               break;
             }
 
-            console.warn('[Jerry STT] rejected language:', { language, transcript: cleaned });
+            console.warn('[Jerry STT] rejected turn transcript:', {
+              language,
+              transcript: cleaned,
+              foreignScriptChars,
+            });
           } catch (err) {
             console.warn('[Jerry STT] turn transcription exception:', err);
           }
@@ -917,6 +932,25 @@ CRITICAL RULES:
               JSON.stringify({
                 type: 'stt-retry',
                 message: 'לא הצלחתי לזהות עברית או אנגלית בצורה אמינה. נסה שוב.',
+              }),
+            );
+          }
+          return;
+        }
+
+        // Final defense-in-depth check before anything reaches Jerry.
+        const finalForeignChars =
+          transcript.match(/[^\u0590-\u05FFA-Za-z0-9\s.,!?'"()\-:&/]/g) || [];
+        if (finalForeignChars.length > 0 || !/[\u0590-\u05FFA-Za-z]/.test(transcript)) {
+          console.warn('[Jerry STT] blocked transcript at final firewall:', {
+            transcript,
+            finalForeignChars,
+          });
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(
+              JSON.stringify({
+                type: 'stt-retry',
+                message: 'זוהתה שפה שאינה עברית או אנגלית. נסה שוב.',
               }),
             );
           }
