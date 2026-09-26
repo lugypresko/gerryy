@@ -60,6 +60,8 @@ export function JerryPodcastStudio() {
   const [episodeFileExtension, setEpisodeFileExtension] = useState('webm');
   const [recordingNotice, setRecordingNotice] = useState<string | null>(null);
   const [isLiveReady, setIsLiveReady] = useState(false);
+  const [isPcmDebugRecording, setIsPcmDebugRecording] = useState(false);
+  const [pcmDebugAudioUrl, setPcmDebugAudioUrl] = useState<string | null>(null);
 
   // Audio & WebRTC references
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
@@ -92,6 +94,8 @@ export function JerryPodcastStudio() {
   const liveUserTurnCommittedRef = useRef(false);
   const smoothedLipLevelRef = useRef(0);
   const quietLipFramesRef = useRef(0);
+  const pcmDebugChunksRef = useRef<Uint8Array[]>([]);
+  const pcmDebugStopTimerRef = useRef<number | null>(null);
 
   // Auto-scroll chat messages
   useEffect(() => {
@@ -137,6 +141,89 @@ export function JerryPodcastStudio() {
 
     return new Uint8Array(output.buffer);
   };
+
+  const pcm16ChunksToWavBlob = (chunks: Uint8Array[], sampleRate = 16000) => {
+    const dataLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+    const buffer = new ArrayBuffer(44 + dataLength);
+    const view = new DataView(buffer);
+
+    const writeAscii = (offset: number, value: string) => {
+      for (let i = 0; i < value.length; i++) {
+        view.setUint8(offset + i, value.charCodeAt(i));
+      }
+    };
+
+    writeAscii(0, 'RIFF');
+    view.setUint32(4, 36 + dataLength, true);
+    writeAscii(8, 'WAVE');
+    writeAscii(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeAscii(36, 'data');
+    view.setUint32(40, dataLength, true);
+
+    let offset = 44;
+    for (const chunk of chunks) {
+      new Uint8Array(buffer, offset, chunk.byteLength).set(chunk);
+      offset += chunk.byteLength;
+    }
+
+    return new Blob([buffer], { type: 'audio/wav' });
+  };
+
+  const finishPcmDebugCapture = useCallback(() => {
+    if (!pcmDebugChunksRef.current.length) {
+      setIsPcmDebugRecording(false);
+      setErrorNotice('לא נאסף אודיו בבדיקת PCM.');
+      return;
+    }
+
+    const blob = pcm16ChunksToWavBlob(pcmDebugChunksRef.current, 16000);
+    const url = URL.createObjectURL(blob);
+
+    setPcmDebugAudioUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return url;
+    });
+    setIsPcmDebugRecording(false);
+    pcmDebugChunksRef.current = [];
+    pcmDebugStopTimerRef.current = null;
+
+    console.info('[PCM Debug] capture ready', {
+      bytes: blob.size,
+      type: blob.type,
+      sampleRate: 16000,
+    });
+  }, []);
+
+  const startPcmDebugCapture = useCallback(async () => {
+    setErrorNotice(null);
+
+    if (!isLiveReady) {
+      setErrorNotice('Gemini Live עדיין לא מחובר. המתן עד שיופיע GEMINI LIVE ואז נסה שוב.');
+      return;
+    }
+
+    pcmDebugChunksRef.current = [];
+    setIsPcmDebugRecording(true);
+
+    if (!liveMicActiveRef.current) {
+      await startLiveMic();
+    }
+
+    if (pcmDebugStopTimerRef.current) {
+      window.clearTimeout(pcmDebugStopTimerRef.current);
+    }
+
+    pcmDebugStopTimerRef.current = window.setTimeout(() => {
+      finishPcmDebugCapture();
+    }, 5000);
+  }, [isLiveReady, startLiveMic, finishPcmDebugCapture]);
 
   const commitLiveUserTurn = useCallback(() => {
     if (liveUserTurnCommittedRef.current) return;
@@ -256,6 +343,11 @@ export function JerryPodcastStudio() {
         const pcm = resampleTo16kPcm(input, micCtx.sampleRate);
         if (!pcm.byteLength) return;
 
+        // Capture exactly the same 16kHz PCM bytes that are sent to Gemini Live.
+        if (isPcmDebugRecording) {
+          pcmDebugChunksRef.current.push(new Uint8Array(pcm));
+        }
+
         socket.send(
           JSON.stringify({
             type: 'audio',
@@ -303,7 +395,7 @@ export function JerryPodcastStudio() {
       setErrorNotice(reason);
       setIsRecordingMic(false);
     }
-  }, [isLiveReady]);
+  }, [isLiveReady, isPcmDebugRecording]);
 
   const pcm16ChunksToWavUrl = (chunks: Uint8Array[], sampleRate = 24000) => {
     const dataLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
@@ -1405,6 +1497,31 @@ export function JerryPodcastStudio() {
               </span>
             </div>
           )}
+
+          <div className="mb-2 flex items-center gap-2 flex-wrap">
+            <button
+              type="button"
+              onClick={startPcmDebugCapture}
+              disabled={isPcmDebugRecording || !isLiveReady}
+              className="px-2.5 py-1.5 rounded-[7px] text-[11px] font-semibold border border-[#DCDAD4] bg-[#F4F3EF] hover:bg-[#EBE9E3] disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Record the exact 16kHz PCM sent to Gemini for 5 seconds"
+            >
+              {isPcmDebugRecording ? 'מקליט PCM... 5 שניות' : 'בדיקת PCM ל-5 שניות'}
+            </button>
+
+            {pcmDebugAudioUrl && (
+              <>
+                <audio src={pcmDebugAudioUrl} controls className="h-8 max-w-[260px]" />
+                <a
+                  href={pcmDebugAudioUrl}
+                  download={`jerry-mic-debug-${Date.now()}.wav`}
+                  className="text-[11px] underline text-[#454440] hover:text-black"
+                >
+                  הורד WAV
+                </a>
+              </>
+            )}
+          </div>
 
           <form
             onSubmit={(e) => {
