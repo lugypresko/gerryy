@@ -502,7 +502,7 @@ export function JerryPodcastStudio() {
   }, []);
 
   const playLivePcmChunk = useCallback(
-    (base64: string) => {
+    (base64: string, mimeType = 'audio/pcm;rate=24000') => {
       if (isMuted) return;
 
       // Audio-source invariant: Jerry may have only ONE audible voice at a time.
@@ -518,14 +518,40 @@ export function JerryPodcastStudio() {
       const sampleCount = Math.floor(bytes.byteLength / 2);
       if (!sampleCount) return;
 
-      const samples = new Float32Array(sampleCount);
+      const sourceSamples = new Float32Array(sampleCount);
       const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
       for (let i = 0; i < sampleCount; i++) {
-        samples[i] = view.getInt16(i * 2, true) / 32768;
+        sourceSamples[i] = view.getInt16(i * 2, true) / 32768;
       }
 
-      livePlaybackQueueRef.current.push(samples);
-      liveQueuedSamplesRef.current += sampleCount;
+      // Gemini Live returns PCM at ~24 kHz, while Chrome's AudioContext is
+      // commonly 48 kHz. Writing 24 kHz samples directly into a 48 kHz output
+      // plays Jerry at 2x speed/pitch and makes him nearly unintelligible.
+      const sourceRateMatch = /rate=(\d+)/i.exec(mimeType || '');
+      const sourceRate = sourceRateMatch ? Number(sourceRateMatch[1]) : 24000;
+      const ctx = getAudioContext();
+      const targetRate = ctx?.sampleRate || sourceRate;
+
+      let playbackSamples = sourceSamples;
+      if (sourceRate > 0 && targetRate > 0 && sourceRate !== targetRate) {
+        const ratio = targetRate / sourceRate;
+        const outputLength = Math.max(1, Math.round(sourceSamples.length * ratio));
+        const resampled = new Float32Array(outputLength);
+
+        for (let i = 0; i < outputLength; i++) {
+          const sourcePos = i / ratio;
+          const left = Math.floor(sourcePos);
+          const right = Math.min(sourceSamples.length - 1, left + 1);
+          const frac = sourcePos - left;
+          const a = sourceSamples[left] ?? 0;
+          const b = sourceSamples[right] ?? a;
+          resampled[i] = a + (b - a) * frac;
+        }
+        playbackSamples = resampled;
+      }
+
+      livePlaybackQueueRef.current.push(playbackSamples);
+      liveQueuedSamplesRef.current += playbackSamples.length;
       ensureLivePlaybackProcessor();
 
       setIsJerryThinking(false);
@@ -563,7 +589,7 @@ export function JerryPodcastStudio() {
 
           if (msg.type === 'audio' && msg.data) {
             commitLiveUserTurn();
-            playLivePcmChunk(msg.data);
+            playLivePcmChunk(msg.data, msg.mimeType || 'audio/pcm;rate=24000');
             return;
           }
 
@@ -630,9 +656,10 @@ export function JerryPodcastStudio() {
             liveTranscriptRef.current = '';
             livePcmChunksRef.current = [];
 
+            const playbackRate = audioContextRef.current?.sampleRate || 48000;
             const remainingMs = Math.max(
               0,
-              (liveQueuedSamplesRef.current / 24000) * 1000,
+              (liveQueuedSamplesRef.current / playbackRate) * 1000,
             );
 
             if (liveTurnTimerRef.current) window.clearTimeout(liveTurnTimerRef.current);
