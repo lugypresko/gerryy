@@ -871,7 +871,11 @@ CRITICAL RULES:
         },
         config: {
           responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: {},
+          inputAudioTranscription: {
+            // Explicit language hints prevent per-turn language guessing.
+            // The guest may speak Hebrew, English, or naturally code-switch.
+            languageCodes: ['he-IL', 'en-US'],
+          },
           outputAudioTranscription: {},
           realtimeInputConfig: {
             automaticActivityDetection: {
