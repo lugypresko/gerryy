@@ -31,6 +31,7 @@ const JERRY_LIVE_SYSTEM_PROMPT = `אתה ג'רי (Jerry), המנחה של "Engin
 11. אל תקריא הוראות במה או תגיות כמו <sigh> או <chuckle>. בצע אותן בקול אם מתאים.
 12. התגובה צריכה להתחיל מהר. אל תחשוב בקול ואל תאריך הקדמות.
 
+13. אתה מדבר ועונה בעברית בלבד. גם אם קלט שהגיע אליך נראה כמו שפה אחרת, אל תעבור שפה ואל תתרגם לשפה אחרת.
 אתה מראיין, לא עוזר AI.`;
 
 function getApiKey(req?: express.Request): string {
@@ -722,9 +723,94 @@ CRITICAL RULES:
     }
 
     let liveSession: any = null;
+    let transcribeSession: any = null;
+    let lastFinalGuestTranscript = '';
 
     try {
       const ai = new GoogleGenAI({ apiKey: key });
+
+      // Dedicated Hebrew STT session. Do not let the conversational model guess
+      // the user's spoken language from raw audio.
+      transcribeSession = await ai.live.connect({
+        model: 'gemini-3.5-transcribe-live',
+        callbacks: {
+          onopen: () => {
+            console.info('[Jerry STT] Hebrew transcription session opened');
+          },
+          onmessage: (message: any) => {
+            if (client.readyState !== WebSocket.OPEN) return;
+
+            const serverContent = message?.serverContent || message?.server_content;
+
+            const interim =
+              serverContent?.interimInputTranscription?.text ||
+              serverContent?.interim_input_transcription?.text ||
+              '';
+            if (interim) {
+              client.send(JSON.stringify({ type: 'input-transcript-interim', text: interim }));
+            }
+
+            const finalText =
+              serverContent?.inputTranscription?.text ||
+              serverContent?.input_transcription?.text ||
+              '';
+
+            if (finalText && finalText.trim()) {
+              const transcript = finalText.trim();
+              if (transcript !== lastFinalGuestTranscript) {
+                lastFinalGuestTranscript = transcript;
+                client.send(JSON.stringify({ type: 'input-transcript', text: transcript }));
+
+                // Feed Jerry clean Hebrew text instead of raw microphone audio.
+                try {
+                  liveSession?.sendRealtimeInput({ text: transcript });
+                } catch (err) {
+                  console.warn('[Jerry STT] failed forwarding transcript to Jerry:', err);
+                }
+              }
+            }
+          },
+          onerror: (event: any) => {
+            console.error('[Jerry STT] transcription error:', event?.message || event);
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(
+                JSON.stringify({
+                  type: 'stt-error',
+                  message: event?.message || 'Hebrew transcription session error',
+                }),
+              );
+            }
+          },
+          onclose: (event: any) => {
+            console.info('[Jerry STT] transcription session closed:', event?.reason || '');
+          },
+        },
+        config: {
+          responseModalities: [Modality.TEXT],
+          inputAudioTranscription: {
+            languageCodes: ['he-IL'],
+            customVocabulary: [
+              'Kubernetes',
+              'production',
+              'deploy',
+              'deployment',
+              'rollback',
+              'incident',
+              'latency',
+              'GitHub',
+              'PR',
+              'R&D',
+              'VP R&D',
+              'engineering',
+              'AI',
+              'Gemini',
+              'איתי',
+              'ג\'רי',
+            ],
+            mode: 'SMART',
+          },
+        },
+      });
 
       liveSession = await ai.live.connect({
         model: 'gemini-3.8-live',
@@ -795,28 +881,6 @@ CRITICAL RULES:
         },
         config: {
           responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: {
-            languageCodes: ['he-IL'],
-            customVocabulary: [
-              'Kubernetes',
-              'production',
-              'deploy',
-              'deployment',
-              'rollback',
-              'incident',
-              'latency',
-              'GitHub',
-              'PR',
-              'R&D',
-              'VP R&D',
-              'engineering',
-              'AI',
-              'Gemini',
-              'איתי',
-              'ג\'רי',
-            ],
-            mode: 'SMART',
-          },
           outputAudioTranscription: {},
           speechConfig: {
             voiceConfig: {
@@ -848,14 +912,16 @@ CRITICAL RULES:
         if (msg.type === 'text' && typeof msg.text === 'string' && msg.text.trim()) {
           liveSession.sendRealtimeInput({ text: msg.text.trim() });
         } else if (msg.type === 'audio' && typeof msg.data === 'string' && msg.data) {
-          liveSession.sendRealtimeInput({
+          // Raw microphone audio goes ONLY to the Hebrew transcription model.
+          transcribeSession?.sendRealtimeInput({
             audio: {
               data: msg.data,
               mimeType: msg.mimeType || 'audio/pcm;rate=16000',
             },
           });
         } else if (msg.type === 'audio-end') {
-          liveSession.sendRealtimeInput({ audioStreamEnd: true });
+          lastFinalGuestTranscript = '';
+          transcribeSession?.sendRealtimeInput({ audioStreamEnd: true });
         }
       } catch (err) {
         console.warn('[Jerry Live] bad browser message:', err);
@@ -866,7 +932,11 @@ CRITICAL RULES:
       try {
         liveSession?.close();
       } catch {}
+      try {
+        transcribeSession?.close();
+      } catch {}
       liveSession = null;
+      transcribeSession = null;
     });
   });
 
