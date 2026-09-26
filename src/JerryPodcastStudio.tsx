@@ -62,6 +62,11 @@ export function JerryPodcastStudio() {
   const [isLiveReady, setIsLiveReady] = useState(false);
   const [isPcmDebugRecording, setIsPcmDebugRecording] = useState(false);
   const [pcmDebugAudioUrl, setPcmDebugAudioUrl] = useState<string | null>(null);
+  const messagesRef = useRef<PodcastMessage[]>(messages);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   // Audio & WebRTC references
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
@@ -282,8 +287,7 @@ export function JerryPodcastStudio() {
     }
 
     setIsRecordingMic(false);
-    window.setTimeout(commitLiveUserTurn, 180);
-  }, [commitLiveUserTurn]);
+  }, []);
 
   const startLiveMic = useCallback(async () => {
     if (!isLiveReady || liveSocketRef.current?.readyState !== WebSocket.OPEN) return;
@@ -584,11 +588,34 @@ export function JerryPodcastStudio() {
 
           if (msg.type === 'ready') {
             setIsLiveReady(true);
+
+            // A reconnect creates a fresh Gemini Live session. Restore only completed
+            // conversation turns, ending at the most recent Jerry/model turn, so the
+            // new session has context without accidentally replaying an unfinished user turn.
+            const history = messagesRef.current;
+            let lastModelIndex = -1;
+            for (let i = history.length - 1; i >= 0; i--) {
+              if (history[i].sender === 'jerry') {
+                lastModelIndex = i;
+                break;
+              }
+            }
+
+            if (lastModelIndex >= 0 && socket.readyState === WebSocket.OPEN) {
+              socket.send(
+                JSON.stringify({
+                  type: 'restore-history',
+                  turns: history.slice(0, lastModelIndex + 1).map((m) => ({
+                    role: m.sender === 'user' ? 'user' : 'model',
+                    text: m.text,
+                  })),
+                }),
+              );
+            }
             return;
           }
 
           if (msg.type === 'audio' && msg.data) {
-            commitLiveUserTurn();
             playLivePcmChunk(msg.data, msg.mimeType || 'audio/pcm;rate=24000');
             return;
           }
@@ -601,6 +628,7 @@ export function JerryPodcastStudio() {
           if (msg.type === 'input-transcript' && msg.text) {
             liveInputTranscriptRef.current = msg.text;
             setMicTranscript(msg.text);
+            commitLiveUserTurn();
             return;
           }
 
@@ -1223,7 +1251,7 @@ export function JerryPodcastStudio() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           userMessage: text,
-          history: serverHistory.slice(-8),
+          history: serverHistory,
         }),
       });
 
@@ -1233,7 +1261,7 @@ export function JerryPodcastStudio() {
       }
 
       const data = await res.json();
-      const replyText = data.replyText || '<sigh> מה אמרת עכשיו? שוב לא שמעתי.';
+      const replyText = data.replyText || 'מה אמרת עכשיו? שוב לא שמעתי.';
       let audioUrl: string | undefined = undefined;
 
       if (data.audioBase64) {
