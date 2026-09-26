@@ -798,200 +798,9 @@ CRITICAL RULES:
     }
 
     let liveSession: any = null;
-    let guestPcmChunks: Buffer[] = [];
-    let isTranscribingGuest = false;
-
-    const pcm16ToWavBase64 = (pcm: Buffer, sampleRate = 16000) => {
-      const header = Buffer.alloc(44);
-      header.write('RIFF', 0);
-      header.writeUInt32LE(36 + pcm.length, 4);
-      header.write('WAVE', 8);
-      header.write('fmt ', 12);
-      header.writeUInt32LE(16, 16);
-      header.writeUInt16LE(1, 20);
-      header.writeUInt16LE(1, 22);
-      header.writeUInt32LE(sampleRate, 24);
-      header.writeUInt32LE(sampleRate * 2, 28);
-      header.writeUInt16LE(2, 32);
-      header.writeUInt16LE(16, 34);
-      header.write('data', 36);
-      header.writeUInt32LE(pcm.length, 40);
-      return Buffer.concat([header, pcm]).toString('base64');
-    };
 
     try {
       const ai = new GoogleGenAI({ apiKey: key });
-
-      const transcribeGuestTurn = async () => {
-        if (isTranscribingGuest || guestPcmChunks.length === 0) return;
-        isTranscribingGuest = true;
-
-        const pcm = Buffer.concat(guestPcmChunks);
-        guestPcmChunks = [];
-
-        // Ignore accidental taps / near-empty turns.
-        if (pcm.length < 3200) {
-          isTranscribingGuest = false;
-          return;
-        }
-
-        const wavBase64 = pcm16ToWavBase64(pcm, 16000);
-        const models = ['models/gemini-3.8-flash', 'models/gemini-2.5-flash'];
-        let transcript = '';
-
-        for (const model of models) {
-          try {
-            const resp = await fetch(
-              `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${encodeURIComponent(key)}`,
-              {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json; charset=utf-8' },
-                body: JSON.stringify({
-                  contents: [
-                    {
-                      role: 'user',
-                      parts: [
-                        {
-                          inlineData: {
-                            mimeType: 'audio/wav',
-                            data: wavBase64,
-                          },
-                        },
-                        {
-                          text:
-                            'תמלל מילה במילה את הדיבור בקובץ וסווג את שפת הדיבור. השפות המותרות הן רק עברית, אנגלית, או שילוב טבעי של עברית+אנגלית. אם הדיבור הוא בגרמנית, ספרדית, צרפתית, קוריאנית, ערבית, רוסית או כל שפה אחרת — סווג כ-other. אל תתרגם. אל תתקן את הדובר. אם קטע לא ברור, החזר [לא ברור] בשדה text.',
-                        },
-                      ],
-                    },
-                  ],
-                  generationConfig: {
-                    temperature: 0,
-                    maxOutputTokens: 220,
-                    responseMimeType: 'application/json',
-                    responseSchema: {
-                      type: 'OBJECT',
-                      properties: {
-                        text: { type: 'STRING' },
-                        language: {
-                          type: 'STRING',
-                          enum: ['hebrew', 'english', 'mixed', 'other'],
-                        },
-                      },
-                      required: ['text', 'language'],
-                    },
-                  },
-                }),
-              },
-            );
-
-            if (!resp.ok) {
-              console.warn('[Jerry STT] turn transcription failed on', model, resp.status);
-              continue;
-            }
-
-            const data = await resp.json();
-            const raw = (data.candidates?.[0]?.content?.parts || [])
-              .map((p: any) => p.text || '')
-              .join('')
-              .trim();
-
-            if (!raw) continue;
-
-            let parsed: any = null;
-            try {
-              parsed = JSON.parse(raw);
-            } catch {
-              console.warn('[Jerry STT] invalid JSON transcription payload:', raw);
-              continue;
-            }
-
-            const cleaned = String(parsed?.text || '').trim();
-            const language = String(parsed?.language || '').toLowerCase();
-
-            if (!cleaned) continue;
-
-            // Allow normal punctuation, curly quotes, dashes and bidi marks.
-            // Reject only LETTERS from scripts other than Hebrew/Latin.
-            // Language semantics are enforced separately by the classifier above.
-            const allLetters = cleaned.match(/\p{L}/gu) || [];
-            const foreignLetters = allLetters.filter(
-              (ch) => !/[\p{Script=Hebrew}\p{Script=Latin}]/u.test(ch),
-            );
-            const hasAllowedLetters = allLetters.length > 0;
-            const passesScriptFirewall = foreignLetters.length === 0 && hasAllowedLetters;
-
-            if (
-              (language === 'hebrew' || language === 'english' || language === 'mixed') &&
-              passesScriptFirewall
-            ) {
-              transcript = cleaned;
-              break;
-            }
-
-            console.warn('[Jerry STT] rejected turn transcript:', {
-              language,
-              transcript: cleaned,
-              foreignLetters,
-            });
-          } catch (err) {
-            console.warn('[Jerry STT] turn transcription exception:', err);
-          }
-        }
-
-        isTranscribingGuest = false;
-
-        if (!transcript || transcript === '[לא ברור]') {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(
-              JSON.stringify({
-                type: 'stt-retry',
-                message: 'לא הצלחתי לזהות עברית או אנגלית בצורה אמינה. נסה שוב.',
-              }),
-            );
-          }
-          return;
-        }
-
-        // Final defense-in-depth check: punctuation/bidi are fine; foreign letter
-        // scripts are not. This avoids rejecting valid Hebrew typography.
-        const finalLetters = transcript.match(/\p{L}/gu) || [];
-        const finalForeignLetters = finalLetters.filter(
-          (ch) => !/[\p{Script=Hebrew}\p{Script=Latin}]/u.test(ch),
-        );
-        if (finalForeignLetters.length > 0 || finalLetters.length === 0) {
-          console.warn('[Jerry STT] blocked transcript at final firewall:', {
-            transcript,
-            finalForeignLetters,
-          });
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(
-              JSON.stringify({
-                type: 'stt-retry',
-                message: 'זוהתה שפה שאינה עברית או אנגלית. נסה שוב.',
-              }),
-            );
-          }
-          return;
-        }
-
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify({ type: 'input-transcript', text: transcript }));
-        }
-
-        try {
-          console.info('[Jerry Engine]', {
-            engineVersion: JERRY_ENGINE_VERSION,
-            stage: 'forward-to-jerry-live',
-            transcript,
-          });
-          liveSession?.sendClientContent({
-            turns: [{ role: 'user', parts: [{ text: transcript }] }],
-            turnComplete: true,
-          });
-        } catch (err) {
-          console.warn('[Jerry STT] failed forwarding transcript to Jerry:', err);
-        }
-      };
 
       liveSession = await ai.live.connect({
         model: 'gemini-3.8-live',
@@ -1016,6 +825,14 @@ CRITICAL RULES:
                   }),
                 );
               }
+            }
+
+            const inputTranscription =
+              serverContent?.inputTranscription?.text ||
+              serverContent?.input_transcription?.text ||
+              '';
+            if (inputTranscription) {
+              client.send(JSON.stringify({ type: 'input-transcript', text: inputTranscription }));
             }
 
             const transcription =
@@ -1054,7 +871,13 @@ CRITICAL RULES:
         },
         config: {
           responseModalities: [Modality.AUDIO],
+          inputAudioTranscription: {},
           outputAudioTranscription: {},
+          realtimeInputConfig: {
+            automaticActivityDetection: {
+              disabled: true,
+            },
+          },
           speechConfig: {
             voiceConfig: {
               prebuiltVoiceConfig: {
@@ -1072,7 +895,7 @@ CRITICAL RULES:
             type: 'ready',
             engine: 'gemini-3.8-live',
             engineVersion: JERRY_ENGINE_VERSION,
-            inputPath: 'push-to-talk -> full-turn Gemini transcription -> text -> Jerry Live',
+            inputPath: 'push-to-talk PCM -> Gemini 3.8 Live native audio understanding -> Jerry response',
           }),
         );
       }
@@ -1089,20 +912,33 @@ CRITICAL RULES:
       if (!liveSession) return;
       try {
         const msg = JSON.parse(raw.toString());
+
         if (msg.type === 'text' && typeof msg.text === 'string' && msg.text.trim()) {
           liveSession.sendClientContent({
             turns: [{ role: 'user', parts: [{ text: msg.text.trim() }] }],
             turnComplete: true,
           });
         } else if (msg.type === 'activity-start') {
-          guestPcmChunks = [];
+          console.info('[Jerry Engine]', {
+            engineVersion: JERRY_ENGINE_VERSION,
+            stage: 'native-live-audio-start',
+          });
+          liveSession.sendRealtimeInput({ activityStart: {} });
         } else if (msg.type === 'audio' && typeof msg.data === 'string' && msg.data) {
-          // Buffer the user's exact 16 kHz PCM for this push-to-talk turn.
-          // We transcribe the complete utterance after activity-end so the STT
-          // sees full Hebrew context instead of guessing language chunk-by-chunk.
-          guestPcmChunks.push(Buffer.from(msg.data, 'base64'));
+          // IMPORTANT: microphone audio goes straight into Gemini Live.
+          // No intermediary STT model, no language classifier, no text firewall.
+          liveSession.sendRealtimeInput({
+            audio: {
+              data: msg.data,
+              mimeType: msg.mimeType || 'audio/pcm;rate=16000',
+            },
+          });
         } else if (msg.type === 'activity-end') {
-          void transcribeGuestTurn();
+          console.info('[Jerry Engine]', {
+            engineVersion: JERRY_ENGINE_VERSION,
+            stage: 'native-live-audio-end',
+          });
+          liveSession.sendRealtimeInput({ activityEnd: {} });
         }
       } catch (err) {
         console.warn('[Jerry Live] bad browser message:', err);
@@ -1113,7 +949,6 @@ CRITICAL RULES:
       try {
         liveSession?.close();
       } catch {}
-      guestPcmChunks = [];
       liveSession = null;
     });
   });
