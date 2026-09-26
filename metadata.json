@@ -1,0 +1,8 @@
+{
+  "name": "Remix Monologue",
+  "description": "Immersive teleprompter and Voice Design acting reel showcasing rapid emotional shifts in a continuous take using Gemini 3.8 Flash TTS.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,831 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import {
+  Mic,
+  MicOff,
+  Radio,
+  Volume2,
+  VolumeX,
+  RotateCcw,
+  Download,
+  Send,
+  Loader2,
+  AlertCircle,
+  Square,
+  Play,
+  Activity,
+  PhoneCall,
+  Sparkles,
+} from 'lucide-react';
+
+export interface PodcastMessage {
+  id: string;
+  sender: 'jerry' | 'user';
+  text: string;
+  timestamp: string;
+  audioUrl?: string;
+  pose?: 'speaking' | 'listening' | 'phone' | 'skeptical';
+}
+
+const JERRY_INITIAL_OPENING =
+  'שמע, ערב טוב. ג\'רי, תוכנית הלילה. איתי אמר לי... לא משנה מה איתי אמר, איתי והשטויות שלו. מה הדבר הכי מוזר שקרה לך השבוע?';
+
+export function JerryPodcastStudio() {
+  const [messages, setMessages] = useState<PodcastMessage[]>([
+    {
+      id: 'm-0',
+      sender: 'jerry',
+      text: JERRY_INITIAL_OPENING,
+      timestamp: '00:01',
+      audioUrl: '/jerry-opening.wav',
+      pose: 'speaking',
+    },
+  ]);
+
+  const [inputText, setInputText] = useState('');
+  const [isRecordingMic, setIsRecordingMic] = useState(false);
+  const [isJerryThinking, setIsJerryThinking] = useState(false);
+  const [isJerrySpeaking, setIsJerrySpeaking] = useState(false);
+  const [jerryPose, setJerryPose] = useState<'speaking' | 'listening' | 'phone' | 'skeptical'>('speaking');
+  const [errorNotice, setErrorNotice] = useState<string | null>(null);
+  const [micTranscript, setMicTranscript] = useState('');
+  const [isMuted, setIsMuted] = useState(false);
+
+  // Audio Analyser & Lip-Sync state
+  const [mouthOpenAmount, setMouthOpenAmount] = useState(0);
+  const [audioLevel, setAudioLevel] = useState(0);
+
+  // Full Podcast Recording (Master Mix)
+  const [isEpisodeRecording, setIsEpisodeRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [episodeAudioUrl, setEpisodeAudioUrl] = useState<string | null>(null);
+
+  // Audio & WebRTC references
+  const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
+  const recognitionRef = useRef<any>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Mixer refs for recording both Mic + Jerry
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const mixedDestNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const micMediaStreamRef = useRef<MediaStream | null>(null);
+  const timerIntervalRef = useRef<any>(null);
+
+  // Auto-scroll chat messages
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, isJerryThinking]);
+
+  // Episode Recording Timer
+  useEffect(() => {
+    if (isEpisodeRecording) {
+      setRecordingSeconds(0);
+      timerIntervalRef.current = setInterval(() => {
+        setRecordingSeconds((prev) => prev + 1);
+      }, 1000);
+    } else {
+      if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+    }
+    return () => {
+      if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+    };
+  }, [isEpisodeRecording]);
+
+  // Initialize Web Audio Context and Analyser for LipSync & Recording
+  const getAudioContext = () => {
+    if (!audioContextRef.current) {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = new AudioCtx();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.25;
+
+      const mixedDest = ctx.createMediaStreamDestination();
+
+      audioContextRef.current = ctx;
+      analyserRef.current = analyser;
+      mixedDestNodeRef.current = mixedDest;
+
+      if (!audioPlayerRef.current) {
+        audioPlayerRef.current = new Audio();
+        audioPlayerRef.current.crossOrigin = 'anonymous';
+      }
+
+      try {
+        const source = ctx.createMediaElementSource(audioPlayerRef.current);
+        source.connect(analyser);
+        analyser.connect(ctx.destination);
+        // Also feed Jerry's audio into the podcast recording destination
+        source.connect(mixedDest);
+      } catch (e) {
+        // already connected
+      }
+    }
+    return audioContextRef.current;
+  };
+
+  // Lip-Sync Loop measuring speech frequencies
+  const runLipSyncLoop = useCallback(() => {
+    if (!analyserRef.current) return;
+    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+    analyserRef.current.getByteFrequencyData(dataArray);
+
+    let sum = 0;
+    const bins = Math.min(32, dataArray.length);
+    for (let i = 2; i < bins; i++) {
+      sum += dataArray[i];
+    }
+    const avg = sum / (bins - 2);
+    const normalized = Math.min(100, Math.max(0, (avg / 130) * 100));
+
+    setAudioLevel(normalized);
+    setMouthOpenAmount(normalized > 18 ? normalized : 0);
+
+    if (isJerrySpeaking) {
+      animFrameRef.current = requestAnimationFrame(runLipSyncLoop);
+    } else {
+      setMouthOpenAmount(0);
+      setAudioLevel(0);
+    }
+  }, [isJerrySpeaking]);
+
+  useEffect(() => {
+    if (isJerrySpeaking) {
+      animFrameRef.current = requestAnimationFrame(runLipSyncLoop);
+    } else {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      setMouthOpenAmount(0);
+      setAudioLevel(0);
+    }
+    return () => {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    };
+  }, [isJerrySpeaking, runLipSyncLoop]);
+
+  // Initialize Web Speech Recognition
+  useEffect(() => {
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'he-IL';
+
+      recognition.onresult = (event: any) => {
+        let currentTranscript = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          currentTranscript += event.results[i][0].transcript;
+        }
+        setMicTranscript(currentTranscript);
+        setInputText(currentTranscript);
+      };
+
+      recognition.onerror = (e: any) => {
+        console.warn('Speech recognition warning:', e.error);
+        if (e.error !== 'no-speech') {
+          setIsRecordingMic(false);
+        }
+      };
+
+      recognition.onend = () => {
+        setIsRecordingMic(false);
+      };
+
+      recognitionRef.current = recognition;
+    }
+
+    return () => {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch {}
+      }
+    };
+  }, []);
+
+  const playJerryAudio = (audioSrc: string, pose: 'speaking' | 'phone' = 'speaking') => {
+    if (isMuted) return;
+    const ctx = getAudioContext();
+    if (ctx && ctx.state === 'suspended') {
+      ctx.resume();
+    }
+
+    if (!audioPlayerRef.current) {
+      audioPlayerRef.current = new Audio();
+      audioPlayerRef.current.crossOrigin = 'anonymous';
+    }
+
+    const audio = audioPlayerRef.current;
+    audio.src = audioSrc;
+    setIsJerrySpeaking(true);
+    setJerryPose(pose);
+
+    audio.onended = () => {
+      setIsJerrySpeaking(false);
+      setJerryPose('listening');
+      setMouthOpenAmount(0);
+    };
+    audio.onerror = () => {
+      setIsJerrySpeaking(false);
+      setJerryPose('listening');
+      setMouthOpenAmount(0);
+    };
+
+    audio.play().catch((err) => {
+      console.warn('Audio play prevented:', err);
+      setIsJerrySpeaking(false);
+      setJerryPose('listening');
+    });
+  };
+
+  const handlePlayOpening = () => {
+    playJerryAudio('/jerry-opening.wav');
+  };
+
+  // Toggle Guest Push-to-Talk Mic
+  const handleToggleMic = async () => {
+    if (isRecordingMic) {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch {}
+      }
+      setIsRecordingMic(false);
+      if (inputText.trim()) {
+        handleSubmitTurn(inputText.trim());
+      }
+    } else {
+      setErrorNotice(null);
+      if (!recognitionRef.current) {
+        setErrorNotice('הדפדפן שלך אינו תומך בזיהוי קולי (Web Speech). ניתן להקליד ישירות בתיבת הטקסט.');
+        return;
+      }
+      try {
+        setMicTranscript('');
+        setInputText('');
+        recognitionRef.current.start();
+        setIsRecordingMic(true);
+        setJerryPose('listening');
+      } catch (err: any) {
+        console.error('Mic start error:', err);
+        setErrorNotice('לא ניתן לגשת למיקרופון. אנא ודא הרשאות בדפדפן.');
+        setIsRecordingMic(false);
+      }
+    }
+  };
+
+  // Start or Stop Master Podcast Recording
+  const handleToggleEpisodeRecord = async () => {
+    if (isEpisodeRecording) {
+      // STOP recording
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        try {
+          mediaRecorderRef.current.stop();
+        } catch {}
+      }
+      if (micMediaStreamRef.current) {
+        micMediaStreamRef.current.getTracks().forEach((t) => t.stop());
+        micMediaStreamRef.current = null;
+      }
+      setIsEpisodeRecording(false);
+    } else {
+      // START recording
+      setErrorNotice(null);
+      try {
+        const ctx = getAudioContext();
+        if (ctx && ctx.state === 'suspended') {
+          await ctx.resume();
+        }
+
+        // Capture user mic
+        const micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        micMediaStreamRef.current = micStream;
+
+        // Route mic through AudioContext into mixed destination
+        if (ctx && mixedDestNodeRef.current) {
+          const micSource = ctx.createMediaStreamSource(micStream);
+          micSource.connect(mixedDestNodeRef.current);
+        }
+
+        // Record the mixed destination (which contains Jerry + User Mic)
+        const recordStream = mixedDestNodeRef.current?.stream || micStream;
+        
+        let mimeType = 'audio/webm';
+        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+          mimeType = 'audio/webm;codecs=opus';
+        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+          mimeType = 'audio/mp4';
+        }
+
+        const mediaRecorder = new MediaRecorder(recordStream, { mimeType });
+        recordedChunksRef.current = [];
+
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            recordedChunksRef.current.push(e.data);
+          }
+        };
+
+        mediaRecorder.onstop = () => {
+          if (recordedChunksRef.current.length > 0) {
+            const blob = new Blob(recordedChunksRef.current, { type: mimeType });
+            const url = URL.createObjectURL(blob);
+            setEpisodeAudioUrl(url);
+          }
+        };
+
+        mediaRecorder.start(500);
+        mediaRecorderRef.current = mediaRecorder;
+        setIsEpisodeRecording(true);
+      } catch (err: any) {
+        console.error('Recording setup error:', err);
+        setErrorNotice('הרשאת מיקרופון נדרשת להקלטת פרק הפודקאסט: ' + (err.message || ''));
+        setIsEpisodeRecording(false);
+      }
+    }
+  };
+
+  // Submit User Turn to Jerry
+  const handleSubmitTurn = async (userTextToSubmit?: string) => {
+    const text = (userTextToSubmit || inputText).trim();
+    if (!text || isJerryThinking) return;
+
+    if (isRecordingMic && recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {}
+      setIsRecordingMic(false);
+    }
+
+    const userMsg: PodcastMessage = {
+      id: `m-${Date.now()}`,
+      sender: 'user',
+      text,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    };
+
+    const newHistory = [...messages, userMsg];
+    setMessages(newHistory);
+    setInputText('');
+    setMicTranscript('');
+    setIsJerryThinking(true);
+    setJerryPose('skeptical');
+
+    try {
+      const serverHistory = newHistory.map((m) => ({
+        role: m.sender === 'user' ? 'user' : 'model',
+        text: m.text,
+      }));
+
+      const res = await fetch('/api/jerry-live-turn', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userMessage: text,
+          history: serverHistory.slice(-8),
+        }),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(errText || `Server error ${res.status}`);
+      }
+
+      const data = await res.json();
+      const replyText = data.replyText || '<sigh> מה אמרת עכשיו? שוב לא שמעתי.';
+      let audioUrl: string | undefined = undefined;
+
+      if (data.audioBase64) {
+        audioUrl = `data:audio/wav;base64,${data.audioBase64}`;
+      }
+
+      const isPhonePose =
+        replyText.includes('טלפון') ||
+        replyText.includes('על הקו') ||
+        replyText.includes('איתי מתקשר');
+
+      const jerryMsg: PodcastMessage = {
+        id: `m-${Date.now() + 1}`,
+        sender: 'jerry',
+        text: replyText,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        audioUrl,
+        pose: isPhonePose ? 'phone' : 'speaking',
+      };
+
+      setMessages((prev) => [...prev, jerryMsg]);
+      setIsJerryThinking(false);
+
+      if (audioUrl) {
+        playJerryAudio(audioUrl, isPhonePose ? 'phone' : 'speaking');
+      } else {
+        setJerryPose('listening');
+      }
+    } catch (err: any) {
+      console.error('[Jerry Live] Error:', err);
+      setIsJerryThinking(false);
+      setJerryPose('listening');
+      setErrorNotice('חלה שגיאה במענה של ג\'רי: ' + (err.message || 'תקלה בתקשורת'));
+    }
+  };
+
+  const handleResetSession = () => {
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.pause();
+    }
+    setIsJerrySpeaking(false);
+    setIsJerryThinking(false);
+    setIsRecordingMic(false);
+    setJerryPose('speaking');
+    setMouthOpenAmount(0);
+    setMessages([
+      {
+        id: 'm-0',
+        sender: 'jerry',
+        text: JERRY_INITIAL_OPENING,
+        timestamp: '00:01',
+        audioUrl: '/jerry-opening.wav',
+        pose: 'speaking',
+      },
+    ]);
+  };
+
+  const formatTime = (secs: number) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
+  };
+
+  // Determine active visual frame based on speech & lip-sync volume
+  let currentJerryImage = '/jerry-portrait.jpg';
+  if (jerryPose === 'phone') {
+    currentJerryImage = '/jerry-phone.jpg';
+  } else if (isJerrySpeaking) {
+    // Dynamic lip-sync viseme: toggle open/closed mouth by audio level
+    currentJerryImage = mouthOpenAmount > 22 ? '/jerry-mouth-open.jpg' : '/jerry-mouth-closed.jpg';
+  } else if (isJerryThinking || jerryPose === 'skeptical') {
+    currentJerryImage = '/jerry-listening.jpg';
+  } else {
+    currentJerryImage = '/jerry-portrait.jpg';
+  }
+
+  return (
+    <div className="w-full flex flex-col lg:flex-row gap-6 items-stretch">
+      {/* =====================================================================
+          LEFT: JERRY'S PODCAST BROADCAST BOOTH (VISUAL, AVATAR & LIP-SYNC)
+         ===================================================================== */}
+      <div className="w-full lg:w-[48%] flex flex-col justify-between bg-[#191918] rounded-[18px] border border-[#2E2E2B] p-4 sm:p-6 text-white shadow-xl relative overflow-hidden">
+        {/* Top Studio Indicator Bar */}
+        <div className="flex items-center justify-between border-b border-[#2E2E2B] pb-3 mb-4">
+          <div className="flex items-center gap-2.5">
+            <span
+              className={`inline-block w-2.5 h-2.5 rounded-full ${
+                isJerrySpeaking
+                  ? 'bg-red-500 animate-pulse ring-4 ring-red-500/20'
+                  : isRecordingMic
+                  ? 'bg-amber-400 animate-pulse'
+                  : 'bg-emerald-500'
+              }`}
+            />
+            <span className="text-[12px] font-mono uppercase tracking-[0.12em] text-[#D8D6CE] font-semibold">
+              {isJerrySpeaking
+                ? 'ON AIR - JERRY SPEAKING'
+                : isRecordingMic
+                ? 'GUEST SPEAKING (MIC LIVE)'
+                : 'STUDIO LIVE • PODCAST READY'}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {/* Lip-sync indicator */}
+            <span className="text-[10px] font-mono bg-red-950/80 border border-red-700/60 text-red-300 px-2 py-0.5 rounded-[4px] flex items-center gap-1">
+              <Activity className="w-3 h-3 text-red-400" />
+              <span>LIP-SYNC {isJerrySpeaking ? `${Math.round(audioLevel)}%` : 'READY'}</span>
+            </span>
+
+            <button
+              onClick={() => setIsMuted(!isMuted)}
+              className="p-1.5 rounded-[6px] hover:bg-[#2A2A28] text-[#A8A7A1] hover:text-white transition-colors cursor-pointer"
+              title={isMuted ? 'Unmute Jerry' : 'Mute Jerry'}
+            >
+              {isMuted ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4" />}
+            </button>
+            <button
+              onClick={handleResetSession}
+              className="p-1.5 rounded-[6px] hover:bg-[#2A2A28] text-[#A8A7A1] hover:text-white transition-colors cursor-pointer"
+              title="Reset Podcast Episode"
+            >
+              <RotateCcw className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+
+        {/* Jerry's Avatar Canvas with Lip-Sync */}
+        <div className="relative rounded-[12px] overflow-hidden aspect-[16/10] sm:aspect-[16/9] bg-[#0E0E0D] border border-[#333330] flex items-center justify-center group shadow-inner">
+          <img
+            src={currentJerryImage}
+            alt="Jerry - Engineering Leaders in Real Life"
+            className={`w-full h-full object-cover transition-all duration-75 ${
+              isJerrySpeaking ? 'scale-[1.01] brightness-105' : 'scale-100'
+            }`}
+          />
+
+          {/* Glowing "ON AIR" Retro Studio Sign */}
+          <div className="absolute top-3 left-3 bg-red-600/90 backdrop-blur-xs text-white text-[10px] font-black uppercase tracking-[0.18em] px-2.5 py-0.5 rounded-[4px] border border-red-400/30 flex items-center gap-1.5 shadow-lg">
+            <Radio className="w-3 h-3 animate-pulse" />
+            <span>ON AIR</span>
+          </div>
+
+          {/* Phone Call Indicator if Jerry is on phone with Itai */}
+          {jerryPose === 'phone' && (
+            <div className="absolute top-3 right-3 bg-amber-600/90 backdrop-blur-xs text-white text-[10px] font-bold px-2.5 py-0.5 rounded-[4px] border border-amber-400/30 flex items-center gap-1.5 shadow-lg animate-pulse">
+              <PhoneCall className="w-3 h-3" />
+              <span>איתי על הקו...</span>
+            </div>
+          )}
+
+          {/* VU Meter Bars Active when speaking */}
+          {isJerrySpeaking && (
+            <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between bg-black/70 backdrop-blur-md py-1.5 px-3 rounded-full border border-white/10 shadow-lg">
+              <span className="text-[10px] font-mono text-[#DCDAD4] mr-2">VOICE FEED:</span>
+              <div className="flex items-center gap-1 flex-1 max-w-[200px] justify-center mx-2">
+                {[50, 85, 95, 60, 100, 75, 45, 90, 65, 80, 40, 70].map((h, i) => {
+                  const barH = Math.max(4, ((mouthOpenAmount * h) / 100) * 0.2);
+                  return (
+                    <div
+                      key={i}
+                      className="w-1 bg-red-400 rounded-full transition-all duration-75"
+                      style={{ height: `${barH}px` }}
+                    />
+                  );
+                })}
+              </div>
+              <span className="text-[10px] font-mono text-red-300">{Math.round(mouthOpenAmount)}%</span>
+            </div>
+          )}
+
+          {/* Thinking overlay */}
+          {isJerryThinking && (
+            <div className="absolute inset-0 bg-black/60 backdrop-blur-xs flex flex-col items-center justify-center gap-2">
+              <Loader2 className="w-7 h-7 text-amber-400 animate-spin" />
+              <span className="text-[13px] font-medium text-amber-200">ג'רי מתכונן לתגובה חדה...</span>
+            </div>
+          )}
+        </div>
+
+        {/* Master Podcast Recording Bar */}
+        <div className="mt-4 pt-3 border-t border-[#2E2E2B] flex flex-col gap-3">
+          <div className="flex items-center justify-between bg-[#232321] p-2.5 rounded-[10px] border border-[#383835]">
+            <div className="flex items-center gap-2.5">
+              <button
+                onClick={handleToggleEpisodeRecord}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] text-[12px] font-bold transition-all cursor-pointer shadow-xs ${
+                  isEpisodeRecording
+                    ? 'bg-red-600 hover:bg-red-700 text-white animate-pulse ring-4 ring-red-500/20'
+                    : 'bg-[#31312E] hover:bg-[#40403C] text-white border border-[#484844]'
+                }`}
+              >
+                {isEpisodeRecording ? (
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                ) : (
+                  <Mic className="w-3.5 h-3.5 text-red-500" />
+                )}
+                <span>{isEpisodeRecording ? 'עצור הקלטת פרק' : 'הקלט את הפודקאסט'}</span>
+              </button>
+
+              {isEpisodeRecording && (
+                <div className="flex items-center gap-1.5 text-red-400 font-mono text-[12px] font-bold">
+                  <span className="w-2 h-2 rounded-full bg-red-500 animate-ping" />
+                  <span>REC {formatTime(recordingSeconds)}</span>
+                </div>
+              )}
+            </div>
+
+            {episodeAudioUrl && (
+              <a
+                href={episodeAudioUrl}
+                download={`jerry-podcast-episode-${Date.now()}.webm`}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] bg-emerald-600 hover:bg-emerald-500 text-white text-[11.5px] font-semibold transition-colors shadow-xs"
+                title="הורד קובץ הקלטה מלא"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>הורד פרק מלא (Audio)</span>
+              </a>
+            )}
+          </div>
+
+          <div className="flex items-center justify-between text-[11px] text-[#A8A7A1] flex-wrap gap-2">
+            <div>
+              <span className="font-semibold text-white">ג'רי (Jerry)</span> • ותיק הייטק, מומחה מאז 1992
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handlePlayOpening}
+                className="text-[11px] text-[#D8D6CE] hover:text-white underline cursor-pointer"
+              >
+                השמע פתיח אולפן
+              </button>
+              <button
+                onClick={() => playJerryAudio('/jerry-opening.wav', 'phone')}
+                className="text-[11px] text-amber-400 hover:text-amber-300 underline cursor-pointer flex items-center gap-1"
+              >
+                <PhoneCall className="w-3 h-3" />
+                <span>פוזת טלפון</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* =====================================================================
+          RIGHT: TWO-WAY LIVE PODCAST CONVERSATION & MIC CONTROLS
+         ===================================================================== */}
+      <div className="w-full lg:w-[52%] flex flex-col justify-between bg-white rounded-[18px] border border-[#E6E4DF] shadow-xs p-4 sm:p-6 min-h-[460px]">
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-[#F0EFEB] pb-3 mb-3">
+          <div>
+            <h2 className="text-[16px] sm:text-[18px] font-semibold text-[#141413] tracking-[-0.015em] flex items-center gap-2">
+              <span>שיחה חיה עם ג'רי</span>
+              <span className="text-[10px] font-mono bg-red-100 text-red-800 px-2 py-0.5 rounded font-bold">
+                LIP-SYNC & VOICE
+              </span>
+            </h2>
+            <p className="text-[12px] text-[#8E8D8A]">
+              דבר אל ג'רי במיקרופון – הוא מקשיב, עונה בקולו ומזיז את הפה בסנכרון מלא
+            </p>
+          </div>
+
+          <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-[5px] bg-[#F4F3EF] text-[#6E6D69] border border-[#E5E3DC]">
+            {messages.length} תורות
+          </span>
+        </div>
+
+        {/* Notice alert if any */}
+        {errorNotice && (
+          <div className="mb-3 text-[12px] text-amber-800 bg-amber-50 border border-amber-200 rounded-[8px] p-2.5 flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+            <div className="flex-1 text-[11.5px] leading-tight">{errorNotice}</div>
+            <button
+              onClick={() => setErrorNotice(null)}
+              className="text-amber-800 text-[11px] font-bold p-0.5 cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
+        {/* Dialogue Scroll List */}
+        <div className="flex-1 overflow-y-auto max-h-[360px] pr-1 space-y-3.5 my-2">
+          {messages.map((m) => {
+            const isJerry = m.sender === 'jerry';
+            return (
+              <div
+                key={m.id}
+                className={`flex flex-col ${isJerry ? 'items-start' : 'items-end'} group`}
+              >
+                {/* Sender Tag & Timestamp */}
+                <div className="flex items-center gap-2 mb-1 px-1">
+                  <span
+                    className={`text-[10.5px] font-bold tracking-wider uppercase ${
+                      isJerry ? 'text-red-700' : 'text-blue-700'
+                    }`}
+                  >
+                    {isJerry ? "ג'רי (מנחה הפודקאסט)" : 'איתי (אורח באולפן)'}
+                  </span>
+                  <span className="text-[9.5px] text-[#A8A7A1]">{m.timestamp}</span>
+                </div>
+
+                {/* Message Bubble */}
+                <div
+                  className={`max-w-[90%] sm:max-w-[85%] rounded-[12px] px-3.5 py-2.5 text-[13px] sm:text-[14px] leading-relaxed shadow-2xs ${
+                    isJerry
+                      ? 'bg-[#F9F8F5] text-[#1E1E1C] border border-[#E5E3DC] rounded-tl-xs'
+                      : 'bg-[#141413] text-white rounded-tr-xs'
+                  }`}
+                  dir="rtl"
+                >
+                  <p>{m.text}</p>
+
+                  {/* Audio replay button */}
+                  {isJerry && m.audioUrl && (
+                    <button
+                      onClick={() =>
+                        playJerryAudio(m.audioUrl!, m.pose === 'phone' ? 'phone' : 'speaking')
+                      }
+                      className="mt-2 inline-flex items-center gap-1.5 text-[11px] font-medium text-[#65635E] hover:text-[#141413] transition-colors cursor-pointer bg-white px-2 py-0.5 rounded-[5px] border border-[#DCDAD4]"
+                      title="Play Voice + Lip-Sync"
+                    >
+                      <Volume2 className="w-3.5 h-3.5 text-red-600" />
+                      <span>השמע שוב עם Lip-Sync</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          {isJerryThinking && (
+            <div className="flex items-center gap-2 text-[12px] text-[#787672] p-2 bg-[#F9F8F5] rounded-[8px] border border-[#EBEAE5] w-fit">
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-red-600" />
+              <span>ג'רי חושב על תגובה ספציפית ומקליט קול...</span>
+            </div>
+          )}
+
+          <div ref={messagesEndRef} />
+        </div>
+
+        {/* Input Bar & Live Mic Push-to-Talk Controls */}
+        <div className="border-t border-[#F0EFEB] pt-3 mt-2">
+          {/* Live Mic Transcript preview */}
+          {isRecordingMic && (
+            <div className="mb-2 bg-red-50 border border-red-200 text-red-800 text-[12px] rounded-[8px] px-3 py-1.5 flex items-center justify-between animate-pulse">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-red-600 animate-ping" />
+                <span className="font-semibold">מקליט אותך עכשיו:</span>
+                <span className="italic text-[#333]">{micTranscript || 'דבר חופשי אל ג\'רי...'}</span>
+              </div>
+              <span className="text-[11px] text-red-700">לחץ שוב על המיקרופון לסיום ושליחה</span>
+            </div>
+          )}
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSubmitTurn();
+            }}
+            className="flex items-center gap-2"
+          >
+            {/* Microphone Button (Speech to Text) */}
+            <button
+              type="button"
+              onClick={handleToggleMic}
+              disabled={isJerryThinking}
+              className={`p-3 rounded-[9px] transition-all cursor-pointer flex items-center justify-center shrink-0 shadow-xs ${
+                isRecordingMic
+                  ? 'bg-red-600 hover:bg-red-700 text-white animate-pulse ring-4 ring-red-500/20'
+                  : 'bg-[#F4F3EF] hover:bg-[#EBE9E3] text-[#141413] border border-[#DCDAD4]'
+              }`}
+              title={isRecordingMic ? 'עצור והעבר לג\'רי' : 'דבר במיקרופון לשיחה חיה'}
+            >
+              {isRecordingMic ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5 text-red-600" />}
+            </button>
+
+            {/* Text Input fallback */}
+            <input
+              type="text"
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              placeholder={isRecordingMic ? 'מדבר במיקרופון...' : 'ענה לג\'רי, או לחץ על המיקרופון כדי לדבר...'}
+              disabled={isJerryThinking}
+              dir="auto"
+              className="flex-1 bg-[#F9F8F5] border border-[#DCDAD4] focus:border-[#141413] rounded-[9px] px-3.5 py-2.5 text-[13px] sm:text-[14px] text-[#141413] outline-none transition-colors"
+            />
+
+            {/* Send Button */}
+            <button
+              type="submit"
+              disabled={!inputText.trim() || isJerryThinking}
+              className="p-3 rounded-[9px] bg-[#141413] hover:bg-[#2A2A28] disabled:bg-[#DCDAD4] disabled:text-[#8E8D8A] text-white transition-colors cursor-pointer shrink-0"
+              title="שלח תשובה"
+            >
+              {isJerryThinking ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+            </button>
+          </form>
+
+          {/* Quick suggestions pills */}
+          <div className="flex items-center gap-1.5 flex-wrap mt-2.5 text-[11px] text-[#787672]">
+            <span className="font-medium text-[#141413]">רעיונות לתשובה:</span>
+            {[
+              'ה-AI ביטל לנו חצי מה-PRs כי הכל קומפייל אוטומטית.',
+              'הצוות שלי החליט להעביר את כל הפרודקשן לקוברנטיס בלי טסטים.',
+              'איתי, יש לך שיחה דחופה בטלפון.',
+            ].map((suggestion, i) => (
+              <button
+                key={i}
+                type="button"
+                onClick={() => {
+                  setInputText(suggestion);
+                  handleSubmitTurn(suggestion);
+                }}
+                disabled={isJerryThinking}
+                className="bg-[#F4F3EF] hover:bg-[#EBE9E3] border border-[#E5E3DC] px-2 py-0.5 rounded-[5px] text-[#454440] hover:text-[#141413] transition-colors cursor-pointer text-[10.5px] truncate max-w-[240px]"
+              >
+                « {suggestion} »
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
