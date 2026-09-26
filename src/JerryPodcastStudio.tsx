@@ -87,6 +87,8 @@ export function JerryPodcastStudio() {
   const liveMicProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const liveInputTranscriptRef = useRef('');
   const liveUserTurnCommittedRef = useRef(false);
+  const smoothedLipLevelRef = useRef(0);
+  const quietLipFramesRef = useRef(0);
 
   // Auto-scroll chat messages
   useEffect(() => {
@@ -484,35 +486,50 @@ export function JerryPodcastStudio() {
     return audioContextRef.current;
   };
 
-  // High-response Lip-Sync Loop measuring speech frequencies
+  // Puppet-style mouth gating. Jerry is felt, so syllable energy matters more
+  // than human phoneme-perfect lip shapes. We smooth attack/release and hold
+  // quiet frames briefly to avoid frantic mouth flicker.
   const runLipSyncLoop = useCallback(() => {
     if (!analyserRef.current) return;
     const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
     analyserRef.current.getByteFrequencyData(dataArray);
 
     let sum = 0;
-    const bins = Math.min(28, dataArray.length);
+    const bins = Math.min(30, dataArray.length);
     for (let i = 2; i < bins; i++) {
       sum += dataArray[i];
     }
-    const avg = sum / (bins - 2);
-    const normalized = Math.min(100, Math.max(0, (avg / 115) * 100));
 
-    setAudioLevel(normalized);
-    setMouthOpenAmount(normalized);
+    const avg = sum / Math.max(1, bins - 2);
+    const raw = Math.min(100, Math.max(0, (avg / 118) * 100));
 
-    // Dynamic 3-stage viseme mapping
-    if (normalized > 36) {
-      setMouthStage(2); // wide open
-    } else if (normalized > 12) {
-      setMouthStage(1); // partially open
+    // Faster attack, slower release: the mouth catches syllables without chattering.
+    const previous = smoothedLipLevelRef.current;
+    const smoothing = raw > previous ? 0.46 : 0.78;
+    const smoothed = previous * smoothing + raw * (1 - smoothing);
+    smoothedLipLevelRef.current = smoothed;
+
+    setAudioLevel(smoothed);
+    setMouthOpenAmount(smoothed);
+
+    if (smoothed > 43) {
+      quietLipFramesRef.current = 0;
+      setMouthStage(2);
+    } else if (smoothed > 14) {
+      quietLipFramesRef.current = 0;
+      setMouthStage(1);
     } else {
-      setMouthStage(0); // closed
+      quietLipFramesRef.current += 1;
+      if (quietLipFramesRef.current >= 3) {
+        setMouthStage(0);
+      }
     }
 
     if (isJerrySpeaking) {
       animFrameRef.current = requestAnimationFrame(runLipSyncLoop);
     } else {
+      smoothedLipLevelRef.current = 0;
+      quietLipFramesRef.current = 0;
       setMouthStage(0);
       setMouthOpenAmount(0);
       setAudioLevel(0);
@@ -962,9 +979,9 @@ export function JerryPodcastStudio() {
     return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
   };
 
-  // Jaw Drop & Mouth Shift for puppet Lip-Sync
-  const jawDropPx = isJerrySpeaking ? (mouthStage === 2 ? 14 : mouthStage === 1 ? 6 : 0) : 0;
-  const mouthScaleY = isJerrySpeaking ? (mouthStage === 2 ? 1.35 : mouthStage === 1 ? 1.15 : 1.0) : 1.0;
+  // Puppet mouth geometry. Kept deliberately simple: open / wide / rest.
+  const puppetMouthHeight = mouthStage === 2 ? '6.2%' : mouthStage === 1 ? '3.7%' : '1.2%';
+  const puppetMouthWidth = mouthStage === 2 ? '8.3%' : '7.6%';
 
   return (
     <div className="w-full flex flex-col lg:flex-row gap-6 items-stretch">
@@ -1026,30 +1043,46 @@ export function JerryPodcastStudio() {
             className="w-full h-full object-cover"
           />
 
-          {/* LipSync Overlays (Seamless Viseme Layers) */}
+          {/* Puppet Lip-Sync Overlay.
+              Keep one stable Jerry frame while he speaks; only the mouth moves.
+              This avoids the uncanny full-frame outfit/pose flicker caused by
+              swapping separate generated images for every syllable. */}
           {jerryPose !== 'phone' && (
             <>
-              {/* Partially open mouth frame */}
-              <img
-                src="/jerry-speaking.jpg"
-                alt="Jerry speaking viseme"
-                className="absolute inset-0 w-full h-full object-cover transition-opacity duration-75 pointer-events-none"
-                style={{
-                  opacity: mouthStage === 1 ? 1 : 0,
-                  transform: `scale(${1 + mouthOpenAmount * 0.0003})`,
-                }}
-              />
-
-              {/* Wide open mouth frame */}
-              <img
-                src="/jerry-mouth-open.jpg"
-                alt="Jerry wide open viseme"
-                className="absolute inset-0 w-full h-full object-cover transition-opacity duration-75 pointer-events-none"
-                style={{
-                  opacity: mouthStage === 2 ? 1 : 0,
-                  transform: `translateY(${jawDropPx * 0.15}px) scaleY(${mouthScaleY})`,
-                }}
-              />
+              {isJerrySpeaking && (
+                <div
+                  aria-hidden="true"
+                  className="absolute pointer-events-none"
+                  style={{
+                    left: '50.35%',
+                    top: '43.2%',
+                    width: puppetMouthWidth,
+                    height: puppetMouthHeight,
+                    opacity: mouthStage === 0 ? 0 : 0.98,
+                    transform: 'translate(-50%, -50%) rotate(-1.5deg)',
+                    transformOrigin: '50% 10%',
+                    borderRadius: '48% 48% 54% 54% / 36% 36% 70% 70%',
+                    background:
+                      'radial-gradient(ellipse at 50% 72%, #8d3340 0 22%, #541921 23% 42%, #18090b 48% 100%)',
+                    boxShadow:
+                      mouthStage === 2
+                        ? 'inset 0 2px 5px rgba(0,0,0,.9), 0 1px 1px rgba(0,0,0,.35)'
+                        : 'inset 0 1px 4px rgba(0,0,0,.9)',
+                    transition:
+                      'height 55ms linear, width 55ms linear, opacity 45ms linear',
+                  }}
+                >
+                  {/* Tiny felt lower-lip/tongue cue. Intentionally subtle. */}
+                  <div
+                    className="absolute left-[22%] right-[22%] bottom-[4%] rounded-full"
+                    style={{
+                      height: mouthStage === 2 ? '24%' : '18%',
+                      background: 'rgba(173, 66, 78, 0.72)',
+                      filter: 'blur(0.2px)',
+                    }}
+                  />
+                </div>
+              )}
 
               {/* Skeptical listening expression when guest speaks */}
               <img
