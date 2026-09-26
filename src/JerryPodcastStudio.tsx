@@ -59,6 +59,7 @@ export function JerryPodcastStudio() {
   const [episodeAudioUrl, setEpisodeAudioUrl] = useState<string | null>(null);
   const [episodeFileExtension, setEpisodeFileExtension] = useState('webm');
   const [recordingNotice, setRecordingNotice] = useState<string | null>(null);
+  const [isLiveReady, setIsLiveReady] = useState(false);
 
   // Audio & WebRTC references
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
@@ -75,10 +76,220 @@ export function JerryPodcastStudio() {
   const micMediaStreamRef = useRef<MediaStream | null>(null);
   const timerIntervalRef = useRef<any>(null);
 
+  // Gemini Live low-latency streaming refs
+  const liveSocketRef = useRef<WebSocket | null>(null);
+  const liveTranscriptRef = useRef('');
+  const livePcmChunksRef = useRef<Uint8Array[]>([]);
+  const liveAudioEndTimeRef = useRef(0);
+  const liveTurnTimerRef = useRef<number | null>(null);
+
   // Auto-scroll chat messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isJerryThinking]);
+
+  const base64ToBytes = (base64: string) => {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  };
+
+  const pcm16ChunksToWavUrl = (chunks: Uint8Array[], sampleRate = 24000) => {
+    const dataLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+    if (!dataLength) return undefined;
+
+    const buffer = new ArrayBuffer(44 + dataLength);
+    const view = new DataView(buffer);
+    const writeAscii = (offset: number, value: string) => {
+      for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i));
+    };
+
+    writeAscii(0, 'RIFF');
+    view.setUint32(4, 36 + dataLength, true);
+    writeAscii(8, 'WAVE');
+    writeAscii(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeAscii(36, 'data');
+    view.setUint32(40, dataLength, true);
+
+    let offset = 44;
+    for (const chunk of chunks) {
+      new Uint8Array(buffer, offset, chunk.byteLength).set(chunk);
+      offset += chunk.byteLength;
+    }
+
+    return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
+  };
+
+  const playLivePcmChunk = useCallback(
+    (base64: string) => {
+      if (isMuted) return;
+
+      const ctx = getAudioContext();
+      if (!ctx) return;
+      if (ctx.state === 'suspended') void ctx.resume();
+
+      const bytes = base64ToBytes(base64);
+      livePcmChunksRef.current.push(bytes);
+
+      const sampleCount = Math.floor(bytes.byteLength / 2);
+      if (!sampleCount) return;
+
+      const audioBuffer = ctx.createBuffer(1, sampleCount, 24000);
+      const channel = audioBuffer.getChannelData(0);
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+      for (let i = 0; i < sampleCount; i++) {
+        channel[i] = view.getInt16(i * 2, true) / 32768;
+      }
+
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+
+      if (analyserRef.current) {
+        source.connect(analyserRef.current);
+      } else {
+        source.connect(ctx.destination);
+      }
+      if (mixedDestNodeRef.current) {
+        source.connect(mixedDestNodeRef.current);
+      }
+
+      const startAt = Math.max(ctx.currentTime + 0.015, liveAudioEndTimeRef.current);
+      source.start(startAt);
+      liveAudioEndTimeRef.current = startAt + audioBuffer.duration;
+
+      setIsJerryThinking(false);
+      setIsJerrySpeaking(true);
+      setJerryPose('speaking');
+    },
+    [isMuted],
+  );
+
+  // Open one persistent Gemini Live session for the podcast instead of doing
+  // LLM -> full TTS -> playback on every turn.
+  useEffect(() => {
+    let disposed = false;
+    let reconnectTimer: number | null = null;
+
+    const connect = () => {
+      if (disposed) return;
+
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const socket = new WebSocket(`${protocol}//${window.location.host}/api/jerry-live-socket`);
+      liveSocketRef.current = socket;
+
+      socket.onopen = () => {
+        console.info('[Jerry Live] browser socket connected');
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+
+          if (msg.type === 'ready') {
+            setIsLiveReady(true);
+            return;
+          }
+
+          if (msg.type === 'audio' && msg.data) {
+            playLivePcmChunk(msg.data);
+            return;
+          }
+
+          if (msg.type === 'transcript' && msg.text) {
+            liveTranscriptRef.current += msg.text;
+            return;
+          }
+
+          if (msg.type === 'interrupted') {
+            liveAudioEndTimeRef.current = audioContextRef.current?.currentTime || 0;
+            livePcmChunksRef.current = [];
+            liveTranscriptRef.current = '';
+            setIsJerrySpeaking(false);
+            setIsJerryThinking(false);
+            setJerryPose('listening');
+            return;
+          }
+
+          if (msg.type === 'turn-complete') {
+            const replyText = liveTranscriptRef.current.trim() || '...';
+            const audioUrl = pcm16ChunksToWavUrl(livePcmChunksRef.current);
+
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: `m-${Date.now()}`,
+                sender: 'jerry',
+                text: replyText,
+                timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                audioUrl,
+                pose: 'speaking',
+              },
+            ]);
+
+            liveTranscriptRef.current = '';
+            livePcmChunksRef.current = [];
+
+            const ctx = audioContextRef.current;
+            const remainingMs = ctx
+              ? Math.max(0, (liveAudioEndTimeRef.current - ctx.currentTime) * 1000)
+              : 0;
+
+            if (liveTurnTimerRef.current) window.clearTimeout(liveTurnTimerRef.current);
+            liveTurnTimerRef.current = window.setTimeout(() => {
+              setIsJerrySpeaking(false);
+              setIsJerryThinking(false);
+              setJerryPose('listening');
+              setMouthStage(0);
+              setMouthOpenAmount(0);
+            }, remainingMs + 60);
+            return;
+          }
+
+          if (msg.type === 'error') {
+            console.error('[Jerry Live] server error:', msg.message);
+            setIsLiveReady(false);
+            setIsJerryThinking(false);
+            setErrorNotice('Gemini Live לא זמין כרגע; עובר אוטומטית למסלול הרגיל.');
+          }
+        } catch (err) {
+          console.warn('[Jerry Live] bad socket message:', err);
+        }
+      };
+
+      socket.onerror = (event) => {
+        console.warn('[Jerry Live] browser socket error:', event);
+        setIsLiveReady(false);
+      };
+
+      socket.onclose = () => {
+        setIsLiveReady(false);
+        if (!disposed) {
+          reconnectTimer = window.setTimeout(connect, 1200);
+        }
+      };
+    };
+
+    connect();
+
+    return () => {
+      disposed = true;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (liveTurnTimerRef.current) window.clearTimeout(liveTurnTimerRef.current);
+      try {
+        liveSocketRef.current?.close();
+      } catch {}
+      liveSocketRef.current = null;
+    };
+  }, [playLivePcmChunk]);
 
   // Episode Recording Timer
   useEffect(() => {
@@ -494,6 +705,21 @@ export function JerryPodcastStudio() {
     setIsJerryThinking(true);
     setJerryPose('skeptical');
 
+    // Preferred conversational path: persistent Gemini 3.8 Live session.
+    // Audio starts streaming as soon as the model speaks; no separate TTS wait.
+    if (
+      isLiveReady &&
+      liveSocketRef.current &&
+      liveSocketRef.current.readyState === WebSocket.OPEN
+    ) {
+      liveTranscriptRef.current = '';
+      livePcmChunksRef.current = [];
+      liveAudioEndTimeRef.current = audioContextRef.current?.currentTime || 0;
+      liveSocketRef.current.send(JSON.stringify({ type: 'text', text }));
+      return;
+    }
+
+    // Fallback path if Live is temporarily unavailable.
     try {
       const serverHistory = newHistory.map((m) => ({
         role: m.sender === 'user' ? 'user' : 'model',
@@ -813,11 +1039,13 @@ export function JerryPodcastStudio() {
             <h2 className="text-[16px] sm:text-[18px] font-semibold text-[#141413] tracking-[-0.015em] flex items-center gap-2">
               <span>שיחה חיה עם ג'רי</span>
               <span className="text-[10px] font-mono bg-red-100 text-red-800 px-2 py-0.5 rounded font-bold">
-                LIP-SYNC & FAST ENGINE
+                {isLiveReady ? 'GEMINI LIVE • LOW LATENCY' : 'FALLBACK VOICE ENGINE'}
               </span>
             </h2>
             <p className="text-[12px] text-[#8E8D8A]">
-              דבר אל ג'רי במיקרופון – הוא מקשיב, עונה בקולו ומזיז את השפתיים בסנכרון קולי חי
+              {isLiveReady
+                ? 'Gemini Live מחובר — ג\'רי מתחיל לדבר בזמן שהאודיו עדיין זורם'
+                : 'מתחבר ל-Gemini Live; בינתיים אפשר להמשיך במסלול הרגיל'}
             </p>
           </div>
 
