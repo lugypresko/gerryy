@@ -76,6 +76,8 @@ export function JerryPodcastStudio() {
   const recordedChunksRef = useRef<Blob[]>([]);
   const mixedDestNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const micMediaStreamRef = useRef<MediaStream | null>(null);
+  const episodeOwnsMicRef = useRef(false);
+  const episodeMicGainRef = useRef<GainNode | null>(null);
   const timerIntervalRef = useRef<any>(null);
 
   // Gemini Live low-latency streaming refs
@@ -448,8 +450,18 @@ export function JerryPodcastStudio() {
       const channel = audioBuffer.getChannelData(0);
       const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 
+      const fadeSamples = Math.min(Math.floor(24000 * 0.004), Math.floor(sampleCount / 2));
       for (let i = 0; i < sampleCount; i++) {
-        channel[i] = view.getInt16(i * 2, true) / 32768;
+        let sample = view.getInt16(i * 2, true) / 32768;
+
+        // Tiny edge fades remove occasional clicks/tones at PCM chunk boundaries.
+        if (fadeSamples > 0 && i < fadeSamples) {
+          sample *= i / fadeSamples;
+        } else if (fadeSamples > 0 && i >= sampleCount - fadeSamples) {
+          sample *= (sampleCount - i - 1) / fadeSamples;
+        }
+
+        channel[i] = sample;
       }
 
       const source = ctx.createBufferSource();
@@ -854,14 +866,23 @@ export function JerryPodcastStudio() {
   // Start or Stop Master Podcast Recording
   const handleToggleEpisodeRecord = async () => {
     const stopMicTracks = () => {
-      if (micMediaStreamRef.current) {
+      try {
+        episodeMicGainRef.current?.disconnect();
+      } catch {}
+      episodeMicGainRef.current = null;
+
+      // If podcast recording borrowed the already-live conversation microphone,
+      // do not kill it when recording stops.
+      if (episodeOwnsMicRef.current && micMediaStreamRef.current) {
         micMediaStreamRef.current.getTracks().forEach((track) => {
           try {
             track.stop();
           } catch {}
         });
-        micMediaStreamRef.current = null;
       }
+
+      micMediaStreamRef.current = null;
+      episodeOwnsMicRef.current = false;
     };
 
     if (isEpisodeRecording) {
@@ -902,18 +923,39 @@ export function JerryPodcastStudio() {
       // Try getting user mic stream
       let streamToRecord: MediaStream;
       try {
-        const micStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
+        // Prefer the exact same microphone stream used by the live conversation.
+        // Opening a second getUserMedia stream for the master recording can trigger
+        // browser DSP/echo-cancellation twice and make the guest very quiet.
+        let micStream: MediaStream;
+        if (
+          liveMicStreamRef.current &&
+          liveMicStreamRef.current.getAudioTracks().some((track) => track.readyState === 'live')
+        ) {
+          micStream = liveMicStreamRef.current;
+          episodeOwnsMicRef.current = false;
+          console.info('[Podcast Recorder] reusing live conversation microphone');
+        } else {
+          micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
+          episodeOwnsMicRef.current = true;
+        }
+
         micMediaStreamRef.current = micStream;
 
         if (ctx && mixedDestNodeRef.current) {
           const micSource = ctx.createMediaStreamSource(micStream);
-          micSource.connect(mixedDestNodeRef.current);
+          const micGain = ctx.createGain();
+          // Lift the guest channel in the master mix. Jerry is generated audio
+          // and naturally much hotter than a laptop mic.
+          micGain.gain.value = 2.2;
+          episodeMicGainRef.current = micGain;
+          micSource.connect(micGain);
+          micGain.connect(mixedDestNodeRef.current);
           streamToRecord = mixedDestNodeRef.current.stream;
         } else {
           streamToRecord = micStream;
