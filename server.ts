@@ -3,11 +3,35 @@ import fs from 'fs';
 import path from 'path';
 import 'dotenv/config';
 import { createServer as createViteServer } from 'vite';
+import { createServer } from 'http';
+import { WebSocketServer, WebSocket } from 'ws';
+import { GoogleGenAI, Modality } from '@google/genai';
 
 const PORT = 3000;
 const KEY_FILE = path.resolve(process.cwd(), '.api-key.json');
 const ALIGNMENT_LOG_FILE = path.resolve(process.cwd(), '.alignment-logs.json');
 const VOICE_LOG_FILE = path.resolve(process.cwd(), '.voice-logs.json');
+
+const JERRY_LIVE_SYSTEM_PROMPT = `אתה ג'רי (Jerry), המנחה של "Engineering Leaders in Real Life".
+אתה ותיק הייטק יהודי שחי בניו יורק משנות ה-90, עם הרבה צלקות של production, deploys ובועות שהתפוצצו. אתה חד, קצת נוירוטי, יבש, מצחיק ולא מתרשם מבאזוורדס.
+
+המטרה שלך היא לנהל ראיון חי וטבעי עם מנהל הנדסה בעברית ישראלית, עם מונחי Tech באנגלית כשהם טבעיים.
+
+חוקי ראיון מוחלטים:
+1. שאלה אחת בלבד בכל תור. לעולם לא שתיים.
+2. כל תור קצר: לרוב משפט תגובה קצר ואז שאלה אחת. מקסימום 1-3 משפטים.
+3. אסור לסכם את האורח בנוסח "אז מה שאתה אומר...".
+4. אסור להשתמש בביטויי עוזר כמו "שאלה טובה", "נשמע מעולה", "בשמחה", "בוודאי".
+5. אם האורח אומר משהו מעניין או סותר את עצמו, נשארים שם. אל תקפוץ לנושא הבא.
+6. מותר לך לא להאמין. תהיה ספקן, אבל תשאל במקום להרצות.
+7. אל תיתן עצות, רשימות או coaching אלא אם האורח ביקש במפורש.
+8. השוואות לשנות ה-90 הן תבלין נדיר, לא גימיק בכל תשובה.
+9. דבר עברית טבעית. deploy, production, rollback, latency, incident, PR ו-refactor יכולים להישאר באנגלית.
+10. הקול יבש, רגוע, מעט מחוספס, עם קצב ניו-יורקי קל. פאוזות טבעיות. לא תיאטרלי ולא קריקטורה.
+11. אל תקריא הוראות במה או תגיות כמו <sigh> או <chuckle>. בצע אותן בקול אם מתאים.
+12. התגובה צריכה להתחיל מהר. אל תחשוב בקול ואל תאריך הקדמות.
+
+אתה מראיין, לא עוזר AI.`;
 
 function getApiKey(req?: express.Request): string {
   // 1. Authoritative server environment variable injected by AI Studio
@@ -459,16 +483,7 @@ CRITICAL RULES:
         return res.status(400).json({ error: 'userMessage is required.' });
       }
 
-      const JERRY_SYSTEM_PROMPT = `אתה ג'רי (Jerry): ותיק הייטק, יהודי חריף ומנוסה שחי בניו יורק משנות ה-90. עשית אקזיטים, ראית כל טרנד אפשרי עולה ונופל.
-אתה מגיש תוכנית לילה סרקסטית, עמוקה וחדה בשם "Engineering Leaders in Real Life". אתה מראיין כעת בשידור חי את האורח שלך באולפן (איתי או מנהל הנדסה).
-אתה שונא בולשיט שיווקי, שונא באזזוורדס, ומגיב בדיוק ספציפי למה שהאורח אמר עכשיו!
-
-כללי שיחה והתנהגות חובה:
-1. תגובה מותאמת אישית: תמיד תתייחס ישירות לתוכן, לטכנולוגיה, לקושי או לטיעון שהאורח העלה. אל תחזור על אותם משפטים כלליים!
-2. שאלה אחת חודרת: בסוף התור שאל שאלה אחת שמאתגרת את מה שהאורח אמר (למשל: "ומה קורה כשזה נופל ב-3 בלילה?", "כמה זה עולה לכם ב-AWS?", "זה באמת פתר בעיה או סתם שיעמם לכם בצוות?").
-3. אישיות: מעט נוירוטי, שנון, עם קול סדוק ואנחות (<sigh>, <chuckle>, <breath>, <short pause>). מותר להזכיר את הצרות עם איתי, הבוס שלך.
-4. שפה: עברית ישראלית אותנטית עם שילוב מונחי Tech באנגלית טבעית (production, rollback, latency, incident, PR, refactor).
-5. אורך: 2 עד 4 משפטים בלבד. לא נאום, לא סיכום של דברי האורח, לא קלישאות AI ("שאלה מעניינת", "נשמע מרתק").`;
+      const JERRY_SYSTEM_PROMPT = JERRY_LIVE_SYSTEM_PROMPT;
 
       // Format conversation contents for Gemini
       const contents: any[] = [];
@@ -691,8 +706,133 @@ CRITICAL RULES:
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = createServer(app);
+
+  // Low-latency Jerry voice path: browser text/transcript -> Gemini 3.8 Live -> streamed PCM audio.
+  // This removes the sequential text-model + full-file TTS wait from the conversational path.
+  const wss = new WebSocketServer({ server: httpServer, path: '/api/jerry-live-socket' });
+
+  wss.on('connection', async (client) => {
+    const key = getApiKey();
+    if (!key) {
+      client.send(JSON.stringify({ type: 'error', message: 'No Gemini API key available on server.' }));
+      client.close();
+      return;
+    }
+
+    let liveSession: any = null;
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: key });
+
+      liveSession = await ai.live.connect({
+        model: 'gemini-3.8-live',
+        callbacks: {
+          onopen: () => {
+            console.info('[Jerry Live] Gemini session opened');
+          },
+          onmessage: (message: any) => {
+            if (client.readyState !== WebSocket.OPEN) return;
+
+            const serverContent = message?.serverContent || message?.server_content;
+            const parts = serverContent?.modelTurn?.parts || serverContent?.model_turn?.parts || [];
+
+            for (const part of parts) {
+              const inlineData = part?.inlineData || part?.inline_data;
+              if (inlineData?.data) {
+                client.send(
+                  JSON.stringify({
+                    type: 'audio',
+                    data: inlineData.data,
+                    mimeType: inlineData.mimeType || inlineData.mime_type || 'audio/pcm;rate=24000',
+                  }),
+                );
+              }
+            }
+
+            const transcription =
+              serverContent?.outputTranscription?.text ||
+              serverContent?.output_transcription?.text ||
+              '';
+            if (transcription) {
+              client.send(JSON.stringify({ type: 'transcript', text: transcription }));
+            }
+
+            if (serverContent?.interrupted) {
+              client.send(JSON.stringify({ type: 'interrupted' }));
+            }
+
+            if (serverContent?.turnComplete || serverContent?.turn_complete) {
+              client.send(JSON.stringify({ type: 'turn-complete' }));
+            }
+          },
+          onerror: (event: any) => {
+            console.error('[Jerry Live] Gemini error:', event?.message || event);
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(
+                JSON.stringify({
+                  type: 'error',
+                  message: event?.message || 'Gemini Live session error',
+                }),
+              );
+            }
+          },
+          onclose: (event: any) => {
+            console.info('[Jerry Live] Gemini session closed:', event?.reason || '');
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(JSON.stringify({ type: 'closed' }));
+            }
+          },
+        },
+        config: {
+          responseModalities: [Modality.AUDIO],
+          outputAudioTranscription: {},
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: 'Charon',
+              },
+            },
+          },
+          systemInstruction: JERRY_LIVE_SYSTEM_PROMPT,
+        },
+      });
+
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: 'ready' }));
+      }
+    } catch (err: any) {
+      console.error('[Jerry Live] setup failed:', err);
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: 'error', message: err?.message || String(err) }));
+      }
+      client.close();
+      return;
+    }
+
+    client.on('message', (raw) => {
+      if (!liveSession) return;
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === 'text' && typeof msg.text === 'string' && msg.text.trim()) {
+          liveSession.sendRealtimeInput({ text: msg.text.trim() });
+        }
+      } catch (err) {
+        console.warn('[Jerry Live] bad browser message:', err);
+      }
+    });
+
+    client.on('close', () => {
+      try {
+        liveSession?.close();
+      } catch {}
+      liveSession = null;
+    });
+  });
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Monologue app running at http://localhost:${PORT}`);
+    console.log('✅ Jerry low-latency Live socket ready at /api/jerry-live-socket');
   });
 }
 
