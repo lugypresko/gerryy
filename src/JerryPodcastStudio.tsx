@@ -1188,6 +1188,9 @@ export function JerryPodcastStudio() {
 
       if (data.audioBase64) {
         audioUrl = `data:audio/wav;base64,${data.audioBase64}`;
+      } else if (data.audioError) {
+        console.error('[Jerry TTS] fallback returned text without audio:', data.audioError);
+        setErrorNotice('ג\'רי יצר תשובה, אבל יצירת הקול נכשלה: ' + data.audioError);
       }
 
       const isPhonePose =
