@@ -337,6 +337,7 @@ async function startServer() {
           generationConfig: {
             responseModalities: ['AUDIO'],
             speechConfig: {
+              languageCode: 'he-IL',
               voiceConfig: {
                 voice: fallbackVoice || 'Charon',
               },
@@ -636,10 +637,12 @@ CRITICAL RULES:
       }
 
       if (!replyText) {
-        replyText = '<sigh> איתי, השרת שלך עושה לי בעיות עוד פעם. מה שאלת מקודם?';
+        replyText = 'איתי, השרת שלך עושה לי בעיות עוד פעם. מה שאלת מקודם?';
       }
 
-      // Synthesize audio using Gemini TTS
+      // Synthesize audio using Gemini TTS.
+      // Keep stage directions out of speech even if the model emits one.
+      const ttsText = replyText.replace(/<[^>]+>/g, '').trim();
       let audioBase64 = '';
       const ttsErrors: string[] = [];
       const ttsModels = ['models/gemini-3.8-flash-lite-tts', 'models/gemini-3.8-flash-tts'];
@@ -652,10 +655,11 @@ CRITICAL RULES:
               method: 'POST',
               headers: { 'Content-Type': 'application/json; charset=utf-8' },
               body: JSON.stringify({
-                contents: [{ role: 'user', parts: [{ text: replyText }] }],
+                contents: [{ role: 'user', parts: [{ text: ttsText }] }],
                 generationConfig: {
                   responseModalities: ['AUDIO'],
                   speechConfig: {
+                    languageCode: 'he-IL',
                     voiceConfig: {
                       voice: 'Charon',
                     },
@@ -1019,7 +1023,31 @@ CRITICAL RULES:
       try {
         const msg = JSON.parse(raw.toString());
 
-        if (msg.type === 'text' && typeof msg.text === 'string' && msg.text.trim()) {
+        if (msg.type === 'restore-history' && Array.isArray(msg.turns)) {
+          const restoredTurns = msg.turns
+            .filter(
+              (turn: any) =>
+                (turn?.role === 'user' || turn?.role === 'model') &&
+                typeof turn?.text === 'string' &&
+                turn.text.trim(),
+            )
+            .map((turn: any) => ({
+              role: turn.role,
+              parts: [{ text: turn.text.trim() }],
+            }));
+
+          if (restoredTurns.length > 0) {
+            console.info('[Jerry Engine]', {
+              engineVersion: JERRY_ENGINE_VERSION,
+              stage: 'restore-history',
+              turns: restoredTurns.length,
+            });
+            liveSession.sendClientContent({
+              turns: restoredTurns,
+              turnComplete: false,
+            });
+          }
+        } else if (msg.type === 'text' && typeof msg.text === 'string' && msg.text.trim()) {
           liveSession.sendClientContent({
             turns: [{ role: 'user', parts: [{ text: msg.text.trim() }] }],
             turnComplete: true,
