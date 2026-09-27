@@ -1,5 +1,7 @@
 # Jerry LIVE implementation status
 
+> Review correction (2026-09-27, code baseline `e0b0105`): the application is available locally, but end-to-end publishable export has not passed acceptance. Several baseline statements below are historical and no longer match current code. Use [the audited context and architecture](JERRY_PRODUCT_ARCHITECTURE.md) and [the recovery implementation plan](plans/2026-09-27-publishable-bilingual-podcast.md) as the current source of truth. In particular, source-pattern tests are not evidence of audio quality or successful downloads.
+
 Updated: 2026-09-27
 Version: `1.1.3`
 Branch: `feature/jerry-live-animation-recording`
