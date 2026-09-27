@@ -4,6 +4,7 @@ import fs from 'node:fs';
 
 const server = fs.readFileSync('server.ts', 'utf8');
 const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
+const animation = fs.readFileSync('src/jerryAnimation.ts', 'utf8');
 const index = fs.readFileSync('index.html', 'utf8');
 const css = fs.readFileSync('src/index.css', 'utf8');
 
@@ -57,6 +58,41 @@ test('Jerry audio sources are mutually exclusive', () => {
   assert.match(studio, /livePlaybackQueueRef\.current = \[\]/);
 });
 
+test('Jerry studio renders the locked full-frame pose manifest with crossfade and anchors', () => {
+  assert.match(studio, /JERRY_POSES/);
+  assert.match(studio, /Object\.keys\(JERRY_POSES\)/);
+  assert.match(studio, /JERRY_MOUTH_ANCHORS/);
+  assert.match(studio, /JERRY_POSE_CROSSFADE_MS/);
+  assert.match(studio, /poseForState\(animationState\)/);
+  assert.match(animation, /idle: '\/jerry-pose-idle\.jpg'/);
+  assert.match(animation, /speaking: '\/jerry-pose-speaking\.jpg'/);
+  assert.match(animation, /skeptical: '\/jerry-pose-skeptical\.jpg'/);
+  assert.match(animation, /amused: '\/jerry-pose-amused\.jpg'/);
+  assert.match(studio, /opacity:\s*activePose\s*===\s*pose\s*\?\s*1\s*:\s*0/);
+  assert.match(studio, /transition:\s*`opacity \$\{JERRY_POSE_CROSSFADE_MS\}ms/);
+  assert.match(studio, /JERRY_MOUTH_ANCHORS\[activePose\]/);
+  assert.doesNotMatch(studio, /jerry-pose-[abcd]\.jpg/);
+  assert.doesNotMatch(studio, /jerry-head\.png/);
+});
+
+test('Jerry animation state follows live interaction events instead of a fixed script', () => {
+  assert.match(studio, /transitionAnimation\('mic-start'\)/);
+  assert.match(studio, /setAnimationState\('thinking'\)/);
+  assert.match(studio, /transitionAnimation\('output-audio'\)/);
+  assert.match(studio, /transitionAnimation\('turn-complete'\)/);
+});
+
+test('Jerry studio integrates independent recording chains and a centered monitor mix', () => {
+  assert.match(studio, /createRecordingGraph\(/);
+  assert.match(studio, /recordingGraphRef/);
+  assert.match(studio, /jerry:\s*jerryRecordingInputRef\.current/);
+  assert.match(studio, /guest:\s*guestSource/);
+  assert.match(studio, /recordingGraphRef\.current\.destination\.stream/);
+  assert.match(studio, /recordingMonitorMixRef/);
+  assert.match(studio, /recordingGraphRef\.current\?\.update\(/);
+  assert.match(studio, /liveMicStreamRef\.current/);
+});
+
 test('HTTP fallback retains full history instead of slicing to eight turns', () => {
   assert.doesNotMatch(studio, /history:\s*serverHistory\.slice\(-8\)/);
   assert.match(studio, /history:\s*serverHistory/);
@@ -64,5 +100,5 @@ test('HTTP fallback retains full history instead of slicing to eight turns', () 
 
 test('known Hebrew UI debt remains visible so it cannot be mistaken for fixed', () => {
   assert.match(index, /<html lang="en">/);
-  assert.match(css, /font-family:\s*'Inter',\s*'Assistant'/);
+  assert.match(css, /font-family:\s*'Assistant',\s*'Inter'/);
 });

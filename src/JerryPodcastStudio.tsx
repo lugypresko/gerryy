@@ -14,6 +14,17 @@ import {
   Activity,
   PhoneCall,
 } from 'lucide-react';
+import { createRecordingGraph, type RecordingGraph } from './audio/recordingGraph';
+import {
+  JERRY_MOUTH_ANCHORS,
+  JERRY_POSES,
+  JERRY_POSE_CROSSFADE_MS,
+  type JerryAnimationEvent,
+  type JerryAnimationState,
+  type JerryPose,
+  nextAnimationState,
+  poseForState,
+} from './jerryAnimation';
 
 export interface PodcastMessage {
   id: string;
@@ -44,6 +55,7 @@ export function JerryPodcastStudio() {
   const [isJerryThinking, setIsJerryThinking] = useState(false);
   const [isJerrySpeaking, setIsJerrySpeaking] = useState(false);
   const [jerryPose, setJerryPose] = useState<'speaking' | 'listening' | 'phone' | 'skeptical'>('speaking');
+  const [animationState, setAnimationState] = useState<JerryAnimationState>('idle');
   const [errorNotice, setErrorNotice] = useState<string | null>(null);
   const [micTranscript, setMicTranscript] = useState('');
   const [isMuted, setIsMuted] = useState(false);
@@ -52,7 +64,6 @@ export function JerryPodcastStudio() {
   const [mouthStage, setMouthStage] = useState<0 | 1 | 2>(0);
   const [mouthOpenAmount, setMouthOpenAmount] = useState(0);
   const [audioLevel, setAudioLevel] = useState(0);
-  const [headTilt, setHeadTilt] = useState(0);
   const [jawBounce, setJawBounce] = useState(0);
 
   // Full Podcast Recording (Master Mix)
@@ -81,10 +92,15 @@ export function JerryPodcastStudio() {
   // Mixer refs for recording both Mic + Jerry
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
-  const mixedDestNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const recordingGraphRef = useRef<RecordingGraph | null>(null);
+  const jerryRecordingInputRef = useRef<GainNode | null>(null);
+  const jerryPlaybackGainRef = useRef<GainNode | null>(null);
+  const recordingMonitorMixRef = useRef<GainNode | null>(null);
+  const recordingMonitorJerryGainRef = useRef<GainNode | null>(null);
+  const recordingMonitorGuestGainRef = useRef<GainNode | null>(null);
   const micMediaStreamRef = useRef<MediaStream | null>(null);
   const episodeOwnsMicRef = useRef(false);
-  const episodeMicGainRef = useRef<GainNode | null>(null);
+  const recordingModeRef = useRef<'dual-channel' | 'jerry-only' | null>(null);
   const timerIntervalRef = useRef<any>(null);
 
   // Gemini Live low-latency streaming refs
@@ -109,6 +125,10 @@ export function JerryPodcastStudio() {
   const quietLipFramesRef = useRef(0);
   const pcmDebugChunksRef = useRef<Uint8Array[]>([]);
   const pcmDebugStopTimerRef = useRef<number | null>(null);
+
+  const transitionAnimation = useCallback((event: JerryAnimationEvent) => {
+    setAnimationState((current) => nextAnimationState(current, event));
+  }, []);
 
   // Auto-scroll chat messages
   useEffect(() => {
@@ -391,6 +411,7 @@ export function JerryPodcastStudio() {
       processor.connect(silentGain);
       silentGain.connect(micCtx.destination);
 
+      transitionAnimation('mic-start');
       setJerryPose('listening');
       console.info('[Jerry Live] microphone active', {
         label: track.label,
@@ -499,8 +520,8 @@ export function JerryPodcastStudio() {
     } else {
       processor.connect(ctx.destination);
     }
-    if (mixedDestNodeRef.current) {
-      processor.connect(mixedDestNodeRef.current);
+    if (jerryRecordingInputRef.current) {
+      processor.connect(jerryRecordingInputRef.current);
     }
 
     livePlaybackProcessorRef.current = processor;
@@ -562,9 +583,10 @@ export function JerryPodcastStudio() {
 
       setIsJerryThinking(false);
       setIsJerrySpeaking(true);
+      transitionAnimation('output-audio');
       setJerryPose('speaking');
     },
-    [isMuted, ensureLivePlaybackProcessor],
+    [isMuted, ensureLivePlaybackProcessor, transitionAnimation],
   );
 
   // Open one persistent Gemini Live session for the podcast instead of doing
@@ -668,6 +690,7 @@ export function JerryPodcastStudio() {
             liveTranscriptRef.current = '';
             setIsJerrySpeaking(false);
             setIsJerryThinking(false);
+            transitionAnimation('turn-complete');
             setJerryPose('listening');
             return;
           }
@@ -701,6 +724,7 @@ export function JerryPodcastStudio() {
             liveTurnTimerRef.current = window.setTimeout(() => {
               setIsJerrySpeaking(false);
               setIsJerryThinking(false);
+              transitionAnimation('turn-complete');
               setJerryPose('listening');
               setMouthStage(0);
               setMouthOpenAmount(0);
@@ -750,7 +774,7 @@ export function JerryPodcastStudio() {
       } catch {}
       liveSocketRef.current = null;
     };
-  }, [playLivePcmChunk, commitLiveUserTurn]);
+  }, [playLivePcmChunk, commitLiveUserTurn, transitionAnimation]);
 
   // Episode Recording Timer
   useEffect(() => {
@@ -776,11 +800,15 @@ export function JerryPodcastStudio() {
       analyser.fftSize = 256;
       analyser.smoothingTimeConstant = 0.2; // fast response to syllables
 
-      const mixedDest = ctx.createMediaStreamDestination();
+      const jerryRecordingInput = ctx.createGain();
+      jerryRecordingInput.gain.value = 1;
+      const jerryPlaybackGain = ctx.createGain();
+      jerryPlaybackGain.gain.value = 1;
 
       audioContextRef.current = ctx;
       analyserRef.current = analyser;
-      mixedDestNodeRef.current = mixedDest;
+      jerryRecordingInputRef.current = jerryRecordingInput;
+      jerryPlaybackGainRef.current = jerryPlaybackGain;
 
       if (!audioPlayerRef.current) {
         audioPlayerRef.current = new Audio();
@@ -790,14 +818,56 @@ export function JerryPodcastStudio() {
       try {
         const source = ctx.createMediaElementSource(audioPlayerRef.current);
         source.connect(analyser);
-        analyser.connect(ctx.destination);
-        source.connect(mixedDest);
+        source.connect(jerryRecordingInput);
       } catch (e) {
         // already connected
       }
+      analyser.connect(jerryPlaybackGain);
+      jerryPlaybackGain.connect(ctx.destination);
     }
     return audioContextRef.current;
   };
+
+  const cleanupRecordingGraph = useCallback(() => {
+    try {
+      recordingMonitorJerryGainRef.current?.disconnect();
+      recordingMonitorGuestGainRef.current?.disconnect();
+      recordingMonitorMixRef.current?.disconnect();
+    } catch {}
+    recordingMonitorJerryGainRef.current = null;
+    recordingMonitorGuestGainRef.current = null;
+    recordingMonitorMixRef.current = null;
+
+    try {
+      recordingGraphRef.current?.cleanup();
+    } catch (err) {
+      console.warn('[Podcast Recorder] graph cleanup failed:', err);
+    }
+    recordingGraphRef.current = null;
+    recordingModeRef.current = null;
+    if (jerryPlaybackGainRef.current) {
+      jerryPlaybackGainRef.current.gain.value = 1;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isEpisodeRecording) return;
+
+    let frame: number | null = null;
+    let previousTime = performance.now();
+    const updateRecordingGraph = (now: number) => {
+      recordingGraphRef.current?.update(Math.max(0, now - previousTime));
+      previousTime = now;
+      if (recordingGraphRef.current) {
+        frame = requestAnimationFrame(updateRecordingGraph);
+      }
+    };
+
+    frame = requestAnimationFrame(updateRecordingGraph);
+    return () => {
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [isEpisodeRecording]);
 
   // Puppet-style mouth gating. Jerry is felt, so syllable energy matters more
   // than human phoneme-perfect lip shapes. We smooth attack/release and hold
@@ -827,11 +897,6 @@ export function JerryPodcastStudio() {
     const bounce = (smoothed / 100) * 5.5; // 0 to 5.5px downward jaw/head pop
     setJawBounce(bounce);
 
-    // 2. Subtle head sway/tilt driven by speech rhythm and natural inflection
-    const now = performance.now() / 320;
-    const tilt = (smoothed / 100) * Math.sin(now) * 1.8;
-    setHeadTilt(tilt);
-
     if (smoothed > 42) {
       quietLipFramesRef.current = 0;
       setMouthStage(2);
@@ -853,7 +918,6 @@ export function JerryPodcastStudio() {
       setMouthStage(0);
       setMouthOpenAmount(0);
       setAudioLevel(0);
-      setHeadTilt(0);
       setJawBounce(0);
     }
   }, [isJerrySpeaking]);
@@ -940,16 +1004,19 @@ export function JerryPodcastStudio() {
     const audio = audioPlayerRef.current;
     audio.src = audioSrc;
     setIsJerrySpeaking(true);
+    transitionAnimation('output-audio');
     setJerryPose(pose);
 
     audio.onended = () => {
       setIsJerrySpeaking(false);
+      transitionAnimation('turn-complete');
       setJerryPose('listening');
       setMouthStage(0);
       setMouthOpenAmount(0);
     };
     audio.onerror = () => {
       setIsJerrySpeaking(false);
+      transitionAnimation('turn-complete');
       setJerryPose('listening');
       setMouthStage(0);
       setMouthOpenAmount(0);
@@ -958,6 +1025,7 @@ export function JerryPodcastStudio() {
     audio.play().catch((err) => {
       console.warn('Audio play prevented:', err);
       setIsJerrySpeaking(false);
+      transitionAnimation('turn-complete');
       setJerryPose('listening');
     });
   };
@@ -999,6 +1067,7 @@ export function JerryPodcastStudio() {
         setInputText('');
         recognitionRef.current.start();
         setIsRecordingMic(true);
+        transitionAnimation('mic-start');
         setJerryPose('listening');
       } catch (err: any) {
         console.error('Mic start error:', err);
@@ -1011,11 +1080,6 @@ export function JerryPodcastStudio() {
   // Start or Stop Master Podcast Recording
   const handleToggleEpisodeRecord = async () => {
     const stopMicTracks = () => {
-      try {
-        episodeMicGainRef.current?.disconnect();
-      } catch {}
-      episodeMicGainRef.current = null;
-
       // If podcast recording borrowed the already-live conversation microphone,
       // do not kill it when recording stops.
       if (episodeOwnsMicRef.current && micMediaStreamRef.current) {
@@ -1041,10 +1105,12 @@ export function JerryPodcastStudio() {
           setRecordingNotice('מסיים ושומר את ההקלטה...');
         } catch (e) {
           console.error('[Podcast Recorder] error stopping MediaRecorder:', e);
+          cleanupRecordingGraph();
           stopMicTracks();
           setErrorNotice('לא ניתן היה לסיים את ההקלטה כראוי.');
         }
       } else {
+        cleanupRecordingGraph();
         stopMicTracks();
       }
       setIsEpisodeRecording(false);
@@ -1065,13 +1131,18 @@ export function JerryPodcastStudio() {
         await ctx.resume();
       }
 
-      // Try getting user mic stream
+      if (!ctx || !jerryRecordingInputRef.current) {
+        throw new Error('Jerry audio source is unavailable for recording.');
+      }
+
+      // Prefer the exact same microphone stream used by the live conversation.
+      // A Jerry-only recording remains available when mic permission is denied.
       let streamToRecord: MediaStream;
+      let micStream: MediaStream | null = null;
       try {
         // Prefer the exact same microphone stream used by the live conversation.
         // Opening a second getUserMedia stream for the master recording can trigger
         // browser DSP/echo-cancellation twice and make the guest very quiet.
-        let micStream: MediaStream;
         if (
           liveMicStreamRef.current &&
           liveMicStreamRef.current.getAudioTracks().some((track) => track.readyState === 'live')
@@ -1092,23 +1163,40 @@ export function JerryPodcastStudio() {
 
         micMediaStreamRef.current = micStream;
 
-        if (ctx && mixedDestNodeRef.current) {
-          const micSource = ctx.createMediaStreamSource(micStream);
-          const micGain = ctx.createGain();
-          // Lift the guest channel in the master mix. Jerry is generated audio
-          // and naturally much hotter than a laptop mic.
-          micGain.gain.value = 2.2;
-          episodeMicGainRef.current = micGain;
-          micSource.connect(micGain);
-          micGain.connect(mixedDestNodeRef.current);
-          streamToRecord = mixedDestNodeRef.current.stream;
-        } else {
-          streamToRecord = micStream;
+        const guestSource = ctx ? ctx.createMediaStreamSource(micStream) : null;
+        const graph = ctx && jerryRecordingInputRef.current
+          ? createRecordingGraph(ctx, { jerry: jerryRecordingInputRef.current, guest: guestSource })
+          : null;
+        if (!graph) throw new Error('Recording graph is unavailable.');
+        recordingGraphRef.current = graph;
+
+        const monitorMix = ctx.createGain();
+        const monitorJerryGain = ctx.createGain();
+        const monitorGuestGain = guestSource ? ctx.createGain() : null;
+        monitorJerryGain.gain.value = guestSource ? 0.5 : 1;
+        graph.jerryChain.output.connect(monitorJerryGain);
+        monitorJerryGain.connect(monitorMix);
+        if (graph.guestChain && monitorGuestGain) {
+          monitorGuestGain.gain.value = 0.5;
+          graph.guestChain.output.connect(monitorGuestGain);
+          monitorGuestGain.connect(monitorMix);
         }
+        monitorMix.connect(ctx.destination);
+        recordingMonitorMixRef.current = monitorMix;
+        recordingMonitorJerryGainRef.current = monitorJerryGain;
+        recordingMonitorGuestGainRef.current = monitorGuestGain;
+        recordingModeRef.current = guestSource ? 'dual-channel' : 'jerry-only';
+        if (jerryPlaybackGainRef.current) jerryPlaybackGainRef.current.gain.value = 0;
+        streamToRecord = graph.destination.stream;
+        setRecordingNotice(
+          guestSource
+            ? 'Stereo recording active: Jerry left, guest right.'
+            : 'Jerry-only recording active: microphone unavailable.',
+        );
       } catch (micErr: any) {
         console.warn('[Podcast Recorder] microphone unavailable; trying Jerry-only recording:', micErr);
-        if (mixedDestNodeRef.current && mixedDestNodeRef.current.stream.getAudioTracks().length > 0) {
-          streamToRecord = mixedDestNodeRef.current.stream;
+        if (recordingGraphRef.current?.destination.stream.getAudioTracks().length) {
+          streamToRecord = recordingGraphRef.current.destination.stream;
           setRecordingNotice('ההקלטה פעילה (רק ערוץ הקול של ג\'רי - לא אושרה הרשאת מיקרופון).');
         } else {
           throw new Error('יש לאשר גישה למיקרופון בדפדפן כדי להתחיל להקליט את השיחה.');
@@ -1239,6 +1327,7 @@ export function JerryPodcastStudio() {
     setInputText('');
     setMicTranscript('');
     setIsJerryThinking(true);
+    setAnimationState('thinking');
     setJerryPose('skeptical');
 
     // Preferred conversational path: persistent Gemini 3.8 Live session.
@@ -1307,11 +1396,13 @@ export function JerryPodcastStudio() {
       if (audioUrl) {
         playJerryAudio(audioUrl, isPhonePose ? 'phone' : 'speaking');
       } else {
+        transitionAnimation('turn-complete');
         setJerryPose('listening');
       }
     } catch (err: any) {
       console.error('[Jerry Live] Error:', err);
       setIsJerryThinking(false);
+      transitionAnimation('turn-complete');
       setJerryPose('listening');
       setErrorNotice('חלה שגיאה במענה של ג\'רי: ' + (err.message || 'תקלה בתקשורת'));
     }
@@ -1324,6 +1415,7 @@ export function JerryPodcastStudio() {
     setIsJerrySpeaking(false);
     setIsJerryThinking(false);
     setIsRecordingMic(false);
+    setAnimationState('idle');
     setJerryPose('speaking');
     setMouthStage(0);
     setMouthOpenAmount(0);
@@ -1345,9 +1437,8 @@ export function JerryPodcastStudio() {
     return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
   };
 
-  // Puppet mouth geometry. Kept deliberately simple: open / wide / rest.
-  const puppetMouthHeight = mouthStage === 2 ? '6.2%' : mouthStage === 1 ? '3.7%' : '1.2%';
-  const puppetMouthWidth = mouthStage === 2 ? '8.3%' : '7.6%';
+  const activePose = poseForState(animationState);
+  const activeMouthAnchor = JERRY_MOUTH_ANCHORS[activePose];
 
   return (
     <div className="w-full flex flex-col lg:flex-row gap-6 items-stretch">
@@ -1400,84 +1491,54 @@ export function JerryPodcastStudio() {
           </div>
         </div>
 
-        {/* Jerry's Visual Puppet Canvas with Precision Lip-Sync Layers */}
+        {/* Jerry's locked full-frame pose canvas with precision lip-sync layers */}
         <div className="relative rounded-[12px] overflow-hidden aspect-[16/10] sm:aspect-[16/9] bg-[#0E0E0D] border border-[#333330] flex items-center justify-center group shadow-inner select-none">
-          {/* Layer 0: 100% ROCK SOLID STATIC STUDIO BACKGROUND (Desk, Laptop, Blackboard, Mic, Plant) */}
-          <img
-            src="/jerry-pose-a.jpg"
-            alt="Jerry Studio Background"
-            className="absolute inset-0 w-full h-full object-cover select-none pointer-events-none"
-          />
-
-          {/* Layer 1: Focused listening state when user speaks (smooth crossfade on guest speech) */}
-          <img
-            src="/jerry-pose-d.jpg"
-            alt="Jerry Listening Pose"
-            className="absolute inset-0 w-full h-full object-cover transition-opacity duration-300 pointer-events-none select-none"
-            style={{
-              opacity: (isRecordingMic || isJerryThinking) && !isJerrySpeaking ? 1 : 0,
-            }}
-          />
-
-          {/* Layer 2: ONLY JERRY'S HEAD MOVES (Eyes, Eyebrows, Hair, Head Bob) - Background does NOT move! */}
-          <div
-            className="absolute pointer-events-none will-change-transform"
-            style={{
-              left: '26%',
-              top: '2%',
-              width: '43%',
-              height: '58%',
-              transformOrigin: '50% 90%', // Neck pivot point
-              transform: isJerrySpeaking
-                ? `translateY(${jawBounce * 0.4}px) rotate(${headTilt}deg)`
-                : isRecordingMic || isJerryThinking
-                ? 'translateY(-1px) rotate(-0.4deg)'
-                : 'translateY(0px)',
-              transition: isJerrySpeaking ? 'transform 40ms ease-out' : 'transform 400ms ease-in-out',
-            }}
-          >
-            {/* Jerry Head Sprite */}
+          {(Object.keys(JERRY_POSES) as JerryPose[]).map((pose) => (
             <img
-              src="/jerry-head.png"
-              alt="Jerry Head"
-              className="w-full h-full object-contain"
+              key={pose}
+              src={JERRY_POSES[pose]}
+              alt={`Jerry ${pose} pose`}
+              className="absolute inset-0 w-full h-full object-cover pointer-events-none select-none"
+              style={{
+                opacity: activePose === pose ? 1 : 0,
+                transition: `opacity ${JERRY_POSE_CROSSFADE_MS}ms ease-in-out`,
+              }}
             />
+          ))}
 
-            {/* Realistic Muppet Puppet Mouth Overlay inside the head - Moves with jaw */}
-            {isJerrySpeaking && (
+          {/* The analyser-driven mouth stays on top of whichever full-frame pose is active. */}
+          {isJerrySpeaking && (
+            <div
+              aria-hidden="true"
+              className="absolute pointer-events-none will-change-transform"
+              style={{
+                left: `${activeMouthAnchor.x}%`,
+                top: `calc(${activeMouthAnchor.y}% + ${jawBounce * 0.55}px)`,
+                width: `${activeMouthAnchor.width + (mouthOpenAmount / 100) * 3.8}%`,
+                height: `${2.8 + (mouthOpenAmount / 100) * 11.5}%`,
+                opacity: mouthStage === 0 ? 0 : 0.98,
+                transform: 'translate(-50%, -50%)',
+                borderRadius: '46% 46% 54% 54% / 30% 30% 70% 70%',
+                background:
+                  'radial-gradient(ellipse at 50% 75%, #8d3340 0 25%, #541921 26% 50%, #150709 55% 100%)',
+                boxShadow:
+                  mouthStage === 2
+                    ? 'inset 0 2px 5px rgba(0,0,0,.9), 0 1px 2px rgba(0,0,0,.4)'
+                    : 'inset 0 1px 4px rgba(0,0,0,.9)',
+                transition:
+                  'height 40ms ease-out, width 40ms ease-out, top 40ms ease-out, opacity 35ms linear',
+              }}
+            >
               <div
-                aria-hidden="true"
-                className="absolute pointer-events-none will-change-transform"
+                className="absolute left-[20%] right-[20%] bottom-[6%] rounded-full"
                 style={{
-                  left: '55.2%',
-                  top: `calc(75.5% + ${jawBounce * 0.55}px)`,
-                  width: `${17.5 + (mouthOpenAmount / 100) * 3.8}%`,
-                  height: `${2.8 + (mouthOpenAmount / 100) * 11.5}%`,
-                  opacity: mouthStage === 0 ? 0 : 0.98,
-                  transform: 'translate(-50%, -50%)',
-                  borderRadius: '46% 46% 54% 54% / 30% 30% 70% 70%',
-                  background:
-                    'radial-gradient(ellipse at 50% 75%, #8d3340 0 25%, #541921 26% 50%, #150709 55% 100%)',
-                  boxShadow:
-                    mouthStage === 2
-                      ? 'inset 0 2px 5px rgba(0,0,0,.9), 0 1px 2px rgba(0,0,0,.4)'
-                      : 'inset 0 1px 4px rgba(0,0,0,.9)',
-                  transition:
-                    'height 40ms ease-out, width 40ms ease-out, top 40ms ease-out, opacity 35ms linear',
+                  height: mouthStage === 2 ? '30%' : '22%',
+                  background: 'rgba(185, 68, 80, 0.85)',
+                  filter: 'blur(0.2px)',
                 }}
-              >
-                {/* Felt Muppet Tongue / Inner Mouth */}
-                <div
-                  className="absolute left-[20%] right-[20%] bottom-[6%] rounded-full"
-                  style={{
-                    height: mouthStage === 2 ? '30%' : '22%',
-                    background: 'rgba(185, 68, 80, 0.85)',
-                    filter: 'blur(0.2px)',
-                  }}
-                />
-              </div>
-            )}
-          </div>
+              />
+            </div>
+          )}
 
           {/* Glowing "ON AIR" Retro Studio Sign */}
           <div className="absolute top-3 left-3 bg-red-600/90 backdrop-blur-xs text-white text-[10px] font-black uppercase tracking-[0.18em] px-2.5 py-0.5 rounded-[4px] border border-red-400/30 flex items-center gap-1.5 shadow-lg">
