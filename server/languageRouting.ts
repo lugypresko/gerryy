@@ -2,6 +2,11 @@ export const CODE_SWITCH_LANGUAGE_CODES = ['he-IL', 'en-US'] as const;
 
 export const CODE_SWITCH_TRANSCRIPTION_CONFIG = {
   languageCodes: CODE_SWITCH_LANGUAGE_CODES,
+};
+
+// Application policy; these fields are intentionally not spread into the
+// provider request because Gemini rejects unknown inputAudioTranscription keys.
+export const CODE_SWITCH_PRESERVATION_POLICY = {
   mode: 'VERBATIM' as const,
   preserveCodeSwitching: true,
 };
