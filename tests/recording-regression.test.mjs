@@ -7,7 +7,7 @@ const leveler = fs.readFileSync('src/audio/autoLeveler.ts', 'utf8');
 
 test('recording channels are a stable Jerry-left and guest-right contract', () => {
   assert.match(graph, /export const RECORDING_CHANNELS = \{\s*jerry:\s*0,\s*guest:\s*1,\s*\} as const;/);
-  assert.match(graph, /targetDbfs:\s*-18/);
+  assert.match(graph, /targetDbfs:\s*-16/);
   assert.match(graph, /gateDbfs:\s*-55/);
   assert.match(graph, /minGainDb:\s*-12/);
   assert.match(graph, /maxGainDb:\s*18/);
@@ -37,7 +37,7 @@ test('recording graph creates independent source chains with compressors', () =>
 test('merger routes Jerry to channel zero and guest to channel one', () => {
   assert.match(graph, /jerryChain\.output\.connect\(merger, 0, RECORDING_CHANNELS\.jerry\)/);
   assert.match(graph, /guestChain\.output\.connect\(merger, 0, RECORDING_CHANNELS\.guest\)/);
-  assert.match(graph, /merger\.connect\(destination\)/);
+  assert.match(graph, /merger\.connect\(masterGain\)/);
   assert.match(graph, /createMediaStreamDestination\(\)/);
 });
 
@@ -66,6 +66,16 @@ test('recording graph exposes independent Jerry and guest destinations', () => {
   assert.match(graph, /guestDestination: MediaStreamAudioDestinationNode \| null/);
   assert.match(graph, /jerryChain\.output\.connect\(jerryDestination\)/);
   assert.match(graph, /guestChain\.output\.connect\(guestDestination\)/);
+});
+
+test('master voice mix applies shared loudness target and -1 dB headroom limiter', () => {
+  assert.match(graph, /RECORDING_MASTER_CONFIG/);
+  assert.match(graph, /masterGain: GainNode/);
+  assert.match(graph, /masterLimiter: DynamicsCompressorNode/);
+  assert.match(graph, /masterGain\.gain\.value/);
+  assert.match(graph, /masterGain\.connect\(masterLimiter\)/);
+  assert.match(graph, /masterLimiter\.connect\(destination\)/);
+  assert.match(graph, /ceilingDb:\s*-1/);
 });
 
 test('episode recording creates separate speaker files and a conversation log', () => {

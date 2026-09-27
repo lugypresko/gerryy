@@ -11,6 +11,7 @@ Updated: 2026-09-27
 - The monitor remains centered while recording outputs preserve speaker separation.
 - Recording produces a stereo master plus dedicated speaker files.
 - Recording produces `conversation.json` with turn number, speaker, text, and timestamps relative to recording start.
+- Voice Mix v1 targets approximately `-16 dBFS RMS` per source and adds a master limiter with a `-1 dB` ceiling.
 
 ## Recording outputs
 
