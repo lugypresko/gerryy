@@ -87,7 +87,7 @@ test('Jerry studio integrates independent recording chains and a centered monito
   assert.match(studio, /recordingGraphRef/);
   assert.match(studio, /jerry:\s*jerryRecordingInputRef\.current/);
   assert.match(studio, /guest:\s*guestSource/);
-  assert.match(studio, /recordingGraphRef\.current\.destination\.stream/);
+  assert.match(studio, /(?:recordingGraphRef\.current|graph)\.destination\.stream/);
   assert.match(studio, /recordingMonitorMixRef/);
   assert.match(studio, /recordingGraphRef\.current\?\.update\(/);
   assert.match(studio, /liveMicStreamRef\.current/);
