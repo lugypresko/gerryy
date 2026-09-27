@@ -43,6 +43,26 @@ test('dedicated Hebrew transcription path is present', () => {
   assert.match(server, /type:\s*'stt-error'/);
 });
 
+test('authoritative guest transcript is finalized from the complete turn audio', () => {
+  assert.match(server, /guestPcmChunks/);
+  assert.match(server, /Buffer\.from\(msg\.data,\s*'base64'\)/);
+  assert.match(server, /gemini-3\.5-transcribe/);
+  assert.match(server, /generateContent\(/);
+  assert.match(server, /audioTranscriptionConfig/);
+  assert.match(server, /mimeType:\s*'audio\/wav'/);
+  assert.match(server, /transcribeGuestTurn/);
+});
+
+test('live STT is interim-only and authoritative text is what reaches Jerry', () => {
+  assert.match(server, /input-transcript-interim/);
+  assert.match(server, /transcribeGuestTurn\(ai,\s*completedTurnChunks\)/);
+  assert.match(server, /authoritativeTranscript[\s\S]{0,500}sendClientContent\(/);
+  assert.doesNotMatch(
+    server,
+    /const transcript = finalText\.trim\(\);[\s\S]{0,260}sendClientContent\(/,
+  );
+});
+
 test('Gemini Live output PCM is resampled to the browser AudioContext rate', () => {
   assert.match(studio, /sourceRateMatch = \/rate=\(\\d\+\)\/i\.exec/);
   assert.match(studio, /const targetRate = ctx\?\.sampleRate \|\| sourceRate/);

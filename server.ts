@@ -158,6 +158,58 @@ function getApiKey(req?: express.Request): string {
   return '';
 }
 
+function pcm16ToWavBase64(chunks: Buffer[], sampleRate = 16000): string {
+  const pcm = Buffer.concat(chunks);
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]).toString('base64');
+}
+
+async function transcribeGuestTurn(ai: GoogleGenAI, chunks: Buffer[]): Promise<string> {
+  if (chunks.length === 0) return '';
+  const response = await ai.models.generateContent({
+    model: 'gemini-3.5-transcribe',
+    contents: [{
+      inlineData: {
+        mimeType: 'audio/wav',
+        data: pcm16ToWavBase64(chunks),
+      },
+    }],
+    config: {
+      audioTranscriptionConfig: {
+        languageCodes: ['he-IL'],
+        customVocabulary: [
+          'ג\'רי',
+          'איתי',
+          'Kubernetes',
+          'production',
+          'deploy',
+          'rollback',
+          'incident',
+          'latency',
+          'GitHub',
+          'R&D',
+          'AI',
+          'Gemini',
+        ],
+      },
+    },
+  });
+  return response.text?.trim() || '';
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
@@ -838,6 +890,8 @@ CRITICAL RULES:
     let liveSession: any = null;
     let transcribeSession: any = null;
     let lastFinalGuestTranscript = '';
+    let guestPcmChunks: Buffer[] = [];
+    let guestTurnId = 0;
 
     try {
       const ai = new GoogleGenAI({ apiKey: key });
@@ -860,27 +914,12 @@ CRITICAL RULES:
               client.send(JSON.stringify({ type: 'input-transcript-interim', text: interim }));
             }
 
-            const finalText =
+            const liveFinalText =
               serverContent?.inputTranscription?.text ||
               serverContent?.input_transcription?.text ||
               '';
-
-            if (finalText && finalText.trim()) {
-              const transcript = finalText.trim();
-              if (transcript === lastFinalGuestTranscript) return;
-              lastFinalGuestTranscript = transcript;
-
-              console.info('[Jerry STT] final Hebrew transcript:', transcript);
-              client.send(JSON.stringify({ type: 'input-transcript', text: transcript }));
-
-              try {
-                liveSession?.sendClientContent({
-                  turns: [{ role: 'user', parts: [{ text: transcript }] }],
-                  turnComplete: true,
-                });
-              } catch (err) {
-                console.warn('[Jerry STT] failed forwarding transcript to Jerry:', err);
-              }
+            if (liveFinalText.trim()) {
+              console.info('[Jerry STT] live final candidate (awaiting full-turn verification):', liveFinalText.trim());
             }
           },
           onerror: (event: any) => {
@@ -1005,7 +1044,7 @@ CRITICAL RULES:
             type: 'ready',
             engine: 'gemini-3.8-live',
             engineVersion: JERRY_ENGINE_VERSION,
-                inputPath: 'push-to-talk PCM -> Gemini 3.5 Transcribe Live (he-IL + VERBATIM) -> text -> Gemini 3.8 Live -> Jerry response',
+                    inputPath: 'push-to-talk PCM -> Live interim STT -> full-turn Gemini 3.5 Transcribe (he-IL) -> Gemini 3.8 Live -> Jerry response',
           }),
         );
       }
@@ -1054,12 +1093,15 @@ CRITICAL RULES:
           });
         } else if (msg.type === 'activity-start') {
           lastFinalGuestTranscript = '';
+          guestTurnId += 1;
+          guestPcmChunks = [];
           console.info('[Jerry Engine]', {
             engineVersion: JERRY_ENGINE_VERSION,
             stage: 'hebrew-transcribe-start',
           });
           transcribeSession.sendRealtimeInput({ activityStart: {} });
         } else if (msg.type === 'audio' && typeof msg.data === 'string' && msg.data) {
+          guestPcmChunks.push(Buffer.from(msg.data, 'base64'));
           transcribeSession.sendRealtimeInput({
             audio: {
               data: msg.data,
@@ -1067,11 +1109,35 @@ CRITICAL RULES:
             },
           });
         } else if (msg.type === 'activity-end') {
+          const completedTurnId = guestTurnId;
+          const completedTurnChunks = guestPcmChunks;
+          guestPcmChunks = [];
           console.info('[Jerry Engine]', {
             engineVersion: JERRY_ENGINE_VERSION,
-            stage: 'hebrew-transcribe-end',
+            stage: 'hebrew-transcribe-end-awaiting-authoritative-final',
           });
           transcribeSession.sendRealtimeInput({ activityEnd: {} });
+          void (async () => {
+            try {
+              const authoritativeTranscript = await transcribeGuestTurn(ai, completedTurnChunks);
+              if (completedTurnId !== guestTurnId || !authoritativeTranscript) return;
+              if (authoritativeTranscript === lastFinalGuestTranscript) return;
+              lastFinalGuestTranscript = authoritativeTranscript;
+              console.info('[Jerry STT] authoritative Hebrew transcript:', authoritativeTranscript);
+              if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({ type: 'input-transcript', text: authoritativeTranscript }));
+              }
+              liveSession?.sendClientContent({
+                turns: [{ role: 'user', parts: [{ text: authoritativeTranscript }] }],
+                turnComplete: true,
+              });
+            } catch (err) {
+              console.warn('[Jerry STT] authoritative transcription failed:', err);
+              if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({ type: 'stt-error', message: 'Authoritative Hebrew transcription failed' }));
+              }
+            }
+          })();
         }
       } catch (err) {
         console.warn('[Jerry Live] bad browser message:', err);
