@@ -4,6 +4,7 @@ export interface RecordingSessionOptions {
   ownsMic: boolean;
   mimeType: string;
   cleanupGraph: () => void;
+  onChunk?: (chunk: Blob, sequence: number) => void | Promise<void>;
 }
 
 export interface RecordingSession {
@@ -15,14 +16,22 @@ export interface RecordingSession {
 }
 
 export function createRecordingSession(options: RecordingSessionOptions): RecordingSession {
-  const { recorder, micStream, ownsMic, mimeType, cleanupGraph } = options;
+  const { recorder, micStream, ownsMic, mimeType, cleanupGraph, onChunk } = options;
   const chunks: Blob[] = [];
+  const pendingChunkWrites: Promise<void>[] = [];
+  let sequence = 0;
   let cleaned = false;
   let stopRequested = false;
   let resolveStopped: (() => void) | null = null;
   const stopped = new Promise<void>((resolve) => { resolveStopped = resolve; });
 
-  const onData = (event: BlobEvent) => { if (event.data?.size) chunks.push(event.data); };
+  const onData = (event: BlobEvent) => {
+    if (event.data?.size) {
+      chunks.push(event.data);
+      const write = onChunk?.(event.data, sequence++);
+      if (write) pendingChunkWrites.push(Promise.resolve(write));
+    }
+  };
   const onStop = () => resolveStopped?.();
   recorder.addEventListener('dataavailable', onData);
   recorder.addEventListener('stop', onStop, { once: true });
@@ -43,6 +52,8 @@ export function createRecordingSession(options: RecordingSessionOptions): Record
       recorder.stop();
     }
     if (recorder.state !== 'inactive') await stopped;
+    else await Promise.resolve();
+    await Promise.all(pendingChunkWrites);
     return new Blob(chunks, { type: mimeType });
   };
 

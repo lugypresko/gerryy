@@ -17,6 +17,7 @@ import {
 import { createRecordingGraph, type RecordingGraph, type RecordingMetrics } from './audio/recordingGraph';
 import { finalizeEpisode, type FinalizedEpisode } from './audio/episodeFinalizer';
 import { createRecordingSession, type RecordingSession } from './audio/recordingSession';
+import { createRecordingOutbox, type RecordingOutbox } from './audio/recordingOutbox';
 import {
   appendConversationTurn,
   createConversationTurnLog,
@@ -167,6 +168,7 @@ export function JerryPodcastStudio() {
   const recordingStartedAtRef = useRef<number | null>(null);
   const turnLogRef = useRef<ConversationTurnLogEntry[]>(createConversationTurnLog());
   const activeTurnRef = useRef<{ speaker: ConversationSpeaker; startedAt: number; text: string } | null>(null);
+  const recordingOutboxRef = useRef<RecordingOutbox | null>(null);
   const recordingGraphRef = useRef<RecordingGraph | null>(null);
   const jerryRecordingInputRef = useRef<GainNode | null>(null);
   const jerryPlaybackGainRef = useRef<GainNode | null>(null);
@@ -1718,6 +1720,8 @@ export function JerryPodcastStudio() {
       const options: MediaRecorderOptions = chosenMime ? { mimeType: chosenMime } : {};
       const mediaRecorder = new MediaRecorder(streamToRecord, options);
       const actualMime = mediaRecorder.mimeType || chosenMime || 'audio/webm';
+      const recordingOutbox = await createRecordingOutbox();
+      recordingOutboxRef.current = recordingOutbox;
       const extension = actualMime.includes('mp4')
         ? 'm4a'
         : actualMime.includes('ogg')
@@ -1783,6 +1787,15 @@ export function JerryPodcastStudio() {
 
           if (blob.size > 0) {
             const recordingId = `episode-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+            try {
+              await recordingOutbox.saveSnapshot({
+                master: blob,
+                timeline: [...turnLogRef.current],
+              });
+            } catch (error) {
+              console.error('[Podcast Recorder] outbox snapshot write failed:', error);
+              setErrorNotice('ההקלטה עובדה, אך השמירה המקומית נכשלה.');
+            }
             setRecordingNotice('Finalizing recording...');
             emitRecordingDebugEvent('recording-finalization-start', { rawMasterBytes: blob.size, mimeType: actualMime });
             await persistRecordingArtifact(recordingId, 'raw', blob, {
@@ -1837,6 +1850,9 @@ export function JerryPodcastStudio() {
           stopMicTracks();
           recordingSessionRef.current?.cleanup();
           recordingSessionRef.current = null;
+          recordingOutboxRef.current = null;
+          micMediaStreamRef.current = null;
+          episodeOwnsMicRef.current = false;
           mediaRecorderRef.current = null;
           jerryTrackRecorderRef.current = null;
           guestTrackRecorderRef.current = null;
@@ -1884,6 +1900,9 @@ export function JerryPodcastStudio() {
         ownsMic: episodeOwnsMicRef.current,
         mimeType: actualMime,
         cleanupGraph: () => undefined,
+        onChunk: (chunk, sequence) => recordingOutbox
+          .appendChunk({ source: 'master', sequence, blob: chunk })
+          .then(() => undefined),
       });
       recordingStartedAtRef.current = performance.now();
       setIsEpisodeRecording(true);
