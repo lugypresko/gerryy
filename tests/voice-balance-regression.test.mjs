@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 const graph = fs.readFileSync('src/audio/recordingGraph.ts', 'utf8');
+const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
 
 test('Guest and Jerry gain ceilings are bounded and distinct', () => {
   const guest = graph.match(/export const GUEST_LEVEL_CONFIG = \{([\s\S]*?)\} as const/);
@@ -41,4 +42,38 @@ test('createRecordingGraph wires source-specific level and dynamics configs', ()
   assert.match(graph, /createChannelChain\([\s\S]*?sources\.guest,[\s\S]*?GUEST_LEVEL_CONFIG,[\s\S]*?GUEST_DYNAMICS_CONFIG,[\s\S]*?\)/);
   assert.match(graph, /dynamicsConfig\.threshold/);
   assert.match(graph, /dynamicsConfig\.release/);
+});
+
+test('microphone capture enables cleanup but delegates leveling to Jerry', () => {
+  assert.match(studio, /MICROPHONE_CAPTURE_CONSTRAINTS/);
+  assert.match(studio, /echoCancellation:\s*true/);
+  assert.match(studio, /noiseSuppression:\s*true/);
+  assert.match(studio, /autoGainControl:\s*false/);
+  assert.equal((studio.match(/\.\.\.MICROPHONE_CAPTURE_CONSTRAINTS/g) || []).length, 2);
+});
+
+test('master output has an explicit conservative ceiling', () => {
+  assert.match(graph, /MASTER_LIMITER_CONFIG[\s\S]{0,220}threshold:\s*-1/);
+  assert.match(graph, /masterGain\.connect\(masterLimiter\)/);
+  assert.match(graph, /masterLimiter\.connect\(destination\)/);
+});
+
+test('recording exposes balance telemetry and a publication decision', () => {
+  assert.match(graph, /getMetrics/);
+  for (const metric of [
+    'guestRmsDbfs',
+    'jerryRmsDbfs',
+    'guestPeakDbfs',
+    'jerryPeakDbfs',
+    'guestClippingCount',
+    'jerryClippingCount',
+    'balanceDeltaDb',
+  ]) {
+    assert.match(graph, new RegExp(`\\b${metric}\\b`), `missing concrete telemetry metric: ${metric}`);
+  }
+  assert.match(studio, /recording-levels/);
+  assert.match(studio, /publicationStatus/);
+  assert.match(studio, /publishable/);
+  assert.match(studio, /needs-review/);
+  assert.match(studio, /failed/);
 });

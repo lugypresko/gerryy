@@ -63,7 +63,8 @@ test('recording graph creates independent source chains with compressors', () =>
 test('merger routes Jerry to channel zero and guest to channel one', () => {
   assert.match(graph, /jerryChain\.output\.connect\(merger, 0, RECORDING_CHANNELS\.jerry\)/);
   assert.match(graph, /guestChain\.output\.connect\(merger, 0, RECORDING_CHANNELS\.guest\)/);
-  assert.match(graph, /merger\.connect\(masterLimiter\)/);
+  assert.match(graph, /merger\.connect\(masterGain\)/);
+  assert.match(graph, /masterGain\.connect\(masterLimiter\)/);
   assert.match(graph, /masterLimiter\.connect\(destination\)/);
   assert.match(graph, /createMediaStreamDestination\(\)/);
 });
@@ -71,7 +72,7 @@ test('merger routes Jerry to channel zero and guest to channel one', () => {
 test('master limiter is the final recording safety boundary', () => {
   assert.match(graph, /const MASTER_LIMITER_CONFIG = \{[\s\S]*?threshold:\s*-1/);
   assert.match(graph, /const MASTER_LIMITER_CONFIG = \{[\s\S]*?ratio:\s*20/);
-  assert.match(graph, /merger\.connect\(masterLimiter\);\s*masterLimiter\.connect\(destination\);/);
+  assert.match(graph, /merger\.connect\(masterGain\);\s*masterGain\.connect\(masterLimiter\);\s*masterLimiter\.connect\(destination\);/);
 });
 
 test('recording graph exposes cleanup without owning the centered monitor mix', () => {
@@ -102,13 +103,13 @@ test('recording graph exposes independent Jerry and guest destinations', () => {
 });
 
 test('master voice mix applies shared loudness target and -1 dB headroom limiter', () => {
-  assert.match(graph, /RECORDING_MASTER_CONFIG/);
+  assert.match(graph, /MASTER_LIMITER_CONFIG/);
   assert.match(graph, /masterGain: GainNode/);
   assert.match(graph, /masterLimiter: DynamicsCompressorNode/);
   assert.match(graph, /masterGain\.gain\.value/);
   assert.match(graph, /masterGain\.connect\(masterLimiter\)/);
   assert.match(graph, /masterLimiter\.connect\(destination\)/);
-  assert.match(graph, /ceilingDb:\s*-1/);
+  assert.match(graph, /threshold:\s*-1/);
 });
 
 test('episode recording creates separate speaker files and a conversation log', () => {

@@ -76,6 +76,9 @@ export interface RecordingGraph {
   guestChain: RecordingChannelChain | null;
   merger: ChannelMergerNode;
   destination: MediaStreamAudioDestinationNode;
+  jerryDestination: MediaStreamAudioDestinationNode;
+  guestDestination: MediaStreamAudioDestinationNode | null;
+  masterGain: GainNode;
   masterLimiter: DynamicsCompressorNode;
   /** The centered monitor mix remains an integration responsibility. */
   monitorMix: null;
@@ -144,7 +147,6 @@ export function createRecordingGraph(
     )
     : null;
   const merger = context.createChannelMerger(2);
-  const masterLimiter = context.createDynamicsCompressor();
   const destination = context.createMediaStreamDestination();
   const jerryDestination = context.createMediaStreamDestination();
   const guestDestination = guestChain ? context.createMediaStreamDestination() : null;
@@ -153,13 +155,7 @@ export function createRecordingGraph(
   destination.channelCount = guestChain ? 2 : 1;
   jerryDestination.channelCount = 1;
   if (guestDestination) guestDestination.channelCount = 1;
-  masterGain.gain.value = 10 ** (RECORDING_MASTER_CONFIG.ceilingDb / 20);
-  setAudioParam(context, masterLimiter.threshold, RECORDING_MASTER_CONFIG.threshold);
-  setAudioParam(context, masterLimiter.knee, RECORDING_MASTER_CONFIG.knee);
-  setAudioParam(context, masterLimiter.ratio, RECORDING_MASTER_CONFIG.ratio);
-  setAudioParam(context, masterLimiter.attack, RECORDING_MASTER_CONFIG.attack);
-  setAudioParam(context, masterLimiter.release, RECORDING_MASTER_CONFIG.release);
-
+  masterGain.gain.value = 1;
   setAudioParam(context, masterLimiter.threshold, MASTER_LIMITER_CONFIG.threshold);
   setAudioParam(context, masterLimiter.knee, MASTER_LIMITER_CONFIG.knee);
   setAudioParam(context, masterLimiter.ratio, MASTER_LIMITER_CONFIG.ratio);
@@ -168,14 +164,20 @@ export function createRecordingGraph(
 
   jerryChain.output.connect(merger, 0, RECORDING_CHANNELS.jerry);
   if (guestChain) guestChain.output.connect(merger, 0, RECORDING_CHANNELS.guest);
-  merger.connect(masterLimiter);
+  merger.connect(masterGain);
+  masterGain.connect(masterLimiter);
   masterLimiter.connect(destination);
+  jerryChain.output.connect(jerryDestination);
+  if (guestChain && guestDestination) guestChain.output.connect(guestDestination);
 
   return {
     jerryChain,
     guestChain,
     merger,
     destination,
+    jerryDestination,
+    guestDestination,
+    masterGain,
     masterLimiter,
     monitorMix: null,
     update(elapsedMs: number) {
@@ -205,6 +207,7 @@ export function createRecordingGraph(
         guestChain.compressor.disconnect();
       }
       merger.disconnect();
+      masterGain.disconnect();
       masterLimiter.disconnect();
       destination.disconnect();
       jerryDestination.disconnect();
