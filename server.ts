@@ -890,6 +890,7 @@ CRITICAL RULES:
     let liveSession: any = null;
     let transcribeSession: any = null;
     let lastFinalGuestTranscript = '';
+    let lastLiveFinalCandidate = '';
     let guestPcmChunks: Buffer[] = [];
     let guestTurnId = 0;
 
@@ -919,7 +920,8 @@ CRITICAL RULES:
               serverContent?.input_transcription?.text ||
               '';
             if (liveFinalText.trim()) {
-              console.info('[Jerry STT] live final candidate (awaiting full-turn verification):', liveFinalText.trim());
+              lastLiveFinalCandidate = liveFinalText.trim();
+              console.info('[Jerry STT] live final candidate (awaiting full-turn verification):', lastLiveFinalCandidate);
             }
           },
           onerror: (event: any) => {
@@ -1093,6 +1095,7 @@ CRITICAL RULES:
           });
         } else if (msg.type === 'activity-start') {
           lastFinalGuestTranscript = '';
+          lastLiveFinalCandidate = '';
           guestTurnId += 1;
           guestPcmChunks = [];
           console.info('[Jerry Engine]', {
@@ -1118,25 +1121,24 @@ CRITICAL RULES:
           });
           transcribeSession.sendRealtimeInput({ activityEnd: {} });
           void (async () => {
+            let authoritativeTranscript = '';
             try {
-              const authoritativeTranscript = await transcribeGuestTurn(ai, completedTurnChunks);
-              if (completedTurnId !== guestTurnId || !authoritativeTranscript) return;
-              if (authoritativeTranscript === lastFinalGuestTranscript) return;
-              lastFinalGuestTranscript = authoritativeTranscript;
-              console.info('[Jerry STT] authoritative Hebrew transcript:', authoritativeTranscript);
-              if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify({ type: 'input-transcript', text: authoritativeTranscript }));
-              }
-              liveSession?.sendClientContent({
-                turns: [{ role: 'user', parts: [{ text: authoritativeTranscript }] }],
-                turnComplete: true,
-              });
+              authoritativeTranscript = await transcribeGuestTurn(ai, completedTurnChunks);
             } catch (err) {
-              console.warn('[Jerry STT] authoritative transcription failed:', err);
-              if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify({ type: 'stt-error', message: 'Authoritative Hebrew transcription failed' }));
-              }
+              console.warn('[Jerry STT] authoritative transcription failed; using live candidate:', err);
             }
+            const finalTranscript = authoritativeTranscript || lastLiveFinalCandidate;
+            if (completedTurnId !== guestTurnId || !finalTranscript) return;
+            if (finalTranscript === lastFinalGuestTranscript) return;
+            lastFinalGuestTranscript = finalTranscript;
+            console.info('[Jerry STT] authoritative Hebrew transcript:', finalTranscript);
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(JSON.stringify({ type: 'input-transcript', text: finalTranscript }));
+            }
+            liveSession?.sendClientContent({
+              turns: [{ role: 'user', parts: [{ text: finalTranscript }] }],
+              turnComplete: true,
+            });
           })();
         }
       } catch (err) {

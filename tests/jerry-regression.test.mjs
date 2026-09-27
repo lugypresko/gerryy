@@ -56,11 +56,16 @@ test('authoritative guest transcript is finalized from the complete turn audio',
 test('live STT is interim-only and authoritative text is what reaches Jerry', () => {
   assert.match(server, /input-transcript-interim/);
   assert.match(server, /transcribeGuestTurn\(ai,\s*completedTurnChunks\)/);
-  assert.match(server, /authoritativeTranscript[\s\S]{0,500}sendClientContent\(/);
+  assert.match(server, /finalTranscript[\s\S]{0,500}sendClientContent\(/);
   assert.doesNotMatch(
     server,
     /const transcript = finalText\.trim\(\);[\s\S]{0,260}sendClientContent\(/,
   );
+});
+
+test('transcription service failure keeps a live candidate fallback', () => {
+  assert.match(server, /lastLiveFinalCandidate/);
+  assert.match(server, /authoritativeTranscript \|\| lastLiveFinalCandidate/);
 });
 
 test('Gemini Live output PCM is resampled to the browser AudioContext rate', () => {
