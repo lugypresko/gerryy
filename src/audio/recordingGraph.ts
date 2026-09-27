@@ -29,6 +29,11 @@ export const JERRY_LEVEL_CONFIG = {
   releaseMs: 500,
 } as const satisfies AutoLevelerConfig;
 
+export const GUEST_PREAMP_CONFIG = {
+  defaultGainDb: 6,
+  maxGainDb: 12,
+} as const;
+
 interface DynamicsConfig {
   threshold: number;
   knee: number;
@@ -66,6 +71,7 @@ type AudioNodeLike = AudioNode;
 
 export interface RecordingChannelChain {
   source: AudioNodeLike;
+  preamp: GainNode;
   analyser: AnalyserNode;
   levelGain: GainNode;
   compressor: DynamicsCompressorNode;
@@ -90,6 +96,10 @@ export interface RecordingMetrics {
   guestGainDb: number | null;
   jerryGainDb: number;
   balanceDeltaDb: number | null;
+  guestPreampDb: number;
+  jerryPreampDb: number;
+  guestLevelGainDb: number;
+  jerryLevelGainDb: number;
 }
 
 export interface RecordingGraph {
@@ -117,12 +127,15 @@ function createChannelChain(
   source: AudioNodeLike,
   levelConfig: AutoLevelerConfig,
   dynamicsConfig: DynamicsConfig,
+  preampGainDb: number,
 ): RecordingChannelChain {
   const analyser = context.createAnalyser();
+  const preamp = context.createGain();
   const levelGain = context.createGain();
   const compressor = context.createDynamicsCompressor();
 
   analyser.fftSize = 1024;
+  preamp.gain.value = 10 ** (preampGainDb / 20);
   levelGain.gain.value = 1;
   setAudioParam(context, compressor.threshold, dynamicsConfig.threshold);
   setAudioParam(context, compressor.knee, dynamicsConfig.knee);
@@ -130,12 +143,14 @@ function createChannelChain(
   setAudioParam(context, compressor.attack, dynamicsConfig.attack);
   setAudioParam(context, compressor.release, dynamicsConfig.release);
 
-  source.connect(analyser);
+  source.connect(preamp);
+  preamp.connect(analyser);
   analyser.connect(levelGain);
   levelGain.connect(compressor);
 
   return {
     source,
+    preamp,
     analyser,
     levelGain,
     compressor,
@@ -160,6 +175,7 @@ export function createRecordingGraph(
     sources.jerry,
     JERRY_LEVEL_CONFIG,
     JERRY_DYNAMICS_CONFIG,
+    0,
   );
   const guestChain = sources.guest
     ? createChannelChain(
@@ -167,6 +183,7 @@ export function createRecordingGraph(
       sources.guest,
       GUEST_LEVEL_CONFIG,
       GUEST_DYNAMICS_CONFIG,
+      Math.min(GUEST_PREAMP_CONFIG.defaultGainDb, GUEST_PREAMP_CONFIG.maxGainDb),
     )
     : null;
   const merger = context.createChannelMerger(2);
@@ -214,6 +231,17 @@ export function createRecordingGraph(
     }
     : null;
 
+  let jerryLevelGainDb = 0;
+  let guestLevelGainDb = 0;
+  const metrics: RecordingMetrics = {
+    guestPreampDb: guestChain
+      ? Math.min(GUEST_PREAMP_CONFIG.defaultGainDb, GUEST_PREAMP_CONFIG.maxGainDb)
+      : 0,
+    jerryPreampDb: 0,
+    guestLevelGainDb,
+    jerryLevelGainDb,
+  };
+
   return {
     jerryChain,
     guestChain,
@@ -235,6 +263,8 @@ export function createRecordingGraph(
           elapsedMs,
         );
         jerryChain.levelGain.gain.value = 10 ** (jerryGainDb / 20);
+        jerryLevelGainDb = jerryGainDb;
+        metrics.jerryLevelGainDb = jerryLevelGainDb;
       }
 
       if (guestChain) {
@@ -248,6 +278,8 @@ export function createRecordingGraph(
             elapsedMs,
           );
           guestChain.levelGain.gain.value = 10 ** (guestGainDb / 20);
+          guestLevelGainDb = guestGainDb;
+          metrics.guestLevelGainDb = guestLevelGainDb;
         }
       }
     },
@@ -271,15 +303,21 @@ export function createRecordingGraph(
         guestGainDb: guestChain?.leveler.gainDb ?? null,
         jerryGainDb: jerryChain.leveler.gainDb,
         balanceDeltaDb,
+        guestPreampDb: metrics.guestPreampDb,
+        jerryPreampDb: metrics.jerryPreampDb,
+        guestLevelGainDb,
+        jerryLevelGainDb,
       }
     },
     cleanup() {
       jerryChain.source.disconnect();
+      jerryChain.preamp.disconnect();
       jerryChain.analyser.disconnect();
       jerryChain.levelGain.disconnect();
       jerryChain.compressor.disconnect();
       if (guestChain) {
         guestChain.source.disconnect();
+        guestChain.preamp.disconnect();
         guestChain.analyser.disconnect();
         guestChain.levelGain.disconnect();
         guestChain.compressor.disconnect();

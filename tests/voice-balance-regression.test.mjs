@@ -131,3 +131,19 @@ test('leveling is updated only for active speech windows and exposes bounded bal
   assert.match(graph, /guestRmsDbfs/);
   assert.match(graph, /jerryRmsDbfs/);
 });
+
+test('Guest preamp is bounded and does not alter Jerry gain', () => {
+  const preamp = graph.match(/export const GUEST_PREAMP_CONFIG = \{([\s\S]*?)\} as const/);
+  assert.ok(preamp);
+  const defaultGain = Number(preamp[1].match(/defaultGainDb:\s*(-?\d+)/)[1]);
+  const maxGain = Number(preamp[1].match(/maxGainDb:\s*(-?\d+)/)[1]);
+  assert.equal(defaultGain, 6);
+  assert.ok(defaultGain >= 0 && defaultGain <= maxGain);
+  assert.equal(maxGain, 12);
+  assert.match(graph, /jerryPreampDb:\s*0/);
+});
+
+test('Guest preamp is applied before the Guest analyser', () => {
+  assert.match(graph, /source\.connect\(preamp\);\s*preamp\.connect\(analyser\);/);
+  assert.match(graph, /sources\.guest,[\s\S]*?Math\.min\(GUEST_PREAMP_CONFIG\.defaultGainDb, GUEST_PREAMP_CONFIG\.maxGainDb\)/);
+});

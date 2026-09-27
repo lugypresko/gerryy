@@ -60,6 +60,25 @@ test('recording graph creates independent source chains with compressors', () =>
   assert.match(graph, /createChannelChain\([\s\S]*?sources\.guest,[\s\S]*?GUEST_LEVEL_CONFIG,[\s\S]*?GUEST_DYNAMICS_CONFIG,[\s\S]*?\)/);
 });
 
+test('Guest has a conservative bounded preamp before analysis while Jerry stays at unity', () => {
+  const preamp = graph.match(/export const GUEST_PREAMP_CONFIG = \{([\s\S]*?)\} as const/);
+  assert.ok(preamp, 'Guest preamp config should be exported');
+  assert.match(preamp[1], /defaultGainDb:\s*6/);
+  assert.match(preamp[1], /maxGainDb:\s*12/);
+  assert.match(graph, /const preamp = context\.createGain\(\);/);
+  assert.match(graph, /preamp\.gain\.value = 10 \*\* \(preampGainDb \/ 20\);/);
+  assert.match(graph, /source\.connect\(preamp\);\s*preamp\.connect\(analyser\);/);
+  assert.match(graph, /jerryPreampDb:\s*0/);
+});
+
+test('RecordingMetrics exposes the applied Guest preamp for diagnostics', () => {
+  assert.match(graph, /export interface RecordingMetrics/);
+  assert.match(graph, /guestPreampDb:\s*number/);
+  assert.match(graph, /jerryPreampDb:\s*number/);
+  assert.match(graph, /getMetrics: \(\) => RecordingMetrics/);
+  assert.match(graph, /guestPreampDb:[\s\S]*?GUEST_PREAMP_CONFIG\.defaultGainDb/);
+});
+
 test('merger routes Jerry to channel zero and guest to channel one', () => {
   assert.match(graph, /jerryChain\.output\.connect\(merger, 0, RECORDING_CHANNELS\.jerry\)/);
   assert.match(graph, /guestChain\.output\.connect\(merger, 0, RECORDING_CHANNELS\.guest\)/);
