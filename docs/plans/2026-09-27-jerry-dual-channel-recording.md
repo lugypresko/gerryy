@@ -1,5 +1,7 @@
 # Jerry Dual-Channel Recording Implementation Plan
 
+Current documentation note: speaker exports, conversation turn logs, and bounded recording telemetry are implemented. See `docs/JERRY_DEBUG_MONITOR.md` for runtime diagnostics.
+
 > **Implementation status (2026-09-27): COMPLETE + SPEAKER EXPORTS** — The leveled stereo master and independent speaker recordings are implemented. The application now exports a dedicated Jerry track, a dedicated guest track when microphone access is available, and `conversation.json` with relative turn timestamps.
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
