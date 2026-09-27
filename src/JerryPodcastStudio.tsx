@@ -44,6 +44,12 @@ export interface PodcastMessage {
 const JERRY_INITIAL_OPENING =
   'שמע, ערב טוב. ג\'רי, תוכנית הלילה. איתי אמר לי... לא משנה מה איתי אמר, איתי והשטויות שלו. מה הדבר הכי מוזר שקרה לך השבוע?';
 
+const MICROPHONE_CAPTURE_CONSTRAINTS = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: false,
+} as const;
+
 export function JerryPodcastStudio() {
   const [messages, setMessages] = useState<PodcastMessage[]>([
     {
@@ -447,10 +453,8 @@ export function JerryPodcastStudio() {
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
+          ...MICROPHONE_CAPTURE_CONSTRAINTS,
           ...(selectedAudioInputId ? { deviceId: { exact: selectedAudioInputId } } : {}),
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
         },
       });
       if (requestId !== getUserMediaRequestRef.current || !liveMicActiveRef.current) {
@@ -1428,10 +1432,8 @@ export function JerryPodcastStudio() {
         } else {
           micStream = await navigator.mediaDevices.getUserMedia({
             audio: {
+              ...MICROPHONE_CAPTURE_CONSTRAINTS,
               ...(selectedAudioInputId ? { deviceId: { exact: selectedAudioInputId } } : {}),
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
             },
           });
           episodeOwnsMicRef.current = true;

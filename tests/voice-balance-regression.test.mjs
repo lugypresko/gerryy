@@ -72,13 +72,20 @@ test('guest and Jerry use intentionally separate processing configurations', () 
 });
 
 test('microphone capture enables cleanup but delegates leveling to Jerry', () => {
+  const sharedConstraints = extractNamedObject(studio, 'MICROPHONE_CAPTURE_CONSTRAINTS');
+  assert.match(sharedConstraints, /echoCancellation:\s*true/);
+  assert.match(sharedConstraints, /noiseSuppression:\s*true/);
+  assert.match(sharedConstraints, /autoGainControl:\s*false/);
+
   const captureBlocks = extractGetUserMediaAudioBlocks(studio);
   assert.equal(captureBlocks.length, 2, 'expected separate live and recording capture calls');
 
   for (const [index, block] of captureBlocks.entries()) {
-    assert.match(block, /echoCancellation:\s*true/, `capture block ${index + 1} must enable AEC`);
-    assert.match(block, /noiseSuppression:\s*true/, `capture block ${index + 1} must enable noise suppression`);
-    assert.match(block, /autoGainControl:\s*false/, `capture block ${index + 1} must delegate leveling to Jerry`);
+    assert.match(
+      block,
+      /\.\.\.MICROPHONE_CAPTURE_CONSTRAINTS/,
+      `capture block ${index + 1} must use shared microphone constraints`,
+    );
   }
 });
 
