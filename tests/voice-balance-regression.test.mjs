@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 const graph = fs.readFileSync('src/audio/recordingGraph.ts', 'utf8');
+const leveler = fs.readFileSync('src/audio/autoLeveler.ts', 'utf8');
 const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
 
 test('Guest and Jerry gain ceilings are bounded and distinct', () => {
@@ -76,4 +77,31 @@ test('recording exposes balance telemetry and a publication decision', () => {
   assert.match(studio, /publishable/);
   assert.match(studio, /needs-review/);
   assert.match(studio, /failed/);
+});
+
+test('recording graph measures speech windows without retaining raw PCM', () => {
+  assert.match(leveler, /measureAudioWindow/);
+  assert.match(graph, /createSpeechWindowMeter/);
+  assert.match(graph, /getMetrics/);
+  for (const metric of [
+    'rmsDbfs',
+    'peakDbfs',
+    'silenceDurationMs',
+    'activeSpeechDurationMs',
+    'clippingCount',
+    'isSpeech',
+    'smoothedRmsDbfs',
+  ]) {
+    assert.match(leveler, new RegExp(`\\b${metric}\\b`), `missing speech metric: ${metric}`);
+  }
+  assert.doesNotMatch(graph, /Float32Array\\[\\]|rawPcm|pcmBuffer/i);
+});
+
+test('leveling is updated only for active speech windows and exposes bounded balance metrics', () => {
+  assert.match(graph, /if \(jerryMeasurement\.isSpeech\)[\s\S]*?jerryChain\.leveler\.updateRmsDbfs/);
+  assert.match(graph, /if \(guestMeasurement\.isSpeech\)[\s\S]*?guestChain\.leveler\.updateRmsDbfs/);
+  assert.match(graph, /Math\.abs\([\s\S]*?balanceDeltaDb/);
+  assert.match(graph, /getMetrics\(\): RecordingMetrics/);
+  assert.match(graph, /guestRmsDbfs/);
+  assert.match(graph, /jerryRmsDbfs/);
 });

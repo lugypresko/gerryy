@@ -1,6 +1,8 @@
 import {
   createAutoLeveler,
+  createSpeechWindowMeter,
   DEFAULT_AUTO_LEVELER_CONFIG,
+  type SpeechWindowMetrics,
   type AutoLevelerConfig,
 } from './autoLeveler';
 
@@ -69,6 +71,25 @@ export interface RecordingChannelChain {
   compressor: DynamicsCompressorNode;
   output: AudioNodeLike;
   leveler: ReturnType<typeof createAutoLeveler>;
+  speechMeter: ReturnType<typeof createSpeechWindowMeter>;
+}
+
+export interface RecordingMetrics {
+  guestRmsDbfs: number | null;
+  jerryRmsDbfs: number;
+  guestPeakDbfs: number | null;
+  jerryPeakDbfs: number;
+  guestSilenceDurationMs: number | null;
+  jerrySilenceDurationMs: number;
+  guestActiveSpeechDurationMs: number | null;
+  jerryActiveSpeechDurationMs: number;
+  guestClippingCount: number | null;
+  jerryClippingCount: number;
+  guestSmoothedRmsDbfs: number | null;
+  jerrySmoothedRmsDbfs: number;
+  guestGainDb: number | null;
+  jerryGainDb: number;
+  balanceDeltaDb: number | null;
 }
 
 export interface RecordingGraph {
@@ -83,6 +104,7 @@ export interface RecordingGraph {
   /** The centered monitor mix remains an integration responsibility. */
   monitorMix: null;
   update: (elapsedMs: number) => void;
+  getMetrics: () => RecordingMetrics;
   cleanup: () => void;
 }
 
@@ -119,6 +141,7 @@ function createChannelChain(
     compressor,
     output: compressor,
     leveler: createAutoLeveler(levelConfig),
+    speechMeter: createSpeechWindowMeter(levelConfig.gateDbfs),
   };
 }
 
@@ -170,6 +193,27 @@ export function createRecordingGraph(
   jerryChain.output.connect(jerryDestination);
   if (guestChain && guestDestination) guestChain.output.connect(guestDestination);
 
+  let jerryMeasurement: SpeechWindowMetrics = {
+    rmsDbfs: Number.NEGATIVE_INFINITY,
+    peakDbfs: Number.NEGATIVE_INFINITY,
+    isSpeech: false,
+    clippingCount: 0,
+    silenceDurationMs: 0,
+    activeSpeechDurationMs: 0,
+    smoothedRmsDbfs: JERRY_LEVEL_CONFIG.gateDbfs,
+  };
+  let guestMeasurement: SpeechWindowMetrics | null = guestChain
+    ? {
+      rmsDbfs: Number.NEGATIVE_INFINITY,
+      peakDbfs: Number.NEGATIVE_INFINITY,
+      isSpeech: false,
+      clippingCount: 0,
+      silenceDurationMs: 0,
+      activeSpeechDurationMs: 0,
+      smoothedRmsDbfs: GUEST_LEVEL_CONFIG.gateDbfs,
+    }
+    : null;
+
   return {
     jerryChain,
     guestChain,
@@ -181,18 +225,52 @@ export function createRecordingGraph(
     masterLimiter,
     monitorMix: null,
     update(elapsedMs: number) {
-      const jerryGainDb = jerryChain.leveler.update(
+      jerryMeasurement = jerryChain.speechMeter.measure(
         readRmsSamples(jerryChain.analyser),
         elapsedMs,
       );
-      jerryChain.levelGain.gain.value = 10 ** (jerryGainDb / 20);
+      if (jerryMeasurement.isSpeech) {
+        const jerryGainDb = jerryChain.leveler.updateRmsDbfs(
+          jerryMeasurement.rmsDbfs,
+          elapsedMs,
+        );
+        jerryChain.levelGain.gain.value = 10 ** (jerryGainDb / 20);
+      }
 
       if (guestChain) {
-        const guestGainDb = guestChain.leveler.update(
+        guestMeasurement = guestChain.speechMeter.measure(
           readRmsSamples(guestChain.analyser),
           elapsedMs,
         );
-        guestChain.levelGain.gain.value = 10 ** (guestGainDb / 20);
+        if (guestMeasurement.isSpeech) {
+          const guestGainDb = guestChain.leveler.updateRmsDbfs(
+            guestMeasurement.rmsDbfs,
+            elapsedMs,
+          );
+          guestChain.levelGain.gain.value = 10 ** (guestGainDb / 20);
+        }
+      }
+    },
+    getMetrics(): RecordingMetrics {
+      const balanceDeltaDb = guestMeasurement
+        ? Math.abs(jerryMeasurement.smoothedRmsDbfs - guestMeasurement.smoothedRmsDbfs)
+        : null;
+      return {
+        guestRmsDbfs: guestMeasurement?.rmsDbfs ?? null,
+        jerryRmsDbfs: jerryMeasurement.rmsDbfs,
+        guestPeakDbfs: guestMeasurement?.peakDbfs ?? null,
+        jerryPeakDbfs: jerryMeasurement.peakDbfs,
+        guestSilenceDurationMs: guestMeasurement?.silenceDurationMs ?? null,
+        jerrySilenceDurationMs: jerryMeasurement.silenceDurationMs,
+        guestActiveSpeechDurationMs: guestMeasurement?.activeSpeechDurationMs ?? null,
+        jerryActiveSpeechDurationMs: jerryMeasurement.activeSpeechDurationMs,
+        guestClippingCount: guestMeasurement?.clippingCount ?? null,
+        jerryClippingCount: jerryMeasurement.clippingCount,
+        guestSmoothedRmsDbfs: guestMeasurement?.smoothedRmsDbfs ?? null,
+        jerrySmoothedRmsDbfs: jerryMeasurement.smoothedRmsDbfs,
+        guestGainDb: guestChain?.leveler.gainDb ?? null,
+        jerryGainDb: jerryChain.leveler.gainDb,
+        balanceDeltaDb,
       }
     },
     cleanup() {
