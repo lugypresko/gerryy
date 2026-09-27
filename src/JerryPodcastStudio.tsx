@@ -1772,6 +1772,8 @@ export function JerryPodcastStudio() {
       rawStems: Object.keys(finalized.rawStems),
               rawMasterBytes: finalized.rawStems.master.size,
               finalMasterBytes: finalized.finalMaster.size,
+              finalMimeType: finalized.finalMaster.type,
+              stereoFallback: finalized.finalMaster === finalized.rawStems.master,
               warnings: finalized.warnings.join(' | ').slice(0, 500),
               durationMs: Math.round(finalized.metrics.durationMs),
               completedAt: new Date().toISOString(),
@@ -1782,7 +1784,7 @@ export function JerryPodcastStudio() {
               setRecordingNotice('Recording saved but blocked from download until audio quality is fixed.');
             } else {
               setEpisodeAudioUrl(URL.createObjectURL(finalized.finalMaster));
-              setEpisodeFileExtension('wav');
+              setEpisodeFileExtension(finalized.finalMaster.type.includes('webm') ? 'webm' : 'wav');
               setRecordingNotice(finalized.publicationStatus === 'needs-review'
                 ? 'Recording finalized; review the audio warning before download.'
                 : 'Recording finalized and ready for download.');

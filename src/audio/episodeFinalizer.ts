@@ -255,6 +255,29 @@ export async function finalizeEpisode(
       processingMs: Math.round(performance.now() - startedAt),
     };
   } catch (error) {
+    const decodeWarning = error instanceof Error ? error.message : 'unknown decode error';
+    const isStereoWebmFallback = input.master.type.includes('webm') && input.master.size > 0;
+    if (isStereoWebmFallback) {
+      return {
+        // Preserve the browser's original stereo master when this browser cannot
+        // decode its WebM/Opus payload. The file remains downloadable with review.
+        finalMaster: input.master,
+        rawStems,
+        metrics: {
+          jerryRmsDbfs: -Infinity,
+          guestRmsDbfs: -Infinity,
+          jerryPeakDbfs: -Infinity,
+          guestPeakDbfs: -Infinity,
+          balanceDeltaDb: Infinity,
+          masterPeakDbfs: -Infinity,
+          clippingCount: 0,
+          durationMs: 0,
+        },
+        publicationStatus: 'needs-review',
+        warnings: [`Automatic audio decode unavailable (${decodeWarning}); original stereo master preserved for review.`],
+        processingMs: Math.round(performance.now() - startedAt),
+      };
+    }
     return {
       finalMaster: input.master,
       rawStems,
@@ -269,7 +292,7 @@ export async function finalizeEpisode(
         durationMs: 0,
       },
       publicationStatus: 'failed',
-      warnings: [`Finalization failed: ${error instanceof Error ? error.message : 'unknown error'}`],
+      warnings: [`Finalization failed: ${decodeWarning}`],
       processingMs: Math.round(performance.now() - startedAt),
     };
   }
