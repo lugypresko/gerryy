@@ -52,6 +52,8 @@ export function JerryPodcastStudio() {
   const [mouthStage, setMouthStage] = useState<0 | 1 | 2>(0);
   const [mouthOpenAmount, setMouthOpenAmount] = useState(0);
   const [audioLevel, setAudioLevel] = useState(0);
+  const [headTilt, setHeadTilt] = useState(0);
+  const [jawBounce, setJawBounce] = useState(0);
 
   // Full Podcast Recording (Master Mix)
   const [isEpisodeRecording, setIsEpisodeRecording] = useState(false);
@@ -820,18 +822,25 @@ export function JerryPodcastStudio() {
     const smoothed = previous * smoothing + raw * (1 - smoothing);
     smoothedLipLevelRef.current = smoothed;
 
-    setAudioLevel(smoothed);
-    setMouthOpenAmount(smoothed);
+    // Continuous organic Muppet dynamics:
+    // 1. Dynamic jaw movement & bounce based on real-time syllable energy
+    const bounce = (smoothed / 100) * 5.5; // 0 to 5.5px downward jaw/head pop
+    setJawBounce(bounce);
 
-    if (smoothed > 43) {
+    // 2. Subtle head sway/tilt driven by speech rhythm and natural inflection
+    const now = performance.now() / 320;
+    const tilt = (smoothed / 100) * Math.sin(now) * 1.8;
+    setHeadTilt(tilt);
+
+    if (smoothed > 42) {
       quietLipFramesRef.current = 0;
       setMouthStage(2);
-    } else if (smoothed > 14) {
+    } else if (smoothed > 12) {
       quietLipFramesRef.current = 0;
       setMouthStage(1);
     } else {
       quietLipFramesRef.current += 1;
-      if (quietLipFramesRef.current >= 3) {
+      if (quietLipFramesRef.current >= 2) {
         setMouthStage(0);
       }
     }
@@ -844,6 +853,8 @@ export function JerryPodcastStudio() {
       setMouthStage(0);
       setMouthOpenAmount(0);
       setAudioLevel(0);
+      setHeadTilt(0);
+      setJawBounce(0);
     }
   }, [isJerrySpeaking]);
 
@@ -1391,65 +1402,82 @@ export function JerryPodcastStudio() {
 
         {/* Jerry's Visual Puppet Canvas with Precision Lip-Sync Layers */}
         <div className="relative rounded-[12px] overflow-hidden aspect-[16/10] sm:aspect-[16/9] bg-[#0E0E0D] border border-[#333330] flex items-center justify-center group shadow-inner select-none">
-          {/* Base Layer: Portrait / Pose */}
+          {/* Layer 0: 100% ROCK SOLID STATIC STUDIO BACKGROUND (Desk, Laptop, Blackboard, Mic, Plant) */}
           <img
-            src={jerryPose === 'phone' ? '/jerry-phone.jpg' : '/jerry-portrait.jpg'}
-            alt="Jerry - Engineering Leaders in Real Life"
-            className="w-full h-full object-cover"
+            src="/jerry-pose-a.jpg"
+            alt="Jerry Studio Background"
+            className="absolute inset-0 w-full h-full object-cover select-none pointer-events-none"
           />
 
-          {/* Puppet Lip-Sync Overlay.
-              Keep one stable Jerry frame while he speaks; only the mouth moves.
-              This avoids the uncanny full-frame outfit/pose flicker caused by
-              swapping separate generated images for every syllable. */}
-          {jerryPose !== 'phone' && (
-            <>
-              {isJerrySpeaking && (
-                <div
-                  aria-hidden="true"
-                  className="absolute pointer-events-none"
-                  style={{
-                    left: '50.35%',
-                    top: '43.2%',
-                    width: puppetMouthWidth,
-                    height: puppetMouthHeight,
-                    opacity: mouthStage === 0 ? 0 : 0.98,
-                    transform: 'translate(-50%, -50%) rotate(-1.5deg)',
-                    transformOrigin: '50% 10%',
-                    borderRadius: '48% 48% 54% 54% / 36% 36% 70% 70%',
-                    background:
-                      'radial-gradient(ellipse at 50% 72%, #8d3340 0 22%, #541921 23% 42%, #18090b 48% 100%)',
-                    boxShadow:
-                      mouthStage === 2
-                        ? 'inset 0 2px 5px rgba(0,0,0,.9), 0 1px 1px rgba(0,0,0,.35)'
-                        : 'inset 0 1px 4px rgba(0,0,0,.9)',
-                    transition:
-                      'height 55ms linear, width 55ms linear, opacity 45ms linear',
-                  }}
-                >
-                  {/* Tiny felt lower-lip/tongue cue. Intentionally subtle. */}
-                  <div
-                    className="absolute left-[22%] right-[22%] bottom-[4%] rounded-full"
-                    style={{
-                      height: mouthStage === 2 ? '24%' : '18%',
-                      background: 'rgba(173, 66, 78, 0.72)',
-                      filter: 'blur(0.2px)',
-                    }}
-                  />
-                </div>
-              )}
+          {/* Layer 1: Focused listening state when user speaks (smooth crossfade on guest speech) */}
+          <img
+            src="/jerry-pose-d.jpg"
+            alt="Jerry Listening Pose"
+            className="absolute inset-0 w-full h-full object-cover transition-opacity duration-300 pointer-events-none select-none"
+            style={{
+              opacity: (isRecordingMic || isJerryThinking) && !isJerrySpeaking ? 1 : 0,
+            }}
+          />
 
-              {/* Skeptical listening expression when guest speaks */}
-              <img
-                src="/jerry-listening.jpg"
-                alt="Jerry listening"
-                className="absolute inset-0 w-full h-full object-cover transition-opacity duration-150 pointer-events-none"
+          {/* Layer 2: ONLY JERRY'S HEAD MOVES (Eyes, Eyebrows, Hair, Head Bob) - Background does NOT move! */}
+          <div
+            className="absolute pointer-events-none will-change-transform"
+            style={{
+              left: '26%',
+              top: '2%',
+              width: '43%',
+              height: '58%',
+              transformOrigin: '50% 90%', // Neck pivot point
+              transform: isJerrySpeaking
+                ? `translateY(${jawBounce * 0.4}px) rotate(${headTilt}deg)`
+                : isRecordingMic || isJerryThinking
+                ? 'translateY(-1px) rotate(-0.4deg)'
+                : 'translateY(0px)',
+              transition: isJerrySpeaking ? 'transform 40ms ease-out' : 'transform 400ms ease-in-out',
+            }}
+          >
+            {/* Jerry Head Sprite */}
+            <img
+              src="/jerry-head.png"
+              alt="Jerry Head"
+              className="w-full h-full object-contain"
+            />
+
+            {/* Realistic Muppet Puppet Mouth Overlay inside the head - Moves with jaw */}
+            {isJerrySpeaking && (
+              <div
+                aria-hidden="true"
+                className="absolute pointer-events-none will-change-transform"
                 style={{
-                  opacity: (isJerryThinking || isRecordingMic) && !isJerrySpeaking ? 1 : 0,
+                  left: '55.2%',
+                  top: `calc(75.5% + ${jawBounce * 0.55}px)`,
+                  width: `${17.5 + (mouthOpenAmount / 100) * 3.8}%`,
+                  height: `${2.8 + (mouthOpenAmount / 100) * 11.5}%`,
+                  opacity: mouthStage === 0 ? 0 : 0.98,
+                  transform: 'translate(-50%, -50%)',
+                  borderRadius: '46% 46% 54% 54% / 30% 30% 70% 70%',
+                  background:
+                    'radial-gradient(ellipse at 50% 75%, #8d3340 0 25%, #541921 26% 50%, #150709 55% 100%)',
+                  boxShadow:
+                    mouthStage === 2
+                      ? 'inset 0 2px 5px rgba(0,0,0,.9), 0 1px 2px rgba(0,0,0,.4)'
+                      : 'inset 0 1px 4px rgba(0,0,0,.9)',
+                  transition:
+                    'height 40ms ease-out, width 40ms ease-out, top 40ms ease-out, opacity 35ms linear',
                 }}
-              />
-            </>
-          )}
+              >
+                {/* Felt Muppet Tongue / Inner Mouth */}
+                <div
+                  className="absolute left-[20%] right-[20%] bottom-[6%] rounded-full"
+                  style={{
+                    height: mouthStage === 2 ? '30%' : '22%',
+                    background: 'rgba(185, 68, 80, 0.85)',
+                    filter: 'blur(0.2px)',
+                  }}
+                />
+              </div>
+            )}
+          </div>
 
           {/* Glowing "ON AIR" Retro Studio Sign */}
           <div className="absolute top-3 left-3 bg-red-600/90 backdrop-blur-xs text-white text-[10px] font-black uppercase tracking-[0.18em] px-2.5 py-0.5 rounded-[4px] border border-red-400/30 flex items-center gap-1.5 shadow-lg">
@@ -1642,7 +1670,7 @@ export function JerryPodcastStudio() {
                   }`}
                   dir="rtl"
                 >
-                  <p>{m.text}</p>
+                  <p className="whitespace-pre-wrap leading-relaxed"><bdi>{m.text}</bdi></p>
 
                   {/* Audio replay button */}
                   {isJerry && m.audioUrl && (

@@ -2,7 +2,7 @@
 
 @layer base {
   body {
-    font-family: 'Inter', 'Assistant', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-family: 'Assistant', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
     background-color: #F6F5F2;
     color: #141413;
   }
@@ -14,6 +14,24 @@
 
 .font-mono-code {
   font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* Muppet Natural Animations - Smooth and Grounded */
+@keyframes muppet-breathe {
+  0%, 100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-2px);
+  }
+}
+
+.animate-muppet-idle {
+  animation: muppet-breathe 4s ease-in-out infinite;
+}
+
+.animate-muppet-talking {
+  animation: muppet-breathe 1.5s ease-in-out infinite;
 }
 
 /* Subtle archival scrollbar */
