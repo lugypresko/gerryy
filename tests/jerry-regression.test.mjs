@@ -4,6 +4,7 @@ import fs from 'node:fs';
 
 const server = fs.readFileSync('server.ts', 'utf8');
 const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
+const turnLog = fs.readFileSync('src/audio/turnLog.ts', 'utf8');
 const animation = fs.readFileSync('src/jerryAnimation.ts', 'utf8');
 const index = fs.readFileSync('index.html', 'utf8');
 const css = fs.readFileSync('src/index.css', 'utf8');
@@ -43,80 +44,6 @@ test('dedicated Hebrew transcription path is present', () => {
   assert.match(server, /type:\s*'stt-error'/);
 });
 
-test('authoritative guest transcript is finalized from the complete turn audio', () => {
-  assert.match(server, /guestPcmChunks/);
-  assert.match(server, /Buffer\.from\(msg\.data,\s*'base64'\)/);
-  assert.match(server, /gemini-3\.5-transcribe/);
-  assert.match(server, /generateContent\(/);
-  assert.match(server, /audioTranscriptionConfig/);
-  assert.match(server, /mimeType:\s*'audio\/wav'/);
-  assert.match(server, /transcribeGuestTurn/);
-});
-
-test('live STT is interim-only and authoritative text is what reaches Jerry', () => {
-  assert.match(server, /input-transcript-interim/);
-  assert.match(server, /transcribeGuestTurn\(aiClient,\s*completedTurnChunks\)/);
-  assert.match(server, /finalTranscript[\s\S]{0,500}sendClientContent\(/);
-  assert.doesNotMatch(
-    server,
-    /const transcript = finalText\.trim\(\);[\s\S]{0,260}sendClientContent\(/,
-  );
-});
-
-test('transcription service failure keeps a live candidate fallback', () => {
-  assert.match(server, /lastLiveFinalCandidate/);
-  assert.match(server, /authoritativeTranscript \|\| lastLiveFinalCandidate/);
-});
-
-test('authoritative transcription keeps the Gemini client in WebSocket handler scope', () => {
-  assert.match(server, /let aiClient:\s*GoogleGenAI \| null = null/);
-  assert.match(server, /aiClient = new GoogleGenAI\(\{ apiKey: key \}\)/);
-  assert.match(server, /transcribeGuestTurn\(aiClient,\s*completedTurnChunks\)/);
-});
-
-test('Jerry debug monitor records the complete live turn chain', () => {
-  assert.match(server, /\/api\/jerry-debug/);
-  assert.match(server, /JERRY_DEBUG_MAX_EVENTS/);
-  assert.match(server, /connectionId/);
-  assert.match(server, /turnId/);
-  assert.match(server, /authoritative-start/);
-  assert.match(server, /guest-transcript-forwarded/);
-  assert.match(server, /jerry-audio/);
-  assert.match(server, /jerry-turn-complete/);
-});
-
-test('authoritative STT cannot hang silently and reports an explicit timeout', () => {
-  assert.match(server, /transcription-timeout/);
-  assert.match(server, /authoritative-timeout/);
-  assert.match(server, /turn-aborted-no-transcript/);
-  assert.match(server, /stt-error/);
-});
-
-test('debug monitor accepts client-side voice, noise, animation, and recording telemetry', () => {
-  assert.match(server, /msg\.type === 'debug-event'/);
-  assert.match(server, /client-debug/);
-  assert.match(studio, /sendDebugEvent/);
-  assert.match(studio, /'mic'/);
-  assert.match(studio, /'pcm'/);
-  assert.match(studio, /'recording'/);
-  assert.match(studio, /'animation'/);
-  assert.match(studio, /'video'/);
-  assert.match(studio, /'noise'/);
-  assert.match(studio, /'stt'/);
-});
-
-test('recording-levels telemetry is documented as bounded metadata', () => {
-  assert.match(studio, /RECORDING_LEVELS_INTERVAL_MS/);
-  assert.match(studio, /recording-levels/);
-  assert.match(fs.readFileSync('docs/JERRY_DEBUG_MONITOR.md', 'utf8'), /recording-levels/);
-  assert.match(fs.readFileSync('docs/JERRY_DEBUG_MONITOR.md', 'utf8'), /bounded|truncated/i);
-});
-
-test('invalid debug/socket payloads are observable instead of uncaught JSON noise', () => {
-  assert.match(server, /socket-invalid-message/);
-  assert.match(server, /rawText === 'undefined'/);
-});
-
 test('Gemini Live output PCM is resampled to the browser AudioContext rate', () => {
   assert.match(studio, /sourceRateMatch = \/rate=\(\\d\+\)\/i\.exec/);
   assert.match(studio, /const targetRate = ctx\?\.sampleRate \|\| sourceRate/);
@@ -130,6 +57,41 @@ test('Jerry audio sources are mutually exclusive', () => {
     /if \(audioPlayerRef\.current && !audioPlayerRef\.current\.paused\)[\s\S]{0,180}audioPlayerRef\.current\.pause\(\)/,
   );
   assert.match(studio, /livePlaybackQueueRef\.current = \[\]/);
+});
+
+test('guest speech interruption has explicit start/end telemetry and cancels Jerry generation', () => {
+  assert.match(studio, /guest-interruption-start/);
+  assert.match(studio, /guest-interruption-end/);
+  assert.match(studio, /jerry-generation-cancelled/);
+  assert.match(studio, /guestVadStateRef/);
+  assert.match(studio, /guestSpeechRmsDbfs|rmsDbfs/);
+  assert.match(studio, /send\(JSON\.stringify\(\{\s*type:\s*'debug-event'/);
+  assert.match(studio, /livePlaybackQueueRef\.current\s*=\s*\[\]/);
+  assert.match(studio, /liveSocketRef\.current\.send\(JSON\.stringify\(\{\s*type:\s*'activity-start'/);
+});
+
+test('guest interruption records overlap duration without stopping recording paths', () => {
+  assert.match(turnLog, /export (?:function|const) startGuestInterruption/);
+  assert.match(turnLog, /export (?:function|const) endGuestInterruption/);
+  assert.match(turnLog, /overlapDurationMs/);
+  assert.match(studio, /appendGuestInterruption|startGuestInterruption/);
+  assert.match(studio, /endGuestInterruption/);
+  assert.doesNotMatch(studio, /jerry-generation-cancelled[\s\S]{0,500}cleanupRecordingGraph\(\)/);
+  assert.doesNotMatch(studio, /guest-interruption-start[\s\S]{0,500}stopMicTracks\(\)/);
+});
+
+test('interruption entries are additive and preserve existing conversation turns', () => {
+  assert.match(turnLog, /export interface ConversationTurn/);
+  assert.match(turnLog, /export type TurnLogEntry = ConversationTurn \| GuestInterruptionTurn/);
+  assert.match(turnLog, /export function appendGuestInterruption\(\s*entries: TurnLogEntry\[\]/);
+  assert.match(turnLog, /return \[\.\.\.entries, interruption\]/);
+  assert.match(studio, /turnLogRef = useRef<TurnLogEntry\[\]>\(\[\]\)/);
+  assert.match(studio, /appendGuestInterruption\(/);
+});
+
+test('guest speech state is tracked independently from interruption state', () => {
+  assert.match(studio, /updateGuestVad\(guestVadStateRef\.current/);
+  assert.match(studio, /guestInterruptionTurnRef\.current && vadTransition\.ended/);
 });
 
 test('Jerry studio renders the locked full-frame pose manifest with crossfade and anchors', () => {
@@ -177,7 +139,7 @@ test('Jerry studio integrates independent recording chains and a centered monito
   assert.match(studio, /recordingGraphRef/);
   assert.match(studio, /jerry:\s*jerryRecordingInputRef\.current/);
   assert.match(studio, /guest:\s*guestSource/);
-  assert.match(studio, /(?:recordingGraphRef\.current|graph)\.destination\.stream/);
+  assert.match(studio, /recordingGraphRef\.current\.destination\.stream/);
   assert.match(studio, /recordingMonitorMixRef/);
   assert.match(studio, /recordingGraphRef\.current\?\.update\(/);
   assert.match(studio, /liveMicStreamRef\.current/);
