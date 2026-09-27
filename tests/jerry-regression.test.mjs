@@ -105,6 +105,13 @@ test('debug monitor accepts client-side voice, noise, animation, and recording t
   assert.match(studio, /'stt'/);
 });
 
+test('recording-levels telemetry is documented as bounded metadata', () => {
+  assert.match(studio, /RECORDING_LEVELS_INTERVAL_MS/);
+  assert.match(studio, /recording-levels/);
+  assert.match(fs.readFileSync('docs/JERRY_DEBUG_MONITOR.md', 'utf8'), /recording-levels/);
+  assert.match(fs.readFileSync('docs/JERRY_DEBUG_MONITOR.md', 'utf8'), /bounded|truncated/i);
+});
+
 test('invalid debug/socket payloads are observable instead of uncaught JSON noise', () => {
   assert.match(server, /socket-invalid-message/);
   assert.match(server, /rawText === 'undefined'/);

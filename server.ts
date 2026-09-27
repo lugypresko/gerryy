@@ -39,6 +39,43 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   ]);
 }
 
+const RECORDING_TELEMETRY_KEYS = new Set([
+  'guestRmsDbfs',
+  'jerryRmsDbfs',
+  'guestPeakDbfs',
+  'jerryPeakDbfs',
+  'guestSilenceDurationMs',
+  'jerrySilenceDurationMs',
+  'guestActiveSpeechDurationMs',
+  'jerryActiveSpeechDurationMs',
+  'guestClippingCount',
+  'jerryClippingCount',
+  'balanceDeltaDb',
+  'publicationStatus',
+]);
+
+function sanitizeClientDebugDetails(
+  event: string,
+  details: Record<string, unknown>,
+): Record<string, unknown> {
+  const sanitized: Record<string, unknown> = {};
+  const isRecordingTelemetry = event === 'recording-levels' || event === 'recording-publication';
+  for (const [key, value] of Object.entries(details)) {
+    if (isRecordingTelemetry && !RECORDING_TELEMETRY_KEYS.has(key)) continue;
+    const safeKey = key.slice(0, 60);
+    if (typeof value === 'string') {
+      sanitized[safeKey] = value.slice(0, 40);
+    } else if (typeof value === 'number' && Number.isFinite(value)) {
+      sanitized[safeKey] = isRecordingTelemetry
+        ? Math.max(-1000, Math.min(100000000, Number(value.toFixed(2))))
+        : value;
+    } else if (typeof value === 'boolean' || value === null) {
+      sanitized[safeKey] = value;
+    }
+  }
+  return sanitized;
+}
+
 const JERRY_LIVE_SYSTEM_PROMPT = `אתה ג'רי (Jerry), המנחה של "Engineering Leaders in Real Life".
 
 מי אתה:
@@ -1168,12 +1205,7 @@ CRITICAL RULES:
         ) {
           const category = typeof msg.category === 'string' ? msg.category.slice(0, 40) : 'client';
           const details = msg.details && typeof msg.details === 'object' ? msg.details : {};
-          const sanitizedDetails: Record<string, unknown> = {};
-          for (const [key, value] of Object.entries(details)) {
-            if (typeof value === 'string') sanitizedDetails[key.slice(0, 60)] = value.slice(0, 160);
-            else if (typeof value === 'number' && Number.isFinite(value)) sanitizedDetails[key.slice(0, 60)] = value;
-            else if (typeof value === 'boolean' || value === null) sanitizedDetails[key.slice(0, 60)] = value;
-          }
+          const sanitizedDetails = sanitizeClientDebugDetails(msg.event.trim(), details as Record<string, unknown>);
           recordJerryDebug('client-debug', {
             connectionId,
             turnId: guestTurnId,

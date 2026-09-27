@@ -14,7 +14,7 @@ import {
   Activity,
   PhoneCall,
 } from 'lucide-react';
-import { createRecordingGraph, type RecordingGraph } from './audio/recordingGraph';
+import { createRecordingGraph, type RecordingGraph, type RecordingMetrics } from './audio/recordingGraph';
 import {
   appendConversationTurn,
   createConversationTurnLog,
@@ -49,6 +49,45 @@ const MICROPHONE_CAPTURE_CONSTRAINTS = {
   noiseSuppression: true,
   autoGainControl: false,
 } as const;
+
+export const RECORDING_LEVELS_INTERVAL_MS = 1000;
+const RECORDING_REVIEW_DELTA_DB = 3;
+const RECORDING_FAILURE_DELTA_DB = 6;
+
+export type RecordingPublicationStatus = 'publishable' | 'needs-review' | 'failed';
+
+export function evaluateRecordingPublication(metrics: RecordingMetrics | null): RecordingPublicationStatus {
+  if (!metrics || metrics.jerryActiveSpeechDurationMs <= 0) return 'failed';
+  if (metrics.jerryClippingCount > 0 || (metrics.guestClippingCount ?? 0) > 0) return 'failed';
+  if (metrics.balanceDeltaDb === null) return 'needs-review';
+  if (metrics.balanceDeltaDb > RECORDING_FAILURE_DELTA_DB) return 'failed';
+  if (metrics.balanceDeltaDb > RECORDING_REVIEW_DELTA_DB) return 'needs-review';
+  return 'publishable';
+}
+
+function boundedRecordingMetric(value: number | null): number | null {
+  return value !== null && Number.isFinite(value) ? Number(value.toFixed(2)) : null;
+}
+
+function recordingTelemetryDetails(
+  metrics: RecordingMetrics,
+  publicationStatus: RecordingPublicationStatus,
+): Record<string, unknown> {
+  return {
+    guestRmsDbfs: boundedRecordingMetric(metrics.guestRmsDbfs),
+    jerryRmsDbfs: boundedRecordingMetric(metrics.jerryRmsDbfs),
+    guestPeakDbfs: boundedRecordingMetric(metrics.guestPeakDbfs),
+    jerryPeakDbfs: boundedRecordingMetric(metrics.jerryPeakDbfs),
+    guestSilenceDurationMs: Math.max(0, Math.round(metrics.guestSilenceDurationMs ?? 0)),
+    jerrySilenceDurationMs: Math.max(0, Math.round(metrics.jerrySilenceDurationMs)),
+    guestActiveSpeechDurationMs: Math.max(0, Math.round(metrics.guestActiveSpeechDurationMs ?? 0)),
+    jerryActiveSpeechDurationMs: Math.max(0, Math.round(metrics.jerryActiveSpeechDurationMs)),
+    guestClippingCount: Math.max(0, Math.round(metrics.guestClippingCount ?? 0)),
+    jerryClippingCount: Math.max(0, Math.round(metrics.jerryClippingCount)),
+    balanceDeltaDb: boundedRecordingMetric(metrics.balanceDeltaDb),
+    publicationStatus,
+  };
+}
 
 export function JerryPodcastStudio() {
   const [messages, setMessages] = useState<PodcastMessage[]>([
@@ -87,6 +126,7 @@ export function JerryPodcastStudio() {
   const [episodeTurnLogUrl, setEpisodeTurnLogUrl] = useState<string | null>(null);
   const [episodeFileExtension, setEpisodeFileExtension] = useState('webm');
   const [recordingNotice, setRecordingNotice] = useState<string | null>(null);
+  const [publicationStatus, setPublicationStatus] = useState<RecordingPublicationStatus>('failed');
   const [audioInputDevices, setAudioInputDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedAudioInputId, setSelectedAudioInputId] = useState('');
   const [isLiveReady, setIsLiveReady] = useState(false);
@@ -126,6 +166,9 @@ export function JerryPodcastStudio() {
   const episodeOwnsMicRef = useRef(false);
   const recordingModeRef = useRef<'dual-channel' | 'jerry-only' | null>(null);
   const timerIntervalRef = useRef<any>(null);
+  const recordingLevelsLastSentAtRef = useRef(0);
+  const latestRecordingMetricsRef = useRef<RecordingMetrics | null>(null);
+  const publicationStatusRef = useRef<RecordingPublicationStatus>('failed');
 
   // Gemini Live low-latency streaming refs
   const liveSocketRef = useRef<WebSocket | null>(null);
@@ -1100,8 +1143,18 @@ export function JerryPodcastStudio() {
     let previousTime = performance.now();
     const updateRecordingGraph = (now: number) => {
       recordingGraphRef.current?.update(Math.max(0, now - previousTime));
+      const graph = recordingGraphRef.current;
       previousTime = now;
-      if (recordingGraphRef.current) {
+      if (graph) {
+        const metrics = graph.getMetrics();
+        const nextStatus = evaluateRecordingPublication(metrics);
+        latestRecordingMetricsRef.current = metrics;
+        publicationStatusRef.current = nextStatus;
+        setPublicationStatus(nextStatus);
+        if (now - recordingLevelsLastSentAtRef.current >= RECORDING_LEVELS_INTERVAL_MS) {
+          recordingLevelsLastSentAtRef.current = now;
+          sendDebugEvent('recording-levels', 'recording', recordingTelemetryDetails(metrics, nextStatus));
+        }
         frame = requestAnimationFrame(updateRecordingGraph);
       }
     };
@@ -1110,7 +1163,7 @@ export function JerryPodcastStudio() {
     return () => {
       if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [isEpisodeRecording]);
+  }, [isEpisodeRecording, sendDebugEvent]);
 
   // Puppet-style mouth gating. Jerry is felt, so syllable energy matters more
   // than human phoneme-perfect lip shapes. We smooth attack/release and hold
@@ -1287,6 +1340,24 @@ export function JerryPodcastStudio() {
     playJerryAudio('/jerry-opening.wav');
   };
 
+  const handleEpisodeDownload = useCallback((label: string) => {
+    if (publicationStatus === 'failed') {
+      setRecordingNotice(`ההורדה חסומה: ${label} לא עבר את בדיקת איכות האודיו.`);
+      sendDebugEvent('recording-download-blocked', 'recording', { label, publicationStatus });
+      return false;
+    }
+    if (
+      publicationStatus === 'needs-review' &&
+      typeof window !== 'undefined' &&
+      !window.confirm(`ההקלטה דורשת בדיקה (${label}). להוריד בכל זאת?`)
+    ) {
+      sendDebugEvent('recording-download-cancelled', 'recording', { label, publicationStatus });
+      return false;
+    }
+    sendDebugEvent('recording-download-allowed', 'recording', { label, publicationStatus });
+    return true;
+  }, [publicationStatus, sendDebugEvent]);
+
   // Toggle Guest microphone. When Gemini Live is connected we stream raw PCM
   // directly to the model for natural turn-taking; Web Speech remains as fallback.
   const handleToggleMic = async () => {
@@ -1394,6 +1465,10 @@ export function JerryPodcastStudio() {
     setEpisodeTurnLogUrl(null);
     turnLogRef.current = createConversationTurnLog();
     activeTurnRef.current = null;
+    latestRecordingMetricsRef.current = null;
+    recordingLevelsLastSentAtRef.current = 0;
+    publicationStatusRef.current = 'failed';
+    setPublicationStatus('failed');
     setRecordingNotice(null);
 
     try {
@@ -1573,6 +1648,15 @@ export function JerryPodcastStudio() {
 
       mediaRecorder.onstop = () => {
         try {
+          const finalMetrics = recordingGraphRef.current?.getMetrics() || latestRecordingMetricsRef.current;
+          const finalPublicationStatus = evaluateRecordingPublication(finalMetrics);
+          publicationStatusRef.current = finalPublicationStatus;
+          setPublicationStatus(finalPublicationStatus);
+          if (finalMetrics) {
+            latestRecordingMetricsRef.current = finalMetrics;
+            sendDebugEvent('recording-levels', 'recording', recordingTelemetryDetails(finalMetrics, finalPublicationStatus));
+          }
+          sendDebugEvent('recording-publication', 'recording', { publicationStatus: finalPublicationStatus });
           const blob = new Blob(recordedChunksRef.current, { type: actualMime });
           console.info('[Podcast Recorder] finalized', {
             chunks: recordedChunksRef.current.length,
@@ -2026,11 +2110,26 @@ export function JerryPodcastStudio() {
                   <span>REC {formatTime(recordingSeconds)}</span>
                 </div>
               )}
+
+              {(isEpisodeRecording || episodeAudioUrl) && (
+                <div className={`text-[11px] rounded-[6px] px-3 py-1.5 border ${
+                  publicationStatus === 'publishable'
+                    ? 'bg-emerald-950/50 text-emerald-300 border-emerald-800/60'
+                    : publicationStatus === 'needs-review'
+                    ? 'bg-amber-950/50 text-amber-300 border-amber-800/60'
+                    : 'bg-red-950/50 text-red-300 border-red-800/60'
+                }`}>
+                  סטטוס פרסום: {publicationStatus === 'publishable' ? 'מוכן להורדה' : publicationStatus === 'needs-review' ? 'נדרשת בדיקה' : 'חסום עד לתיקון האודיו'}
+                </div>
+              )}
             </div>
 
             {episodeAudioUrl && (
               <a
                 href={episodeAudioUrl}
+                    onClick={(event) => {
+                      if (!handleEpisodeDownload('הפרק המלא')) event.preventDefault();
+                    }}
                 download={`jerry-podcast-episode-${Date.now()}.${episodeFileExtension}`}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] bg-emerald-600 hover:bg-emerald-500 text-white text-[11.5px] font-semibold transition-colors shadow-xs"
                 title="הורד קובץ הקלטה מלא"
@@ -2040,17 +2139,17 @@ export function JerryPodcastStudio() {
               </a>
             )}
                 {episodeJerryAudioUrl && (
-                  <a href={episodeJerryAudioUrl} download={`jerry-track.${episodeFileExtension}`} className="text-[11px] underline text-emerald-300">
+                  <a href={episodeJerryAudioUrl} onClick={(event) => { if (!handleEpisodeDownload('ערוץ ג׳רי')) event.preventDefault(); }} download={`jerry-track.${episodeFileExtension}`} className="text-[11px] underline text-emerald-300">
                     הורד ערוץ ג׳רי
                   </a>
                 )}
                 {episodeGuestAudioUrl && (
-                  <a href={episodeGuestAudioUrl} download={`guest-track.${episodeFileExtension}`} className="text-[11px] underline text-emerald-300">
+                  <a href={episodeGuestAudioUrl} onClick={(event) => { if (!handleEpisodeDownload('ערוץ האורח')) event.preventDefault(); }} download={`guest-track.${episodeFileExtension}`} className="text-[11px] underline text-emerald-300">
                     הורד ערוץ אורח
                   </a>
                 )}
                 {episodeTurnLogUrl && (
-                  <a href={episodeTurnLogUrl} download="conversation.json" className="text-[11px] underline text-amber-300">
+                  <a href={episodeTurnLogUrl} onClick={(event) => { if (!handleEpisodeDownload('יומן התורות')) event.preventDefault(); }} download="conversation.json" className="text-[11px] underline text-amber-300">
                     הורד יומן תורות
                   </a>
                 )}

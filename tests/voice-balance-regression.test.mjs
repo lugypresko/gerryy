@@ -79,6 +79,32 @@ test('recording exposes balance telemetry and a publication decision', () => {
   assert.match(studio, /failed/);
 });
 
+test('recording-levels telemetry is bounded and includes publication status', () => {
+  assert.match(studio, /RECORDING_LEVELS_INTERVAL_MS/);
+  assert.match(studio, /recording-levels/);
+  assert.match(studio, /guestSilenceDurationMs/);
+  assert.match(studio, /jerrySilenceDurationMs/);
+  assert.match(studio, /guestActiveSpeechDurationMs/);
+  assert.match(studio, /jerryActiveSpeechDurationMs/);
+  assert.match(studio, /guestClippingCount/);
+  assert.match(studio, /jerryClippingCount/);
+  assert.match(studio, /balanceDeltaDb/);
+  assert.match(studio, /publicationStatus/);
+  assert.match(studio, /recordingTelemetryDetails/);
+  assert.match(studio, /guestRmsDbfs:\s*boundedRecordingMetric/);
+});
+
+test('publication gate blocks failed audio and warns before needs-review downloads', () => {
+  assert.match(studio, /function evaluateRecordingPublication/);
+  assert.match(studio, /RECORDING_REVIEW_DELTA_DB = 3/);
+  assert.match(studio, /RECORDING_FAILURE_DELTA_DB = 6/);
+  assert.match(studio, /guestClippingCount \?\? 0\) > 0\) return 'failed'/);
+  assert.match(studio, /if \(metrics\.balanceDeltaDb > RECORDING_REVIEW_DELTA_DB\) return 'needs-review'/);
+  assert.match(studio, /handleEpisodeDownload/);
+  assert.match(studio, /preventDefault/);
+  assert.match(studio, /window\.confirm/);
+});
+
 test('recording graph measures speech windows without retaining raw PCM', () => {
   assert.match(leveler, /measureAudioWindow/);
   assert.match(graph, /createSpeechWindowMeter/);
