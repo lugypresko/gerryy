@@ -7,13 +7,14 @@ import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { RecordingArchiveStore } from './server/recordingStore';
+import { RecordingMediaJobQueue } from './server/recordings/jobs';
 
 const PORT = 3000;
 const JERRY_ENGINE_VERSION = 'jerry-conversation-v3-2026-09-26';
 const KEY_FILE = path.resolve(process.cwd(), '.api-key.json');
 const ALIGNMENT_LOG_FILE = path.resolve(process.cwd(), '.alignment-logs.json');
 const VOICE_LOG_FILE = path.resolve(process.cwd(), '.voice-logs.json');
-const RECORDINGS_DIR = path.resolve(process.cwd(), 'recordings');
+const RECORDINGS_DIR = path.resolve(process.env.JERRY_RECORDINGS_DIR || path.join(process.cwd(), 'data', 'recordings'));
 const JERRY_DEBUG_MAX_EVENTS = 200;
 const jerryDebugEvents: Array<Record<string, unknown>> = [];
 let nextJerryConnectionId = 1;
@@ -78,8 +79,9 @@ function sanitizeClientDebugDetails(
   return sanitized;
 }
 const recordingArchiveStore = new RecordingArchiveStore(
-  path.resolve(process.env.JERRY_RECORDINGS_DIR || path.join(process.cwd(), 'data', 'recordings')),
+  RECORDINGS_DIR,
 );
+const recordingMediaJobQueue = new RecordingMediaJobQueue(RECORDINGS_DIR);
 
 const JERRY_LIVE_SYSTEM_PROMPT = `אתה ג'רי (Jerry), המנחה של "Engineering Leaders in Real Life".
 
@@ -281,6 +283,7 @@ async function transcribeGuestTurn(ai: GoogleGenAI, chunks: Buffer[]): Promise<s
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
+  await recordingMediaJobQueue.recoverStaleJobs();
 
   // Durable append-only recording archive. The manifest is the commit marker;
   // there are intentionally no update or delete routes for archived media.
@@ -302,6 +305,30 @@ async function startServer() {
       res.status(201).json(manifest);
     } catch (error: any) {
       res.status(400).json({ error: error?.message || 'Invalid recording archive' });
+    }
+  });
+
+  app.post('/api/recordings/:archiveId/process', async (req, res) => {
+    try {
+      const archive = await recordingArchiveStore.getArchive(req.params.archiveId);
+      const master = archive.assets.master;
+      if (!master) throw new Error('Archive master asset not found');
+      const job = await recordingMediaJobQueue.enqueue({
+        archiveId: archive.id,
+        sourcePath: path.join(RECORDINGS_DIR, archive.id, master.fileName),
+      });
+      void recordingMediaJobQueue.run(job.id);
+      res.status(202).json(job);
+    } catch (error: any) {
+      res.status(error?.message === 'Archive not found' ? 404 : 400).json({ error: error?.message || 'Unable to start media processing' });
+    }
+  });
+
+  app.get('/api/recordings/jobs/:jobId', async (req, res) => {
+    try {
+      res.json(await recordingMediaJobQueue.get(req.params.jobId));
+    } catch (error: any) {
+      res.status(error?.message === 'Media job not found' ? 404 : 400).json({ error: error?.message || 'Media job unavailable' });
     }
   });
 
