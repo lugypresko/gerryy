@@ -46,3 +46,17 @@ test('recording graph exposes cleanup without owning the centered monitor mix', 
   assert.match(graph, /monitorMix/);
   assert.match(graph, /centered monitor mix remains an integration responsibility/);
 });
+
+test('episode recording integrates the graph, reuses live mic, and cleans up after stop', () => {
+  const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
+  assert.match(studio, /createRecordingGraph\(ctx, \{ jerry: jerryRecordingInputRef\.current, guest: guestSource \}\)/);
+  assert.match(studio, /liveMicStreamRef\.current[\s\S]{0,300}micStream = liveMicStreamRef\.current/);
+  assert.match(studio, /streamToRecord = graph\.destination\.stream/);
+  assert.match(studio, /finally \{[\s\S]{0,500}cleanupRecordingGraph\(\);[\s\S]{0,500}stopMicTracks\(\);/);
+});
+
+test('microphone failure falls back to a Jerry-only recording graph', () => {
+  const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
+  assert.match(studio, /createRecordingGraph\(ctx, \{ jerry: jerryRecordingInputRef\.current, guest: null \}\)/);
+  assert.match(studio, /recordingModeRef\.current = 'jerry-only'/);
+});

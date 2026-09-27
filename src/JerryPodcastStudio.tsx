@@ -1195,12 +1195,21 @@ export function JerryPodcastStudio() {
         );
       } catch (micErr: any) {
         console.warn('[Podcast Recorder] microphone unavailable; trying Jerry-only recording:', micErr);
-        if (recordingGraphRef.current?.destination.stream.getAudioTracks().length) {
-          streamToRecord = recordingGraphRef.current.destination.stream;
-          setRecordingNotice('ההקלטה פעילה (רק ערוץ הקול של ג\'רי - לא אושרה הרשאת מיקרופון).');
-        } else {
-          throw new Error('יש לאשר גישה למיקרופון בדפדפן כדי להתחיל להקליט את השיחה.');
-        }
+        stopMicTracks();
+        cleanupRecordingGraph();
+        const fallbackGraph = createRecordingGraph(ctx, { jerry: jerryRecordingInputRef.current, guest: null });
+        recordingGraphRef.current = fallbackGraph;
+        const monitorMix = ctx.createGain();
+        const monitorJerryGain = ctx.createGain();
+        fallbackGraph.jerryChain.output.connect(monitorJerryGain);
+        monitorJerryGain.connect(monitorMix);
+        monitorMix.connect(ctx.destination);
+        recordingMonitorMixRef.current = monitorMix;
+        recordingMonitorJerryGainRef.current = monitorJerryGain;
+        recordingModeRef.current = 'jerry-only';
+        if (jerryPlaybackGainRef.current) jerryPlaybackGainRef.current.gain.value = 0;
+        streamToRecord = fallbackGraph.destination.stream;
+        setRecordingNotice('ההקלטה פעילה (רק ערוץ הקול של ג\'רי - לא אושרה הרשאת מיקרופון).');
       }
 
       const tracks = streamToRecord.getAudioTracks();
@@ -1284,6 +1293,7 @@ export function JerryPodcastStudio() {
           }
         } finally {
           // Only now is it safe to release the microphone source.
+          cleanupRecordingGraph();
           stopMicTracks();
           mediaRecorderRef.current = null;
           recordedChunksRef.current = [];
