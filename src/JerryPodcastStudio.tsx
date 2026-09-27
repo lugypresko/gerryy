@@ -1429,13 +1429,14 @@ export function JerryPodcastStudio() {
   };
 
   const handleEpisodeDownload = useCallback((label: string) => {
-    if (publicationStatus === 'failed') {
+    const effectivePublicationStatus = finalizedEpisode?.publicationStatus ?? publicationStatus;
+    if (effectivePublicationStatus === 'failed') {
       setRecordingNotice(`ההורדה חסומה: ${label} לא עבר את בדיקת איכות האודיו.`);
-      sendDebugEvent('recording-download-blocked', 'recording', { label, publicationStatus });
+      sendDebugEvent('recording-download-blocked', 'recording', { label, publicationStatus: effectivePublicationStatus });
       return false;
     }
     if (
-      publicationStatus === 'needs-review' &&
+      effectivePublicationStatus === 'needs-review' &&
       typeof window !== 'undefined' &&
       !window.confirm(`ההקלטה דורשת בדיקה (${label}). להוריד בכל זאת?`)
     ) {
@@ -1444,7 +1445,7 @@ export function JerryPodcastStudio() {
     }
     sendDebugEvent('recording-download-allowed', 'recording', { label, publicationStatus });
     return true;
-  }, [publicationStatus, sendDebugEvent]);
+  }, [finalizedEpisode, publicationStatus, sendDebugEvent]);
 
   // Toggle Guest microphone. When Gemini Live is connected we stream raw PCM
   // directly to the model for natural turn-taking; Web Speech remains as fallback.
