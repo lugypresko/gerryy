@@ -273,8 +273,8 @@ export async function finalizeEpisode(
           clippingCount: 0,
           durationMs: 0,
         },
-        publicationStatus: 'needs-review',
-        warnings: [`Automatic audio decode unavailable (${decodeWarning}); original stereo master preserved for review.`],
+        publicationStatus: 'failed',
+        warnings: [`Automatic audio decode unavailable (${decodeWarning}); audio quality could not be verified, so download is blocked.`],
         processingMs: Math.round(performance.now() - startedAt),
       };
     }

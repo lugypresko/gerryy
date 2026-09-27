@@ -32,10 +32,10 @@ test('episode finalizer has bounded balance, measurement, offline rendering, and
   assert.match(finalizer, /clippingCount/);
 });
 
-test('WebM decode failure preserves the original stereo master for review', () => {
+test('WebM decode failure preserves the original stereo master but blocks unverified download', () => {
   assert.match(finalizer, /isStereoWebmFallback/);
-  assert.match(finalizer, /original stereo master preserved/);
-  assert.match(finalizer, /publicationStatus: 'needs-review'/);
+  assert.match(finalizer, /audio quality could not be verified/);
+  assert.match(finalizer, /publicationStatus: 'failed'/);
 });
 
 test('download is created only after finalization and failed output is blocked', () => {
