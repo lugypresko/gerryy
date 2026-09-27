@@ -7,7 +7,7 @@ import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { RecordingArchiveStore } from './server/recordingStore';
-import { RecordingMediaJobQueue } from './server/recordings/jobs';
+import { RecordingMediaJobQueue, RecordingObservabilityStore, type RecordingProcessingMode } from './server/recordings/jobs';
 import {
   buildJerryLanguagePrompt,
   CODE_SWITCH_TRANSCRIPTION_CONFIG,
@@ -86,7 +86,24 @@ function sanitizeClientDebugDetails(
 const recordingArchiveStore = new RecordingArchiveStore(
   RECORDINGS_DIR,
 );
-const recordingMediaJobQueue = new RecordingMediaJobQueue(RECORDINGS_DIR);
+const recordingObservability = new RecordingObservabilityStore(RECORDINGS_DIR);
+const recordingMediaJobQueue = new RecordingMediaJobQueue(RECORDINGS_DIR, { observability: recordingObservability });
+
+async function recordObservabilityEvent(
+  stage: 'capture' | 'upload' | 'download',
+  episodeId: string,
+  reasonCode: string,
+  processingMode: RecordingProcessingMode = 'processed',
+): Promise<void> {
+  await recordingObservability.record({
+    episodeId,
+    stage,
+    event: 'succeeded',
+    elapsedMs: 0,
+    reasonCode,
+    processingMode,
+  });
+}
 
 const JERRY_LIVE_SYSTEM_PROMPT = `אתה ג'רי (Jerry), המנחה של "Engineering Leaders in Real Life".
 
@@ -313,6 +330,9 @@ async function startServer() {
               : 'ready',
         mimeTypes: body.mimeTypes && typeof body.mimeTypes === 'object' ? body.mimeTypes : undefined,
       });
+      const processingMode: RecordingProcessingMode = body.processingMode === 'fallback' ? 'fallback' : 'processed';
+      await recordObservabilityEvent('capture', manifest.id, 'capture_received', processingMode);
+      await recordObservabilityEvent('upload', manifest.id, 'archive_persisted', processingMode);
       res.status(201).json(manifest);
     } catch (error: any) {
       res.status(400).json({ error: error?.message || 'Invalid recording archive' });
@@ -334,7 +354,9 @@ async function startServer() {
       if (!master) throw new Error('Archive master asset not found');
       const job = await recordingMediaJobQueue.enqueue({
         archiveId: archive.id,
+        episodeId: archive.id,
         sourcePath: path.join(RECORDINGS_DIR, archive.id, master.fileName),
+        processingMode: req.body?.processingMode === 'fallback' ? 'fallback' : 'processed',
       });
       void recordingMediaJobQueue.run(job.id);
       res.status(202).json(job);
@@ -351,6 +373,24 @@ async function startServer() {
     }
   });
 
+  app.get('/api/recordings/jobs/:jobId/events', async (req, res) => {
+    try {
+      res.json(await recordingMediaJobQueue.getEvents(req.params.jobId));
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Media job events unavailable' });
+    }
+  });
+
+  app.post('/api/recordings/jobs/:jobId/retry', async (req, res) => {
+    try {
+      const job = await recordingMediaJobQueue.retry(req.params.jobId);
+      void recordingMediaJobQueue.run(job.id);
+      res.status(202).json(job);
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Media job retry unavailable' });
+    }
+  });
+
   app.get('/api/recordings/:archiveId', async (req, res) => {
     try {
       res.json(await recordingArchiveStore.getArchive(req.params.archiveId));
@@ -363,6 +403,7 @@ async function startServer() {
     try {
       const archive = await recordingArchiveStore.getArchive(req.params.archiveId);
       if (archive.status === 'failed') {
+        await recordObservabilityEvent('download', archive.id, 'download_blocked_failed_archive');
         return res.status(409).json({ error: 'Failed recordings are not downloadable' });
       }
       const result = await recordingArchiveStore.getAsset(req.params.archiveId, 'master');
@@ -374,6 +415,7 @@ async function startServer() {
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('ETag', `"${result.manifest.sha256}"`);
       res.setHeader('X-Content-SHA256', result.manifest.sha256);
+      await recordObservabilityEvent('download', archive.id, 'download_served');
 
       if (!range) {
         res.setHeader('Content-Length', total);
