@@ -15,6 +15,7 @@ import {
   PhoneCall,
 } from 'lucide-react';
 import { createRecordingGraph, type RecordingGraph, type RecordingMetrics } from './audio/recordingGraph';
+import { finalizeEpisode, type FinalizedEpisode } from './audio/episodeFinalizer';
 import {
   appendConversationTurn,
   createConversationTurnLog,
@@ -125,6 +126,7 @@ export function JerryPodcastStudio() {
   const [episodeGuestAudioUrl, setEpisodeGuestAudioUrl] = useState<string | null>(null);
   const [episodeTurnLogUrl, setEpisodeTurnLogUrl] = useState<string | null>(null);
   const [episodeFileExtension, setEpisodeFileExtension] = useState('webm');
+  const [finalizedEpisode, setFinalizedEpisode] = useState<FinalizedEpisode | null>(null);
   const [recordingNotice, setRecordingNotice] = useState<string | null>(null);
   const [publicationStatus, setPublicationStatus] = useState<RecordingPublicationStatus>('failed');
   const [audioInputDevices, setAudioInputDevices] = useState<MediaDeviceInfo[]>([]);
@@ -210,6 +212,10 @@ export function JerryPodcastStudio() {
     },
     [],
   );
+
+  const emitRecordingDebugEvent = useCallback((event: string, details: Record<string, unknown> = {}) => {
+    sendDebugEvent(event, 'recording', details);
+  }, [sendDebugEvent]);
 
   const refreshAudioInputDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -1460,6 +1466,7 @@ export function JerryPodcastStudio() {
     if (episodeGuestAudioUrl) URL.revokeObjectURL(episodeGuestAudioUrl);
     if (episodeTurnLogUrl) URL.revokeObjectURL(episodeTurnLogUrl);
     setEpisodeAudioUrl(null);
+    setFinalizedEpisode(null);
     setEpisodeJerryAudioUrl(null);
     setEpisodeGuestAudioUrl(null);
     setEpisodeTurnLogUrl(null);
@@ -1646,7 +1653,7 @@ export function JerryPodcastStudio() {
         );
       };
 
-      mediaRecorder.onstop = () => {
+      mediaRecorder.onstop = async () => {
         try {
           const finalMetrics = recordingGraphRef.current?.getMetrics() || latestRecordingMetricsRef.current;
           const finalPublicationStatus = evaluateRecordingPublication(finalMetrics);
@@ -1672,9 +1679,30 @@ export function JerryPodcastStudio() {
           });
 
           if (blob.size > 0) {
-            const url = URL.createObjectURL(blob);
-            setEpisodeAudioUrl(url);
-            setRecordingNotice('ההקלטה הושלמה בהצלחה! לחץ להורדת הפרק.');
+            setRecordingNotice('Finalizing recording...');
+            emitRecordingDebugEvent('recording-finalization-start', { rawMasterBytes: blob.size, mimeType: actualMime });
+            const finalized = await finalizeEpisode({ master: blob, mimeType: actualMime });
+            setFinalizedEpisode(finalized);
+            emitRecordingDebugEvent('recording-finalized', {
+              publicationStatus: finalized.publicationStatus,
+              processingMs: finalized.processingMs,
+              balanceDeltaDb: finalized.metrics.balanceDeltaDb,
+      rawStems: Object.keys(finalized.rawStems),
+            });
+            if (finalized.publicationStatus === 'failed') {
+              setEpisodeAudioUrl(null);
+              setErrorNotice(finalized.warnings.join(' '));
+              setRecordingNotice('Recording saved but blocked from download until audio quality is fixed.');
+            } else {
+              setEpisodeAudioUrl(URL.createObjectURL(finalized.finalMaster));
+              setEpisodeFileExtension('wav');
+              setRecordingNotice(finalized.publicationStatus === 'needs-review'
+                ? 'Recording finalized; review the audio warning before download.'
+                : 'Recording finalized and ready for download.');
+            }
+            const finalizedLogBlob = new Blob([JSON.stringify(turnLogRef.current, null, 2)], { type: 'application/json' });
+            setEpisodeTurnLogUrl(URL.createObjectURL(finalizedLogBlob));
+            return;
           } else {
             setErrorNotice('ההקלטה נעצרה אך לא נלכדו נתוני שמע.');
             setRecordingNotice(null);
@@ -1867,6 +1895,7 @@ export function JerryPodcastStudio() {
     if (episodeTurnLogUrl) URL.revokeObjectURL(episodeTurnLogUrl);
     if (pcmDebugAudioUrl) URL.revokeObjectURL(pcmDebugAudioUrl);
     setEpisodeAudioUrl(null);
+    setFinalizedEpisode(null);
     setEpisodeJerryAudioUrl(null);
     setEpisodeGuestAudioUrl(null);
     setEpisodeTurnLogUrl(null);
@@ -2124,7 +2153,7 @@ export function JerryPodcastStudio() {
               )}
             </div>
 
-            {episodeAudioUrl && (
+            {episodeAudioUrl && finalizedEpisode?.publicationStatus !== 'failed' && (
               <a
                 href={episodeAudioUrl}
                     onClick={(event) => {

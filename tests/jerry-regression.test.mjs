@@ -183,6 +183,13 @@ test('Jerry studio integrates independent recording chains and a centered monito
   assert.match(studio, /liveMicStreamRef\.current/);
 });
 
+test('episode recording finalizes before exposing a download', () => {
+  assert.match(studio, /import \{ finalizeEpisode/);
+  assert.match(studio, /setRecordingNotice\('.*מעבד|Finalizing/);
+  assert.match(studio, /finalizedEpisode\?\.publicationStatus !== 'failed'/);
+  assert.match(studio, /recording-finalized/);
+});
+
 test('HTTP fallback retains full history instead of slicing to eight turns', () => {
   assert.doesNotMatch(studio, /history:\s*serverHistory\.slice\(-8\)/);
   assert.match(studio, /history:\s*serverHistory/);
