@@ -1765,6 +1765,8 @@ export function JerryPodcastStudio() {
             emitRecordingDebugEvent('recording-finalization-start', { rawMasterBytes: blob.size, mimeType: actualMime });
             const finalized = await finalizeEpisode({ master: blob, mimeType: actualMime });
             setFinalizedEpisode(finalized);
+            setPublicationStatus(finalized.publicationStatus);
+            publicationStatusRef.current = finalized.publicationStatus;
             emitRecordingDebugEvent('recording-finalized', {
               publicationStatus: finalized.publicationStatus,
               processingMs: finalized.processingMs,
