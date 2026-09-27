@@ -264,7 +264,7 @@ async function transcribeGuestTurn(ai: GoogleGenAI, chunks: Buffer[]): Promise<s
     }],
     config: {
       audioTranscriptionConfig: {
-        languageCodes: ['he-IL'],
+        languageCodes: [...CODE_SWITCH_TRANSCRIPTION_CONFIG.languageCodes],
         customVocabulary: [
           'ג\'רי',
           'איתי',
