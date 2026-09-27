@@ -64,14 +64,14 @@ test('HTTP fallback retains full history instead of slicing to eight turns', () 
 
 test('known Hebrew UI debt remains visible so it cannot be mistaken for fixed', () => {
   assert.match(index, /<html lang="en">/);
-  assert.match(css, /font-family:\s*'Inter',\s*'Assistant'/);
+  assert.match(css, /font-family:\s*'Assistant',\s*'Inter'/);
 });
 
 
 test('M1 performance runtime teaches vocal backchannels and timing', () => {
-  assert.match(server, /ביצוע קולי — זה חלק מהשיחה, לא קישוט/);
-  assert.match(server, /backchannels קוליים/);
+  assert.match(server, /הנשמה הקולית של ג'רי — הקול הוא גוף, לא קריינות/);
+  assert.match(server, /backchannel יכול להיות כל התור/);
   assert.match(server, /300–800ms של שקט/);
-  assert.match(server, /אל תבצע יותר ממחווה קולית אחת/);
-  assert.match(server, /jerry-conversation-v4-performance-m1/);
+  assert.match(server, /אל תבצע יותר ממחווה קולית בולטת אחת/);
+  assert.match(server, /jerry-voice-soul-v2-2026-09-27/);
 });
