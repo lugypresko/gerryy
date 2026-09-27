@@ -71,6 +71,8 @@ The implementation is considered ready for publication only when a spoken test r
 
 ## Task 4: Add speech-aware level measurement
 
+**Status:** COMPLETE in `1085dea` — the graph now exposes speech-aware metrics through `getMetrics()` without retaining raw PCM.
+
 **Files:**
 - Modify: `src/audio/recordingGraph.ts`
 - Modify: `src/audio/autoLeveler.ts`
@@ -87,6 +89,8 @@ The implementation is considered ready for publication only when a spoken test r
 7. Commit the measurement and speech-gating change.
 
 ## Task 5: Add publication telemetry and a publish gate
+
+**Status:** NEXT — graph metrics exist, but they are not yet connected to the monitor, UI, or download decision.
 
 **Files:**
 - Modify: `src/JerryPodcastStudio.tsx`
@@ -105,6 +109,21 @@ The implementation is considered ready for publication only when a spoken test r
 7. Run the complete test suite.
 8. Commit the publication gate and diagnostics.
 
+## Task 5A: Add a bounded Guest preamp before leveling
+
+**Files:**
+- Modify: `src/audio/recordingGraph.ts`
+- Test: `tests/recording-regression.test.mjs`
+
+**Steps:**
+
+1. Add a Guest-only preamp node before the Guest analyser with a conservative bounded default.
+2. Keep Jerry at unity input gain so its performance dynamics are preserved.
+3. Include the applied Guest preamp in `RecordingMetrics` and debug metadata.
+4. Add deterministic tests proving the preamp is Guest-only, bounded, and does not replace the leveler gate.
+5. Run focused recording tests, `npm test`, lint, and build.
+6. Commit the preamp change.
+
 ## Task 6: Handle overlap and interruption explicitly
 
 **Files:**
@@ -122,6 +141,29 @@ The implementation is considered ready for publication only when a spoken test r
 5. Add tests for a normal turn, an interruption, and a turn that ends without transcript text.
 6. Run the complete test suite and lint.
 7. Commit the interruption telemetry change.
+
+## Task 7: Build the Episode Finalizer before download
+
+**Files:**
+- Create: `src/audio/episodeFinalizer.ts`
+- Modify: `src/JerryPodcastStudio.tsx`
+- Modify: `src/audio/turnLog.ts`
+- Modify: `docs/JERRY_DEBUG_MONITOR.md`
+- Test: `tests/recording-regression.test.mjs`
+- Test: `tests/jerry-regression.test.mjs`
+
+**Steps:**
+
+1. Define a finalizer input containing the master preview, Jerry stem, Guest stem, and turn log.
+2. Analyze the stems before download and calculate loudness delta, peak, clipping, and speech coverage.
+3. Apply deterministic Guest/Jerry balance, dynamics, and final limiter settings to the export path.
+4. Return `publishable`, `needs-review`, or `failed` with explicit reasons and metrics.
+5. Preserve the original stems for repair while making `final-master` the default download.
+6. Connect the finalizer to the Stop/Download flow; do not invoke an LLM in the audio sample loop.
+7. Add tests for balanced, weak-Guest, clipped, and missing-stem inputs.
+8. Add finalizer start/complete/rejected events to the Debug monitor.
+9. Run the full test suite, lint, build, and one real recording export.
+10. Commit the finalizer integration.
 
 ## Task 7: Validate with real recordings before release
 
