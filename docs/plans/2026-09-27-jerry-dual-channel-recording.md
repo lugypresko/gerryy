@@ -1,5 +1,7 @@
 # Jerry Dual-Channel Recording Implementation Plan
 
+> **Implementation status (2026-09-27): COMPLETE + SPEAKER EXPORTS** — The leveled stereo master and independent speaker recordings are implemented. The application now exports a dedicated Jerry track, a dedicated guest track when microphone access is available, and `conversation.json` with relative turn timestamps.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** להקליט את שיחת ה־LIVE בקובץ סטריאו עם Jerry בערוץ שמאל, האורח בערוץ ימין, ו־automatic leveling ו־limiting נפרדים לכל מקור.
@@ -195,5 +197,16 @@ npm run build
 - אין clipping ואין gain קבוע יחיד שמופעל רק על המיקרופון.
 - הניטור למשתמש נשאר centered ולא נשמע מפוצל לאוזניים.
 - fallback ללא מיקרופון נשאר ברור ומתועד כ־Jerry-only.
-- הקובץ נבדק בפועל עם `ffprobe` ועם האזנה לערוצים בנפרד.
+- בדיקת הקובץ בפועל עם `ffprobe` והאזנה לערוצים בנפרד נשארה כשלב QA ידני בדפדפן/מכשיר.
 - `npm test`, `npm run lint` ו־`npm run build` עוברים.
+
+## Implemented speaker export contract
+
+| Output | Content | Download name |
+|---|---|---|
+| Master | Jerry left / guest right stereo mix | `jerry-podcast-episode-*.webm` (or detected container) |
+| Jerry track | Leveled Jerry-only mono track | `jerry-track.*` |
+| Guest track | Leveled guest-only mono track, when mic is available | `guest-track.*` |
+| Turn log | Conversation turns with relative timestamps | `conversation.json` |
+
+The implementation is covered by the regression suite. A physical microphone recording and `ffprobe` channel inspection still require a browser/device QA pass.

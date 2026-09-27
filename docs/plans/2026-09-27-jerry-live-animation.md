@@ -1,5 +1,7 @@
 # Jerry LIVE Animation Implementation Plan
 
+> **Implementation status (2026-09-27): COMPLETE** — The full-frame pose-swap implementation is live. The four assets, state machine, mouth anchors, crossfade, preload, fallback, and lifecycle cleanup are implemented. The runtime does not load the reference video.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** לגרום לג'רי להיראות חי בזמן שיחה LIVE באמצעות pose-swap של התמונות המלאות, תגובה לעוצמת האודיו ומכונת מצבים ברורה.
