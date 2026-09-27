@@ -65,6 +65,8 @@ After recording stops, the episode finalizer renders a corrected WAV master befo
 
 The finalizer preserves the raw master and optional stems for diagnostics, applies guest/Jerry balance correction plus a master limiter, and blocks failed output at the download gate.
 
+Every non-empty recording is also persisted locally before processing as `recordings/<id>.raw.*`, and the finalizer result is persisted as `recordings/<id>.processed.*`, with a JSON manifest containing timestamps, MIME types, sizes, status, warnings, and processing time. These artifacts are intentionally git-ignored and are retained for before/after comparison.
+
 ## Privacy and retention
 
 - Raw microphone PCM, recorded WebM, and video frames are not written to the debug buffer.

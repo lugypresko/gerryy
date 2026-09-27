@@ -12,6 +12,7 @@ const JERRY_ENGINE_VERSION = 'jerry-conversation-v3-2026-09-26';
 const KEY_FILE = path.resolve(process.cwd(), '.api-key.json');
 const ALIGNMENT_LOG_FILE = path.resolve(process.cwd(), '.alignment-logs.json');
 const VOICE_LOG_FILE = path.resolve(process.cwd(), '.voice-logs.json');
+const RECORDINGS_DIR = path.resolve(process.cwd(), 'recordings');
 const JERRY_DEBUG_MAX_EVENTS = 200;
 const jerryDebugEvents: Array<Record<string, unknown>> = [];
 let nextJerryConnectionId = 1;
@@ -301,6 +302,33 @@ async function startServer() {
       maxEvents: JERRY_DEBUG_MAX_EVENTS,
       events: jerryDebugEvents,
     });
+  });
+
+  app.post('/api/recordings/artifact', (req, res) => {
+    try {
+      const { recordingId, stage, mimeType, data, metadata } = req.body || {};
+      if (!/^[a-zA-Z0-9_-]{8,80}$/.test(recordingId) || !['raw', 'processed'].includes(stage) || typeof data !== 'string') {
+        return res.status(400).json({ error: 'Invalid recording artifact payload' });
+      }
+      const extension = String(mimeType || '').includes('wav') ? 'wav' : 'webm';
+      fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+      const filePath = path.join(RECORDINGS_DIR, `${recordingId}.${stage}.${extension}`);
+      fs.writeFileSync(filePath, Buffer.from(data, 'base64'));
+      const manifestPath = path.join(RECORDINGS_DIR, `${recordingId}.json`);
+      let manifest: Record<string, unknown> = {};
+      if (fs.existsSync(manifestPath)) manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      manifest[stage] = {
+        file: path.basename(filePath),
+        bytes: fs.statSync(filePath).size,
+        mimeType,
+        savedAt: new Date().toISOString(),
+        metadata: metadata && typeof metadata === 'object' ? metadata : {},
+      };
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+      res.json({ ok: true, recordingId, stage, file: path.basename(filePath), bytes: fs.statSync(filePath).size });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || String(err) });
+    }
   });
 
   app.post('/api/key', (req, res) => {

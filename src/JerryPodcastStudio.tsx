@@ -359,6 +359,22 @@ export function JerryPodcastStudio() {
     return btoa(binary);
   };
 
+  const persistRecordingArtifact = async (
+    recordingId: string,
+    stage: 'raw' | 'processed',
+    blob: Blob,
+    metadata: Record<string, unknown>,
+  ) => {
+    const data = bytesToBase64(new Uint8Array(await blob.arrayBuffer()));
+    const response = await fetch('/api/recordings/artifact', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recordingId, stage, mimeType: blob.type, data, metadata }),
+    });
+    if (!response.ok) throw new Error(`Recording ${stage} persistence failed (${response.status})`);
+    return response.json() as Promise<{ ok: true; file: string; bytes: number }>;
+  };
+
   const resampleTo16kPcm = (input: Float32Array, inputRate: number) => {
     const targetRate = 16000;
     if (!input.length) return new Uint8Array();
@@ -1762,12 +1778,22 @@ export function JerryPodcastStudio() {
           });
 
           if (blob.size > 0) {
+            const recordingId = `episode-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
             setRecordingNotice('Finalizing recording...');
             emitRecordingDebugEvent('recording-finalization-start', { rawMasterBytes: blob.size, mimeType: actualMime });
+            await persistRecordingArtifact(recordingId, 'raw', blob, {
+              mode: recordingModeRef.current,
+              turnLogEntries: turnLogRef.current.length,
+            });
             const finalized = await finalizeEpisode({ master: blob, mimeType: actualMime });
             setFinalizedEpisode(finalized);
             setPublicationStatus(finalized.publicationStatus);
             publicationStatusRef.current = finalized.publicationStatus;
+            await persistRecordingArtifact(recordingId, 'processed', finalized.finalMaster, {
+              publicationStatus: finalized.publicationStatus,
+              processingMs: finalized.processingMs,
+              warnings: finalized.warnings.join(' | ').slice(0, 500),
+            });
             emitRecordingDebugEvent('recording-finalized', {
               publicationStatus: finalized.publicationStatus,
               processingMs: finalized.processingMs,

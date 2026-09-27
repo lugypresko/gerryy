@@ -14,6 +14,13 @@ test('fallback TTS is explicitly Hebrew and strips stage tags', () => {
   assert.doesNotMatch(server, /replyText\s*=\s*'<sigh>/);
 });
 
+test('recordings persist raw and processed artifacts before the browser can lose the Blob', () => {
+  assert.match(server, /app\.post\('\/api\/recordings\/artifact'/);
+  assert.match(server, /RECORDINGS_DIR/);
+  assert.match(studio, /persistRecordingArtifact\(recordingId, 'raw'/);
+  assert.match(studio, /persistRecordingArtifact\(recordingId, 'processed'/);
+});
+
 test('final STT transcript commits the guest turn; 180ms race is gone', () => {
   assert.match(
     studio,
