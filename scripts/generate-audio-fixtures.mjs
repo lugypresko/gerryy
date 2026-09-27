@@ -155,6 +155,7 @@ function browserCaptureExpression() {
     const source = context.createBufferSource();
     source.buffer = buffer;
     source.connect(destination);
+    source.connect(context.destination);
     const recorder = new MediaRecorder(destination.stream, { mimeType: 'audio/webm;codecs=opus' });
     const chunks = [];
     recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
@@ -188,6 +189,7 @@ async function captureBrowserMediaRecorder() {
     '--disable-gpu',
     '--no-sandbox',
     '--mute-audio',
+    '--autoplay-policy=no-user-gesture-required',
     `--user-data-dir=${profile}`,
     `--remote-debugging-port=${port}`,
     'about:blank',
