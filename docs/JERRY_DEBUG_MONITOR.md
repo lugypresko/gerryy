@@ -57,10 +57,11 @@ The gate uses these thresholds:
 
 Audio and stem downloads are blocked for `failed` recordings. `needs-review` recordings require an explicit confirmation before download. The final status and final levels are emitted again when the recorder stops.
 
-After recording stops, the episode finalizer renders a corrected WAV master before any download URL is exposed. It emits two bounded events:
+After recording stops, the episode finalizer renders a corrected WAV master before any download URL is exposed. The monitor distinguishes capture from processing and emits bounded events:
 
+- `recording-capture-complete`: captured chunk count, input size, MIME type, and turn-log count;
 - `recording-finalization-start`: raw master size and MIME type;
-- `recording-finalized`: processing time, publication status, and final balance delta.
+- `recording-finalized`: processing time, duration, input/output sizes, publication status, final balance delta, and warnings.
 
 The finalizer preserves the raw master and optional stems for diagnostics, applies guest/Jerry balance correction plus a master limiter, and blocks failed output at the download gate.
 

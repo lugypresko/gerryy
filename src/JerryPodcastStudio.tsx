@@ -1752,7 +1752,7 @@ export function JerryPodcastStudio() {
             blobSize: blob.size,
             mimeType: actualMime,
           });
-          sendDebugEvent('recording-finalized', 'recording', {
+          sendDebugEvent('recording-capture-complete', 'recording', {
             chunks: recordedChunksRef.current.length,
             blobSize: blob.size,
             mimeType: actualMime,
@@ -1770,6 +1770,11 @@ export function JerryPodcastStudio() {
               processingMs: finalized.processingMs,
               balanceDeltaDb: finalized.metrics.balanceDeltaDb,
       rawStems: Object.keys(finalized.rawStems),
+              rawMasterBytes: finalized.rawStems.master.size,
+              finalMasterBytes: finalized.finalMaster.size,
+              warnings: finalized.warnings,
+              durationMs: Math.round(finalized.metrics.durationMs),
+              completedAt: new Date().toISOString(),
             });
             if (finalized.publicationStatus === 'failed') {
               setEpisodeAudioUrl(null);
