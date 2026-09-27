@@ -42,6 +42,8 @@ export function poseForState(state: JerryAnimationState): JerryPose {
 export type JerryAnimationEvent =
   | 'mic-start'
   | 'output-audio'
+  | 'audio-energy'
+  | 'response-amused'
   | 'turn-complete'
   | 'live-disconnect';
 
@@ -54,6 +56,10 @@ export function nextAnimationState(
       return 'listening';
     case 'output-audio':
       return 'speaking';
+    case 'audio-energy':
+      return 'emphasis';
+    case 'response-amused':
+      return 'amused';
     case 'turn-complete':
       return current === 'listening' ? 'listening' : 'idle';
     case 'live-disconnect':

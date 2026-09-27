@@ -18,6 +18,8 @@ function loadAnimationModule() {
       transitions: [
         ['mic-start', 'listening'],
         ['output-audio', 'speaking'],
+        ['audio-energy', 'emphasis'],
+        ['response-amused', 'amused'],
         ['turn-complete', 'idle'],
         ['live-disconnect', 'idle'],
       ].map(([event, state]) => animation.nextAnimationState(state, event)),
@@ -66,7 +68,7 @@ test('uses a short crossfade and safe state transitions', () => {
   const animation = loadAnimationModule();
 
   assert.ok(animation.crossfadeMs >= 120 && animation.crossfadeMs <= 160);
-  assert.deepEqual(animation.transitions, ['listening', 'speaking', 'idle', 'idle']);
+  assert.deepEqual(animation.transitions, ['listening', 'speaking', 'emphasis', 'amused', 'idle', 'idle']);
   assert.equal(animation.disconnectedSpeaking, 'idle');
   assert.equal(animation.unknownFromIdle, 'idle');
 });

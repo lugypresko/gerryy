@@ -73,6 +73,8 @@ test('Jerry studio renders the locked full-frame pose manifest with crossfade an
   assert.match(studio, /JERRY_MOUTH_ANCHORS\[activePose\]/);
   assert.doesNotMatch(studio, /jerry-pose-[abcd]\.jpg/);
   assert.doesNotMatch(studio, /jerry-head\.png/);
+  assert.match(studio, /preload|new Image\(\)/);
+  assert.match(studio, /onError=[\s\S]{0,180}JERRY_POSES\.idle/);
 });
 
 test('Jerry animation state follows live interaction events instead of a fixed script', () => {
@@ -80,6 +82,20 @@ test('Jerry animation state follows live interaction events instead of a fixed s
   assert.match(studio, /setAnimationState\('thinking'\)/);
   assert.match(studio, /transitionAnimation\('output-audio'\)/);
   assert.match(studio, /transitionAnimation\('turn-complete'\)/);
+  assert.match(studio, /audio-energy/);
+  assert.match(studio, /response-amused/);
+  assert.match(studio, /lastEnergyTransitionRef/);
+});
+
+test('Live and recording lifecycle cleanup is explicit and mute silences current playback', () => {
+  assert.match(studio, /getUserMediaRequestRef/);
+  assert.match(studio, /requestId !== getUserMediaRequestRef\.current/);
+  assert.match(studio, /mediaRecorderRef\.current\?\.stop\(\)/);
+  assert.match(studio, /liveMicProcessorRef\.current\?\.disconnect\(\)/);
+  assert.match(studio, /URL\.revokeObjectURL\(pcmDebugAudioUrl\)/);
+  assert.match(studio, /liveQueuedSamplesRef\.current = 0/);
+  assert.match(studio, /jerryPlaybackGainRef\.current\.gain\.value = isMuted/);
+  assert.doesNotMatch(studio, /liveSocketRef\.current\?\.(close|send).*isMuted/);
 });
 
 test('Jerry studio integrates independent recording chains and a centered monitor mix', () => {
