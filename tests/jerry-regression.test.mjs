@@ -66,3 +66,12 @@ test('known Hebrew UI debt remains visible so it cannot be mistaken for fixed', 
   assert.match(index, /<html lang="en">/);
   assert.match(css, /font-family:\s*'Inter',\s*'Assistant'/);
 });
+
+
+test('M1 performance runtime teaches vocal backchannels and timing', () => {
+  assert.match(server, /ביצוע קולי — זה חלק מהשיחה, לא קישוט/);
+  assert.match(server, /backchannels קוליים/);
+  assert.match(server, /300–800ms של שקט/);
+  assert.match(server, /אל תבצע יותר ממחווה קולית אחת/);
+  assert.match(server, /jerry-conversation-v4-performance-m1/);
+});
