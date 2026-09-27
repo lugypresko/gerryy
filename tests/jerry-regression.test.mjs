@@ -74,6 +74,24 @@ test('authoritative transcription keeps the Gemini client in WebSocket handler s
   assert.match(server, /transcribeGuestTurn\(aiClient,\s*completedTurnChunks\)/);
 });
 
+test('Jerry debug monitor records the complete live turn chain', () => {
+  assert.match(server, /\/api\/jerry-debug/);
+  assert.match(server, /JERRY_DEBUG_MAX_EVENTS/);
+  assert.match(server, /connectionId/);
+  assert.match(server, /turnId/);
+  assert.match(server, /authoritative-start/);
+  assert.match(server, /guest-transcript-forwarded/);
+  assert.match(server, /jerry-audio/);
+  assert.match(server, /jerry-turn-complete/);
+});
+
+test('authoritative STT cannot hang silently and reports an explicit timeout', () => {
+  assert.match(server, /transcription-timeout/);
+  assert.match(server, /authoritative-timeout/);
+  assert.match(server, /turn-aborted-no-transcript/);
+  assert.match(server, /stt-error/);
+});
+
 test('Gemini Live output PCM is resampled to the browser AudioContext rate', () => {
   assert.match(studio, /sourceRateMatch = \/rate=\(\\d\+\)\/i\.exec/);
   assert.match(studio, /const targetRate = ctx\?\.sampleRate \|\| sourceRate/);

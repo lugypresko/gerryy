@@ -12,6 +12,32 @@ const JERRY_ENGINE_VERSION = 'jerry-conversation-v3-2026-09-26';
 const KEY_FILE = path.resolve(process.cwd(), '.api-key.json');
 const ALIGNMENT_LOG_FILE = path.resolve(process.cwd(), '.alignment-logs.json');
 const VOICE_LOG_FILE = path.resolve(process.cwd(), '.voice-logs.json');
+const JERRY_DEBUG_MAX_EVENTS = 200;
+const jerryDebugEvents: Array<Record<string, unknown>> = [];
+let nextJerryConnectionId = 1;
+
+function recordJerryDebug(event: string, details: Record<string, unknown> = {}) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    event,
+    ...details,
+  };
+  jerryDebugEvents.push(entry);
+  if (jerryDebugEvents.length > JERRY_DEBUG_MAX_EVENTS) {
+    jerryDebugEvents.splice(0, jerryDebugEvents.length - JERRY_DEBUG_MAX_EVENTS);
+  }
+  console.info('[Jerry Debug]', JSON.stringify(entry));
+  return entry;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      setTimeout(() => reject(new Error(label)), timeoutMs);
+    }),
+  ]);
+}
 
 const JERRY_LIVE_SYSTEM_PROMPT = `אתה ג'רי (Jerry), המנחה של "Engineering Leaders in Real Life".
 
@@ -230,6 +256,14 @@ async function startServer() {
   app.get('/api/key', (req, res) => {
     const key = getApiKey(req);
     res.json({ apiKey: key });
+  });
+
+  app.get('/api/jerry-debug', (_req, res) => {
+    res.json({
+      ok: true,
+      maxEvents: JERRY_DEBUG_MAX_EVENTS,
+      events: jerryDebugEvents,
+    });
   });
 
   app.post('/api/key', (req, res) => {
@@ -880,6 +914,8 @@ CRITICAL RULES:
   const wss = new WebSocketServer({ server: httpServer, path: '/api/jerry-live-socket' });
 
   wss.on('connection', async (client) => {
+    const connectionId = nextJerryConnectionId++;
+    recordJerryDebug('socket-connected', { connectionId });
     const key = getApiKey();
     if (!key) {
       client.send(JSON.stringify({ type: 'error', message: 'No Gemini API key available on server.' }));
@@ -894,6 +930,9 @@ CRITICAL RULES:
     let aiClient: GoogleGenAI | null = null;
     let guestPcmChunks: Buffer[] = [];
     let guestTurnId = 0;
+    let guestTurnStartedAt = 0;
+    let guestAudioChunkCount = 0;
+    let guestAudioBytes = 0;
 
     try {
       aiClient = new GoogleGenAI({ apiKey: key });
@@ -903,6 +942,7 @@ CRITICAL RULES:
         callbacks: {
           onopen: () => {
             console.info('[Jerry STT] dedicated Hebrew transcriber opened');
+            recordJerryDebug('stt-ready', { connectionId });
           },
           onmessage: (message: any) => {
             if (client.readyState !== WebSocket.OPEN) return;
@@ -927,6 +967,7 @@ CRITICAL RULES:
           },
           onerror: (event: any) => {
             console.error('[Jerry STT] error:', event?.message || event);
+            recordJerryDebug('stt-error', { connectionId, message: event?.message || String(event) });
             if (client.readyState === WebSocket.OPEN) {
               client.send(
                 JSON.stringify({
@@ -973,6 +1014,7 @@ CRITICAL RULES:
         callbacks: {
           onopen: () => {
             console.info('[Jerry Live] Gemini session opened');
+            recordJerryDebug('jerry-live-ready', { connectionId });
           },
           onmessage: (message: any) => {
             if (client.readyState !== WebSocket.OPEN) return;
@@ -983,6 +1025,11 @@ CRITICAL RULES:
             for (const part of parts) {
               const inlineData = part?.inlineData || part?.inline_data;
               if (inlineData?.data) {
+                recordJerryDebug('jerry-audio', {
+                  connectionId,
+                  turnId: guestTurnId,
+                  bytes: Math.floor((inlineData.data.length * 3) / 4),
+                });
                 client.send(
                   JSON.stringify({
                     type: 'audio',
@@ -1006,11 +1053,16 @@ CRITICAL RULES:
             }
 
             if (serverContent?.turnComplete || serverContent?.turn_complete) {
+                  recordJerryDebug('jerry-turn-complete', {
+                    connectionId,
+                    turnId: guestTurnId,
+                  });
               client.send(JSON.stringify({ type: 'turn-complete' }));
             }
           },
           onerror: (event: any) => {
             console.error('[Jerry Live] Gemini error:', event?.message || event);
+            recordJerryDebug('jerry-live-error', { connectionId, message: event?.message || String(event) });
             if (client.readyState === WebSocket.OPEN) {
               client.send(
                 JSON.stringify({
@@ -1050,6 +1102,7 @@ CRITICAL RULES:
                     inputPath: 'push-to-talk PCM -> Live interim STT -> full-turn Gemini 3.5 Transcribe (he-IL) -> Gemini 3.8 Live -> Jerry response',
           }),
         );
+            recordJerryDebug('socket-ready-sent', { connectionId, engineVersion: JERRY_ENGINE_VERSION });
       }
     } catch (err: any) {
       console.error('[Jerry Live] setup failed:', err);
@@ -1098,14 +1151,21 @@ CRITICAL RULES:
           lastFinalGuestTranscript = '';
           lastLiveFinalCandidate = '';
           guestTurnId += 1;
+          guestTurnStartedAt = Date.now();
+          guestAudioChunkCount = 0;
+          guestAudioBytes = 0;
           guestPcmChunks = [];
           console.info('[Jerry Engine]', {
             engineVersion: JERRY_ENGINE_VERSION,
             stage: 'hebrew-transcribe-start',
           });
+          recordJerryDebug('guest-turn-start', { connectionId, turnId: guestTurnId });
           transcribeSession.sendRealtimeInput({ activityStart: {} });
         } else if (msg.type === 'audio' && typeof msg.data === 'string' && msg.data) {
-          guestPcmChunks.push(Buffer.from(msg.data, 'base64'));
+          const audioChunk = Buffer.from(msg.data, 'base64');
+          guestPcmChunks.push(audioChunk);
+          guestAudioChunkCount += 1;
+          guestAudioBytes += audioChunk.length;
           transcribeSession.sendRealtimeInput({
             audio: {
               data: msg.data,
@@ -1120,23 +1180,65 @@ CRITICAL RULES:
             engineVersion: JERRY_ENGINE_VERSION,
             stage: 'hebrew-transcribe-end-awaiting-authoritative-final',
           });
+          recordJerryDebug('guest-turn-end', {
+            connectionId,
+            turnId: completedTurnId,
+            durationMs: guestTurnStartedAt ? Date.now() - guestTurnStartedAt : null,
+            audioChunks: guestAudioChunkCount,
+            audioBytes: guestAudioBytes,
+          });
           transcribeSession.sendRealtimeInput({ activityEnd: {} });
           void (async () => {
             let authoritativeTranscript = '';
+            recordJerryDebug('authoritative-start', {
+              connectionId,
+              turnId: completedTurnId,
+              audioBytes: completedTurnChunks.reduce((total, chunk) => total + chunk.length, 0),
+            });
             try {
                   if (!aiClient) throw new Error('Gemini client is not initialized');
-                  authoritativeTranscript = await transcribeGuestTurn(aiClient, completedTurnChunks);
+                  authoritativeTranscript = await withTimeout(
+                    transcribeGuestTurn(aiClient, completedTurnChunks),
+                    12000,
+                    'transcription-timeout',
+                  );
             } catch (err) {
               console.warn('[Jerry STT] authoritative transcription failed; using live candidate:', err);
+              recordJerryDebug('authoritative-error', {
+                connectionId,
+                turnId: completedTurnId,
+                message: err instanceof Error ? err.message : String(err),
+              });
+              if (err instanceof Error && err.message === 'transcription-timeout') {
+                recordJerryDebug('authoritative-timeout', { connectionId, turnId: completedTurnId });
+              }
             }
             const finalTranscript = authoritativeTranscript || lastLiveFinalCandidate;
-            if (completedTurnId !== guestTurnId || !finalTranscript) return;
+            if (completedTurnId !== guestTurnId) return;
+            if (!finalTranscript) {
+              recordJerryDebug('turn-aborted-no-transcript', { connectionId, turnId: completedTurnId });
+              if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({ type: 'stt-error', message: 'No final Hebrew transcript was produced' }));
+              }
+              return;
+            }
             if (finalTranscript === lastFinalGuestTranscript) return;
             lastFinalGuestTranscript = finalTranscript;
             console.info('[Jerry STT] authoritative Hebrew transcript:', finalTranscript);
+            recordJerryDebug(authoritativeTranscript ? 'authoritative-success' : 'authoritative-fallback', {
+              connectionId,
+              turnId: completedTurnId,
+              elapsedMs: guestTurnStartedAt ? Date.now() - guestTurnStartedAt : null,
+              textPreview: finalTranscript.slice(0, 160),
+            });
             if (client.readyState === WebSocket.OPEN) {
               client.send(JSON.stringify({ type: 'input-transcript', text: finalTranscript }));
             }
+            recordJerryDebug('guest-transcript-forwarded', {
+              connectionId,
+              turnId: completedTurnId,
+              textPreview: finalTranscript.slice(0, 160),
+            });
             liveSession?.sendClientContent({
               turns: [{ role: 'user', parts: [{ text: finalTranscript }] }],
               turnComplete: true,
@@ -1149,6 +1251,7 @@ CRITICAL RULES:
     });
 
     client.on('close', () => {
+      recordJerryDebug('socket-closed', { connectionId, turnId: guestTurnId });
       try {
         liveSession?.close();
       } catch {}
