@@ -1116,7 +1116,16 @@ CRITICAL RULES:
     client.on('message', (raw) => {
       if (!liveSession || !transcribeSession) return;
       try {
-        const msg = JSON.parse(raw.toString());
+        const rawText = raw?.toString?.() || '';
+        if (!rawText.trim() || rawText === 'undefined') {
+          recordJerryDebug('socket-invalid-message', {
+            connectionId,
+            turnId: guestTurnId,
+            rawPreview: rawText.slice(0, 80),
+          });
+          return;
+        }
+        const msg = JSON.parse(rawText);
 
         if (msg.type === 'restore-history' && Array.isArray(msg.turns)) {
           const restoredTurns = msg.turns
@@ -1143,9 +1152,34 @@ CRITICAL RULES:
             });
           }
         } else if (msg.type === 'text' && typeof msg.text === 'string' && msg.text.trim()) {
+          recordJerryDebug('guest-text-forwarded', {
+            connectionId,
+            turnId: guestTurnId,
+            textPreview: msg.text.trim().slice(0, 160),
+          });
           liveSession.sendClientContent({
             turns: [{ role: 'user', parts: [{ text: msg.text.trim() }] }],
             turnComplete: true,
+          });
+        } else if (
+          msg.type === 'debug-event' &&
+          typeof msg.event === 'string' &&
+          msg.event.trim()
+        ) {
+          const category = typeof msg.category === 'string' ? msg.category.slice(0, 40) : 'client';
+          const details = msg.details && typeof msg.details === 'object' ? msg.details : {};
+          const sanitizedDetails: Record<string, unknown> = {};
+          for (const [key, value] of Object.entries(details)) {
+            if (typeof value === 'string') sanitizedDetails[key.slice(0, 60)] = value.slice(0, 160);
+            else if (typeof value === 'number' && Number.isFinite(value)) sanitizedDetails[key.slice(0, 60)] = value;
+            else if (typeof value === 'boolean' || value === null) sanitizedDetails[key.slice(0, 60)] = value;
+          }
+          recordJerryDebug('client-debug', {
+            connectionId,
+            turnId: guestTurnId,
+            category,
+            clientEvent: msg.event.trim().slice(0, 80),
+            details: sanitizedDetails,
           });
         } else if (msg.type === 'activity-start') {
           lastFinalGuestTranscript = '';

@@ -146,6 +146,21 @@ export function JerryPodcastStudio() {
   const pcmDebugRecordingRef = useRef(false);
   const getUserMediaRequestRef = useRef(0);
   const lastEnergyTransitionRef = useRef(0);
+  const liveMicDebugChunkCountRef = useRef(0);
+  const liveJerryDebugChunkCountRef = useRef(0);
+
+  const sendDebugEvent = useCallback(
+    (
+      event: string,
+      category: 'mic' | 'pcm' | 'noise' | 'recording' | 'animation' | 'video' | 'stt' | 'jerry-audio' | 'turn-log' | 'socket',
+      details: Record<string, unknown> = {},
+    ) => {
+      const socket = liveSocketRef.current;
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify({ type: 'debug-event', event, category, details }));
+    },
+    [],
+  );
 
   const refreshAudioInputDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -183,8 +198,14 @@ export function JerryPodcastStudio() {
       active.startedAt,
       recordingTime(),
     );
+    sendDebugEvent('turn-log-append', 'turn-log', {
+      speaker: active.speaker,
+      textPreview: (text || active.text).slice(0, 160),
+      startedAt: active.startedAt,
+      endedAt: recordingTime(),
+    });
     activeTurnRef.current = null;
-  }, [recordingTime]);
+  }, [recordingTime, sendDebugEvent]);
 
   const beginRecordedTurn = useCallback((speaker: ConversationSpeaker, text = '') => {
     if (recordingStartedAtRef.current === null) return;
@@ -194,11 +215,16 @@ export function JerryPodcastStudio() {
     }
     endRecordedTurn();
     activeTurnRef.current = { speaker, startedAt: recordingTime(), text };
-  }, [endRecordedTurn, recordingTime]);
+    sendDebugEvent('turn-log-start', 'turn-log', { speaker, textPreview: text.slice(0, 160) });
+  }, [endRecordedTurn, recordingTime, sendDebugEvent]);
 
   const transitionAnimation = useCallback((event: JerryAnimationEvent) => {
-    setAnimationState((current) => nextAnimationState(current, event));
-  }, []);
+    setAnimationState((current) => {
+      const next = nextAnimationState(current, event);
+      sendDebugEvent('animation-transition', 'animation', { event, from: current, to: next });
+      return next;
+    });
+  }, [sendDebugEvent]);
 
   // Auto-scroll chat messages
   useEffect(() => {
@@ -382,9 +408,10 @@ export function JerryPodcastStudio() {
     if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
       liveSocketRef.current.send(JSON.stringify({ type: 'activity-end' }));
     }
+    sendDebugEvent('mic-stop', 'mic', { transcriptPreview: liveInputTranscriptRef.current.slice(0, 160) });
 
     setIsRecordingMic(false);
-  }, [endRecordedTurn]);
+  }, [endRecordedTurn, sendDebugEvent]);
 
   const startLiveMic = useCallback(async () => {
     if (!isLiveReady || liveSocketRef.current?.readyState !== WebSocket.OPEN) return;
@@ -437,6 +464,10 @@ export function JerryPodcastStudio() {
       if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
         liveSocketRef.current.send(JSON.stringify({ type: 'activity-start' }));
       }
+      liveMicDebugChunkCountRef.current = 0;
+      sendDebugEvent('mic-activity-start', 'mic', {
+        deviceId: selectedAudioInputId || 'default',
+      });
 
       const [track] = stream.getAudioTracks();
       if (!track || track.readyState !== 'live') {
@@ -472,6 +503,34 @@ export function JerryPodcastStudio() {
         const pcm = resampleTo16kPcm(input, micCtx.sampleRate);
         if (!pcm.byteLength) return;
 
+        let sumSquares = 0;
+        let peak = 0;
+        let clipped = false;
+        for (let i = 0; i < input.length; i++) {
+          const sample = input[i];
+          sumSquares += sample * sample;
+          peak = Math.max(peak, Math.abs(sample));
+          if (Math.abs(sample) >= 0.99) clipped = true;
+        }
+        liveMicDebugChunkCountRef.current += 1;
+        if (liveMicDebugChunkCountRef.current % 25 === 0) {
+          const rms = Math.sqrt(sumSquares / Math.max(1, input.length));
+          sendDebugEvent('pcm-level', 'pcm', {
+            bytes: pcm.byteLength,
+            rmsDb: rms > 0 ? 20 * Math.log10(rms) : -Infinity,
+            peak,
+            clipped,
+            sampleRate: 16000,
+          });
+          if (clipped || rms < 0.0001) {
+            sendDebugEvent(clipped ? 'input-clipping' : 'input-silence', 'noise', {
+              rmsDb: rms > 0 ? 20 * Math.log10(rms) : -Infinity,
+              peak,
+              clipped,
+            });
+          }
+        }
+
         // Capture exactly the same 16kHz PCM bytes that are sent to Gemini Live.
         if (pcmDebugRecordingRef.current) {
           pcmDebugChunksRef.current.push(new Uint8Array(pcm));
@@ -500,8 +559,15 @@ export function JerryPodcastStudio() {
         state: track.readyState,
         sampleRate: micCtx.sampleRate,
       });
+      sendDebugEvent('mic-active', 'mic', {
+        label: track.label,
+        state: track.readyState,
+        sampleRate: micCtx.sampleRate,
+        constraints: track.getConstraints(),
+      });
     } catch (err: any) {
       console.error('[Jerry Live] microphone start failed:', err);
+      sendDebugEvent('mic-start-error', 'mic', { name: err?.name, message: err?.message });
       liveMicActiveRef.current = false;
 
       if (liveMicStreamRef.current) {
@@ -525,7 +591,7 @@ export function JerryPodcastStudio() {
       setErrorNotice(reason);
       setIsRecordingMic(false);
     }
-  }, [isLiveReady, isPcmDebugRecording]);
+  }, [isLiveReady, isPcmDebugRecording, selectedAudioInputId, sendDebugEvent]);
 
   const pcm16ChunksToWavUrl = (chunks: Uint8Array[], sampleRate = 24000) => {
     const dataLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
@@ -687,7 +753,11 @@ export function JerryPodcastStudio() {
 
       socket.onopen = () => {
         console.info('[Jerry Live] browser socket connected');
+        sendDebugEvent('socket-open', 'socket');
       };
+
+      socket.onerror = () => sendDebugEvent('socket-error', 'socket');
+      socket.onclose = (event) => sendDebugEvent('socket-close', 'socket', { code: event.code, reason: event.reason });
 
       socket.onmessage = (event) => {
         try {
@@ -695,6 +765,11 @@ export function JerryPodcastStudio() {
 
           if (msg.type === 'ready') {
             setIsLiveReady(true);
+            sendDebugEvent('socket-ready', 'socket', {
+              engine: msg.engine,
+              engineVersion: msg.engineVersion,
+              inputPath: msg.inputPath,
+            });
 
             // A reconnect creates a fresh Gemini Live session. Restore only completed
             // conversation turns, ending at the most recent Jerry/model turn, so the
@@ -728,24 +803,34 @@ export function JerryPodcastStudio() {
           }
 
           if (msg.type === 'audio' && msg.data) {
+            liveJerryDebugChunkCountRef.current += 1;
+            if (liveJerryDebugChunkCountRef.current % 10 === 0) {
+              sendDebugEvent('jerry-audio-chunk', 'jerry-audio', {
+                mimeType: msg.mimeType,
+                base64Bytes: msg.data.length,
+              });
+            }
             playLivePcmChunk(msg.data, msg.mimeType || 'audio/pcm;rate=24000');
             return;
           }
 
           if (msg.type === 'input-transcript-interim' && msg.text) {
             setMicTranscript(msg.text);
+            sendDebugEvent('stt-interim', 'stt', { textPreview: msg.text });
             return;
           }
 
           if (msg.type === 'input-transcript' && msg.text) {
             liveInputTranscriptRef.current = msg.text;
             setMicTranscript(msg.text);
+            sendDebugEvent('stt-final', 'stt', { textPreview: msg.text });
             commitLiveUserTurn();
             return;
           }
 
           if (msg.type === 'stt-error') {
             console.error('[Jerry STT] server error:', msg.message);
+            sendDebugEvent('stt-error', 'stt', { message: msg.message });
             setErrorNotice('תמלול העברית נכשל: ' + (msg.message || 'שגיאת STT'));
             return;
           }
@@ -761,6 +846,7 @@ export function JerryPodcastStudio() {
 
           if (msg.type === 'transcript' && msg.text) {
             liveTranscriptRef.current += msg.text;
+            sendDebugEvent('jerry-transcript', 'stt', { textPreview: msg.text });
             return;
           }
 
@@ -779,6 +865,9 @@ export function JerryPodcastStudio() {
           }
 
           if (msg.type === 'turn-complete') {
+            sendDebugEvent('jerry-turn-complete', 'turn-log', {
+              replyPreview: liveTranscriptRef.current.slice(0, 160),
+            });
             const replyText = liveTranscriptRef.current.trim() || '...';
             endRecordedTurn(replyText);
             const audioUrl = pcm16ChunksToWavUrl(livePcmChunksRef.current);
@@ -821,6 +910,7 @@ export function JerryPodcastStudio() {
 
           if (msg.type === 'error') {
             console.error('[Jerry Live] server error:', msg.message);
+            sendDebugEvent('socket-error', 'socket', { message: msg.message });
             setIsLiveReady(false);
             setIsJerryThinking(false);
             setErrorNotice('Gemini Live לא זמין כרגע; עובר אוטומטית למסלול הרגיל.');
@@ -861,7 +951,7 @@ export function JerryPodcastStudio() {
       } catch {}
       liveSocketRef.current = null;
     };
-  }, [playLivePcmChunk, commitLiveUserTurn, endRecordedTurn, transitionAnimation]);
+  }, [playLivePcmChunk, commitLiveUserTurn, endRecordedTurn, transitionAnimation, sendDebugEvent]);
 
   // Episode Recording Timer
   useEffect(() => {
@@ -980,10 +1070,12 @@ export function JerryPodcastStudio() {
     const preloaders = Object.values(JERRY_POSES).map((src) => {
       const image = new Image();
       image.src = src;
+      image.onload = () => sendDebugEvent('pose-asset-loaded', 'video', { src });
+      image.onerror = () => sendDebugEvent('pose-asset-error', 'video', { src });
       return image;
     });
     return () => preloaders.forEach((image) => { image.onload = null; image.onerror = null; });
-  }, []);
+  }, [sendDebugEvent]);
 
   useEffect(() => {
     if (isMuted) {
@@ -1252,6 +1344,7 @@ export function JerryPodcastStudio() {
     };
 
     if (isEpisodeRecording) {
+      sendDebugEvent('recording-stop-request', 'recording', { mode: recordingModeRef.current });
       // STOP recording. Important: do not stop the mic tracks here.
       // MediaRecorder still needs its source alive while it flushes/finalizes the last chunk.
       const recorder = mediaRecorderRef.current;
@@ -1281,6 +1374,9 @@ export function JerryPodcastStudio() {
     }
 
     // START recording
+    sendDebugEvent('recording-start-request', 'recording', {
+      selectedAudioInputId: selectedAudioInputId || 'default',
+    });
     setErrorNotice(null);
     if (episodeAudioUrl) {
       URL.revokeObjectURL(episodeAudioUrl);
@@ -1366,6 +1462,10 @@ export function JerryPodcastStudio() {
         recordingMonitorJerryGainRef.current = monitorJerryGain;
         recordingMonitorGuestGainRef.current = monitorGuestGain;
         recordingModeRef.current = guestSource ? 'dual-channel' : 'jerry-only';
+        sendDebugEvent('recording-graph-ready', 'recording', {
+          mode: recordingModeRef.current,
+          channels: guestSource ? 2 : 1,
+        });
         if (jerryPlaybackGainRef.current) jerryPlaybackGainRef.current.gain.value = 0;
         // recordingGraphRef.current.destination.stream is the master recording stream.
         streamToRecord = graph.destination.stream;
@@ -1388,6 +1488,7 @@ export function JerryPodcastStudio() {
         recordingMonitorMixRef.current = monitorMix;
         recordingMonitorJerryGainRef.current = monitorJerryGain;
         recordingModeRef.current = 'jerry-only';
+        sendDebugEvent('recording-mic-fallback', 'recording', { mode: 'jerry-only', error: micErr?.message });
         if (jerryPlaybackGainRef.current) jerryPlaybackGainRef.current.gain.value = 0;
         streamToRecord = fallbackGraph.destination.stream;
         setRecordingNotice('ההקלטה פעילה (רק ערוץ הקול של ג\'רי - לא אושרה הרשאת מיקרופון).');
@@ -1442,10 +1543,16 @@ export function JerryPodcastStudio() {
 
       mediaRecorder.onstart = () => {
         console.info('[Podcast Recorder] started', { mimeType: actualMime, tracks: tracks.length });
+        sendDebugEvent('recording-started', 'recording', {
+          mimeType: actualMime,
+          tracks: tracks.length,
+          mode: recordingModeRef.current,
+        });
       };
 
       mediaRecorder.ondataavailable = (e) => {
         console.info('[Podcast Recorder] dataavailable', { size: e.data?.size || 0, type: e.data?.type });
+        sendDebugEvent('recording-data', 'recording', { size: e.data?.size || 0, type: e.data?.type });
         if (e.data && e.data.size > 0) {
           recordedChunksRef.current.push(e.data);
         }
@@ -1453,6 +1560,10 @@ export function JerryPodcastStudio() {
 
       mediaRecorder.onerror = (event: any) => {
         console.error('[Podcast Recorder] MediaRecorder error:', event?.error || event);
+        sendDebugEvent('recording-error', 'recording', {
+          name: event?.error?.name,
+          message: event?.error?.message,
+        });
         setErrorNotice(
           'שגיאת הקלטה: ' + (event?.error?.message || event?.error?.name || 'MediaRecorder נכשל'),
         );
@@ -1465,6 +1576,13 @@ export function JerryPodcastStudio() {
             chunks: recordedChunksRef.current.length,
             blobSize: blob.size,
             mimeType: actualMime,
+          });
+          sendDebugEvent('recording-finalized', 'recording', {
+            chunks: recordedChunksRef.current.length,
+            blobSize: blob.size,
+            mimeType: actualMime,
+            mode: recordingModeRef.current,
+            turnLogEntries: turnLogRef.current.length,
           });
 
           if (blob.size > 0) {
@@ -1524,8 +1642,14 @@ export function JerryPodcastStudio() {
       mediaRecorderRef.current = mediaRecorder;
       recordingStartedAtRef.current = performance.now();
       setIsEpisodeRecording(true);
+      sendDebugEvent('recording-active', 'recording', {
+        mode: recordingModeRef.current,
+        mimeType: actualMime,
+        channels: recordingModeRef.current === 'dual-channel' ? 2 : 1,
+      });
     } catch (err: any) {
       console.error('[Podcast Recorder] setup error:', err);
+      sendDebugEvent('recording-setup-error', 'recording', { message: err?.message });
       stopMicTracks();
       mediaRecorderRef.current = null;
       recordingStartedAtRef.current = null;

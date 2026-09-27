@@ -92,6 +92,24 @@ test('authoritative STT cannot hang silently and reports an explicit timeout', (
   assert.match(server, /stt-error/);
 });
 
+test('debug monitor accepts client-side voice, noise, animation, and recording telemetry', () => {
+  assert.match(server, /msg\.type === 'debug-event'/);
+  assert.match(server, /client-debug/);
+  assert.match(studio, /sendDebugEvent/);
+  assert.match(studio, /'mic'/);
+  assert.match(studio, /'pcm'/);
+  assert.match(studio, /'recording'/);
+  assert.match(studio, /'animation'/);
+  assert.match(studio, /'video'/);
+  assert.match(studio, /'noise'/);
+  assert.match(studio, /'stt'/);
+});
+
+test('invalid debug/socket payloads are observable instead of uncaught JSON noise', () => {
+  assert.match(server, /socket-invalid-message/);
+  assert.match(server, /rawText === 'undefined'/);
+});
+
 test('Gemini Live output PCM is resampled to the browser AudioContext rate', () => {
   assert.match(studio, /sourceRateMatch = \/rate=\(\\d\+\)\/i\.exec/);
   assert.match(studio, /const targetRate = ctx\?\.sampleRate \|\| sourceRate/);
