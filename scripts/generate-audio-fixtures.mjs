@@ -144,7 +144,6 @@ function browserCaptureExpression() {
     const context = new AudioContext({ sampleRate });
     context.resume();
     const destination = context.createMediaStreamDestination();
-    destination.connect(context.destination);
     const buffer = context.createBuffer(2, frames, sampleRate);
     const jerry = buffer.getChannelData(0);
     const guest = buffer.getChannelData(1);

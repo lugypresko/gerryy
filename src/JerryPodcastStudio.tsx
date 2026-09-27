@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { createRecordingGraph, type RecordingGraph, type RecordingMetrics } from './audio/recordingGraph';
 import { finalizeEpisode, type FinalizedEpisode } from './audio/episodeFinalizer';
+import { createRecordingSession, type RecordingSession } from './audio/recordingSession';
 import {
   appendConversationTurn,
   createConversationTurnLog,
@@ -157,6 +158,7 @@ export function JerryPodcastStudio() {
 
   // Mixer refs for recording both Mic + Jerry
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingSessionRef = useRef<RecordingSession | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const jerryTrackRecorderRef = useRef<MediaRecorder | null>(null);
   const guestTrackRecorderRef = useRef<MediaRecorder | null>(null);
@@ -1179,8 +1181,11 @@ export function JerryPodcastStudio() {
   }, []);
 
   const cleanupRecordingResources = useCallback(() => {
+    const session = recordingSessionRef.current;
+    recordingSessionRef.current = null;
+    if (session) session.abort();
     const recorder = mediaRecorderRef.current;
-    if (recorder && recorder.state !== 'inactive') {
+    if (!session && recorder && recorder.state !== 'inactive') {
       try {
         recorder.stop();
       } catch {}
@@ -1736,9 +1741,6 @@ export function JerryPodcastStudio() {
       mediaRecorder.ondataavailable = (e) => {
         console.info('[Podcast Recorder] dataavailable', { size: e.data?.size || 0, type: e.data?.type });
         sendDebugEvent('recording-data', 'recording', { size: e.data?.size || 0, type: e.data?.type });
-        if (e.data && e.data.size > 0) {
-          recordedChunksRef.current.push(e.data);
-        }
       };
 
       mediaRecorder.onerror = (event: any) => {
@@ -1763,7 +1765,9 @@ export function JerryPodcastStudio() {
             sendDebugEvent('recording-levels', 'recording', recordingTelemetryDetails(finalMetrics, finalPublicationStatus));
           }
           sendDebugEvent('recording-publication', 'recording', { publicationStatus: finalPublicationStatus });
-          const blob = new Blob(recordedChunksRef.current, { type: actualMime });
+          const blob = recordingSessionRef.current
+            ? await recordingSessionRef.current.stopAndCollect()
+            : new Blob(recordedChunksRef.current, { type: actualMime });
           console.info('[Podcast Recorder] finalized', {
             chunks: recordedChunksRef.current.length,
             blobSize: blob.size,
@@ -1831,6 +1835,8 @@ export function JerryPodcastStudio() {
           // Only now is it safe to release the microphone source.
           cleanupRecordingGraph();
           stopMicTracks();
+          recordingSessionRef.current?.cleanup();
+          recordingSessionRef.current = null;
           mediaRecorderRef.current = null;
           jerryTrackRecorderRef.current = null;
           guestTrackRecorderRef.current = null;
@@ -1872,6 +1878,13 @@ export function JerryPodcastStudio() {
       // Let the browser own final chunking. This is more reliable for short podcast recordings.
       mediaRecorder.start();
       mediaRecorderRef.current = mediaRecorder;
+      recordingSessionRef.current = createRecordingSession({
+        recorder: mediaRecorder,
+        micStream: micMediaStreamRef.current,
+        ownsMic: episodeOwnsMicRef.current,
+        mimeType: actualMime,
+        cleanupGraph: () => undefined,
+      });
       recordingStartedAtRef.current = performance.now();
       setIsEpisodeRecording(true);
       sendDebugEvent('recording-active', 'recording', {
