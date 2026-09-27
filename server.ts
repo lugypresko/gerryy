@@ -8,6 +8,11 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { RecordingArchiveStore } from './server/recordingStore';
 import { RecordingMediaJobQueue } from './server/recordings/jobs';
+import {
+  buildJerryLanguagePrompt,
+  CODE_SWITCH_TRANSCRIPTION_CONFIG,
+  selectTtsLanguage,
+} from './server/languageRouting';
 
 const PORT = 3000;
 const JERRY_ENGINE_VERSION = 'jerry-conversation-v3-2026-09-26';
@@ -147,7 +152,7 @@ REACT BEFORE YOU ASK.
 18. מותר להתלונן על איתי, הבוס שלך, פעם אחת בשיחה, בחיבה עצבנית. לא להפוך את זה לבדיחה חוזרת.
 19. אסור לתת עצות, רשימות או "חמישה טיפים" אלא אם האורח ביקש במפורש.
 20. דבר בעברית טבעית. Tech English כמו deploy, production, rollback, latency, incident, PR, Kubernetes נשאר טבעי.
-21. כרגע האורח מדבר עברית. התייחס לכל קלט קולי כעברית כברירת מחדל, וענה בעברית. אם התמלול נראה כמו שפה אחרת, הנח שזו שגיאת תמלול ולא שהאורח החליף שפה.
+21. האורח עשוי לעבור בין עברית לאנגלית גם באמצע משפט. שמור על השפה ועל מונחי הקוד כפי שנאמרו; מעבר שפה אינו שגיאת תמלול.
 22. הקול יבש, חם, מעט מחוספס, בקצב ניו-יורקי קל. פאוזות טבעיות. לא תיאטרלי ולא קריקטורה.
 23. אל תקריא תגיות במה כמו <sigh> או <chuckle>. בצע אותן בקול אם מתאים.
 24. התחל מהר. אל תחשוב בקול ואל תאריך הקדמות.
@@ -807,7 +812,7 @@ CRITICAL RULES:
         return res.status(400).json({ error: 'userMessage is required.' });
       }
 
-      const JERRY_SYSTEM_PROMPT = JERRY_LIVE_SYSTEM_PROMPT;
+      const JERRY_SYSTEM_PROMPT = buildJerryLanguagePrompt(JERRY_LIVE_SYSTEM_PROMPT);
 
       // Format conversation contents for Gemini
       const contents: any[] = [];
@@ -866,6 +871,7 @@ CRITICAL RULES:
       // Synthesize audio using Gemini TTS.
       // Keep stage directions out of speech even if the model emits one.
       const ttsText = replyText.replace(/<[^>]+>/g, '').trim();
+      const ttsLanguageCode = selectTtsLanguage(ttsText);
       let audioBase64 = '';
       const ttsErrors: string[] = [];
       const ttsModels = ['models/gemini-3.8-flash-lite-tts', 'models/gemini-3.8-flash-tts'];
@@ -882,7 +888,7 @@ CRITICAL RULES:
                 generationConfig: {
                   responseModalities: ['AUDIO'],
                   speechConfig: {
-                    languageCode: 'he-IL',
+                    ...(ttsLanguageCode ? { languageCode: ttsLanguageCode } : {}),
                     voiceConfig: {
                       voice: 'Charon',
                     },
@@ -1078,7 +1084,7 @@ CRITICAL RULES:
         model: 'gemini-3.5-transcribe-live',
         callbacks: {
           onopen: () => {
-            console.info('[Jerry STT] dedicated Hebrew transcriber opened');
+            console.info('[Jerry STT] Hebrew/English code-switching transcriber opened');
             recordJerryDebug('stt-ready', { connectionId });
           },
           onmessage: (message: any) => {
@@ -1109,7 +1115,7 @@ CRITICAL RULES:
               client.send(
                 JSON.stringify({
                   type: 'stt-error',
-                  message: event?.message || 'Hebrew transcription session error',
+                  message: event?.message || 'Transcription session error',
                 }),
               );
             }
@@ -1126,8 +1132,8 @@ CRITICAL RULES:
             },
           },
           inputAudioTranscription: {
-            languageCodes: ['he-IL'],
-            mode: 'VERBATIM',
+            // Deterministic mocks cover routing; live-provider proof remains a separate credentialed check.
+            ...CODE_SWITCH_TRANSCRIPTION_CONFIG,
             customVocabulary: [
               'ג\'רי',
               'איתי',
@@ -1226,7 +1232,7 @@ CRITICAL RULES:
               },
             },
           },
-          systemInstruction: JERRY_LIVE_SYSTEM_PROMPT,
+          systemInstruction: buildJerryLanguagePrompt(JERRY_LIVE_SYSTEM_PROMPT),
         },
       });
 
@@ -1236,7 +1242,7 @@ CRITICAL RULES:
             type: 'ready',
             engine: 'gemini-3.8-live',
             engineVersion: JERRY_ENGINE_VERSION,
-                    inputPath: 'push-to-talk PCM -> Live interim STT -> full-turn Gemini 3.5 Transcribe (he-IL) -> Gemini 3.8 Live -> Jerry response',
+                    inputPath: 'push-to-talk PCM -> Live interim STT -> full-turn Gemini 3.5 Transcribe (he-IL/en-US code-switch) -> Gemini 3.8 Live -> Jerry response',
           }),
         );
             recordJerryDebug('socket-ready-sent', { connectionId, engineVersion: JERRY_ENGINE_VERSION });
@@ -1323,7 +1329,7 @@ CRITICAL RULES:
           guestPcmChunks = [];
           console.info('[Jerry Engine]', {
             engineVersion: JERRY_ENGINE_VERSION,
-            stage: 'hebrew-transcribe-start',
+              stage: 'code-switch-transcribe-start',
           });
           recordJerryDebug('guest-turn-start', { connectionId, turnId: guestTurnId });
           transcribeSession.sendRealtimeInput({ activityStart: {} });
@@ -1344,7 +1350,7 @@ CRITICAL RULES:
           guestPcmChunks = [];
           console.info('[Jerry Engine]', {
             engineVersion: JERRY_ENGINE_VERSION,
-            stage: 'hebrew-transcribe-end-awaiting-authoritative-final',
+            stage: 'code-switch-transcribe-end-awaiting-authoritative-final',
           });
           recordJerryDebug('guest-turn-end', {
             connectionId,

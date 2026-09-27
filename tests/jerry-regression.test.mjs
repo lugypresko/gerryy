@@ -42,10 +42,12 @@ test('Live reconnect restores completed conversation from first guest turn', () 
   assert.match(server, /turnComplete:\s*false/);
 });
 
-test('dedicated Hebrew transcription path is present', () => {
+test('Hebrew/English code-switch transcription path is present', () => {
   assert.match(server, /model:\s*'gemini-3\.5-transcribe-live'/);
-  assert.match(server, /languageCodes:\s*\['he-IL'\]/);
-  assert.match(server, /mode:\s*'VERBATIM'/);
+  assert.match(server, /CODE_SWITCH_TRANSCRIPTION_CONFIG/);
+  assert.match(server, /he-IL/);
+  assert.match(server, /en-US/);
+  assert.match(server, /CODE_SWITCH_TRANSCRIPTION_CONFIG/);
   assert.match(server, /customVocabulary:/);
   assert.match(server, /type:\s*'stt-error'/);
 });

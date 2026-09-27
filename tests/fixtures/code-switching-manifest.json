@@ -1,0 +1,27 @@
+{
+  "policy": "preserve",
+  "liveProviderProof": {
+    "required": true,
+    "note": "Run separately with a real Gemini credential; deterministic tests do not claim provider accuracy."
+  },
+  "cases": [
+    {
+      "id": "hebrew-with-code",
+      "input": "הדיפלוי נכשל בפרודקשן, אז עשינו rollback.",
+      "expectedLanguages": ["he-IL", "en-US"],
+      "expectedTranscript": "הדיפלוי נכשל בפרודקשן, אז עשינו rollback."
+    },
+    {
+      "id": "english-with-hebrew",
+      "input": "The deploy עבר ל-production בלי rollback.",
+      "expectedLanguages": ["he-IL", "en-US"],
+      "expectedTranscript": "The deploy עבר ל-production בלי rollback."
+    },
+    {
+      "id": "english-only",
+      "input": "The incident is resolved.",
+      "expectedLanguages": ["he-IL", "en-US"],
+      "expectedTranscript": "The incident is resolved."
+    }
+  ]
+}
