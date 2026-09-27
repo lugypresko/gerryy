@@ -1772,7 +1772,7 @@ export function JerryPodcastStudio() {
       rawStems: Object.keys(finalized.rawStems),
               rawMasterBytes: finalized.rawStems.master.size,
               finalMasterBytes: finalized.finalMaster.size,
-              warnings: finalized.warnings,
+              warnings: finalized.warnings.join(' | ').slice(0, 500),
               durationMs: Math.round(finalized.metrics.durationMs),
               completedAt: new Date().toISOString(),
             });
