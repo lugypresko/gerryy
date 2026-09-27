@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import 'dotenv/config';
 import test from 'node:test';
 
 const baseUrl = process.env.RELEASE_GATE_BASE_URL || 'http://localhost:3000';
