@@ -18,6 +18,7 @@ import { createRecordingGraph, type RecordingGraph, type RecordingMetrics } from
 import { finalizeEpisode, type FinalizedEpisode } from './audio/episodeFinalizer';
 import { createRecordingSession, type RecordingSession } from './audio/recordingSession';
 import { createRecordingOutbox, type RecordingOutbox } from './audio/recordingOutbox';
+import { RecordingLibrary } from './components/RecordingLibrary';
 import {
   appendConversationTurn,
   createConversationTurnLog,
@@ -2564,6 +2565,9 @@ export function JerryPodcastStudio() {
             ))}
           </div>
         </div>
+      </div>
+      <div className="mt-4">
+        <RecordingLibrary />
       </div>
     </div>
   );
