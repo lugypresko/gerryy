@@ -15,6 +15,18 @@ Branch: `feature/jerry-live-animation-recording`
 - The monitor remains centered while recording outputs preserve speaker separation.
 - Recording produces a stereo master, dedicated Jerry/guest tracks when available, and `conversation.json` with relative turn timestamps.
 
+## Voice balance hardening baseline
+
+The recording is not publishable yet. The current baseline has these known gaps:
+
+- Jerry and the guest currently receive the same aggressive dynamics configuration, so Jerry's pauses, sighs, chuckles, and energy changes are not protected by a dedicated processing policy.
+- Microphone capture currently requests browser `autoGainControl: true` in both capture paths, while Jerry also applies application-level leveling. This can create competing gain control and unstable loudness.
+- The leveler has bounded gains and a silence gate, but the bounds are shared rather than tuned per speaker.
+- The master has a configured `-1 dB` ceiling, but there is no speech-window balance measurement proving that Guest and Jerry are within the publication threshold.
+- Recording telemetry does not yet expose per-speaker RMS/LUFS estimates, peaks, clipping counts, speech/silence duration, loudness delta, or a `publishable` / `needs-review` / `failed` decision.
+
+The failing baseline contract is captured in `tests/voice-balance-regression.test.mjs`. These tests are intentionally red until the voice-balance hardening tasks are implemented.
+
 ## Recording outputs
 
 When microphone permission is available, stopping a recording exposes:
@@ -71,13 +83,19 @@ Then open `http://localhost:3000`.
 
 ## Verification
 
-The current branch passes:
+The existing verification suite passes:
 
 ```text
-npm test        # 35 tests passing
+npm test -- tests/jerry-regression.test.mjs tests/jerry-animation.test.mjs tests/recording-regression.test.mjs
 npm run lint
 npm run build
 ```
+
+The new `tests/voice-balance-regression.test.mjs` baseline tests are intentionally
+failing until the voice-balance hardening implementation is completed. The full
+`npm test` command currently reports the existing passing tests plus four
+intentional baseline failures; those failures represent the known gaps listed
+above and must not be interpreted as a regression in the existing suite.
 
 The live WebSocket E2E path was verified for:
 
