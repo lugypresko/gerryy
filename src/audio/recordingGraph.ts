@@ -11,8 +11,8 @@ export const RECORDING_CHANNELS = {
 
 export const RECORDING_LEVEL_CONFIG = {
   targetDbfs: -18,
-  minGainDb: -6,
-  maxGainDb: 12,
+  minGainDb: -12,
+  maxGainDb: 18,
   gateDbfs: -55,
   attackMs: 20,
   releaseMs: 300,

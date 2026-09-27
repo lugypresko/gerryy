@@ -81,6 +81,8 @@ export function JerryPodcastStudio() {
   const [episodeTurnLogUrl, setEpisodeTurnLogUrl] = useState<string | null>(null);
   const [episodeFileExtension, setEpisodeFileExtension] = useState('webm');
   const [recordingNotice, setRecordingNotice] = useState<string | null>(null);
+  const [audioInputDevices, setAudioInputDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedAudioInputId, setSelectedAudioInputId] = useState('');
   const [isLiveReady, setIsLiveReady] = useState(false);
   const [isPcmDebugRecording, setIsPcmDebugRecording] = useState(false);
   const [pcmDebugAudioUrl, setPcmDebugAudioUrl] = useState<string | null>(null);
@@ -144,6 +146,27 @@ export function JerryPodcastStudio() {
   const pcmDebugRecordingRef = useRef(false);
   const getUserMediaRequestRef = useRef(0);
   const lastEnergyTransitionRef = useRef(0);
+
+  const refreshAudioInputDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const inputs = devices.filter((device) => device.kind === 'audioinput');
+      setAudioInputDevices(inputs);
+      setSelectedAudioInputId((current) => {
+        if (current && inputs.some((device) => device.deviceId === current)) return current;
+        return inputs[0]?.deviceId || '';
+      });
+    } catch (error) {
+      console.warn('[Audio] unable to enumerate input devices:', error);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshAudioInputDevices();
+    navigator.mediaDevices?.addEventListener?.('devicechange', refreshAudioInputDevices);
+    return () => navigator.mediaDevices?.removeEventListener?.('devicechange', refreshAudioInputDevices);
+  }, [refreshAudioInputDevices]);
 
   const recordingTime = useCallback(() => {
     if (recordingStartedAtRef.current === null) return 0;
@@ -397,6 +420,7 @@ export function JerryPodcastStudio() {
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
+          ...(selectedAudioInputId ? { deviceId: { exact: selectedAudioInputId } } : {}),
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
@@ -584,7 +608,7 @@ export function JerryPodcastStudio() {
 
     livePlaybackProcessorRef.current = processor;
     return processor;
-  }, [beginRecordedTurn]);
+  }, [beginRecordedTurn, selectedAudioInputId]);
 
   const playLivePcmChunk = useCallback(
     (base64: string, mimeType = 'audio/pcm;rate=24000') => {
@@ -1290,9 +1314,17 @@ export function JerryPodcastStudio() {
         // Prefer the exact same microphone stream used by the live conversation.
         // Opening a second getUserMedia stream for the master recording can trigger
         // browser DSP/echo-cancellation twice and make the guest very quiet.
+        const liveTrack = liveMicStreamRef.current?.getAudioTracks()[0];
+        const selectedDeviceMatches =
+          !selectedAudioInputId || !liveTrack?.getSettings().deviceId ||
+          liveTrack.getSettings().deviceId === selectedAudioInputId;
         if (
           liveMicStreamRef.current &&
-          liveMicStreamRef.current.getAudioTracks().some((track) => track.readyState === 'live')
+          liveTrack &&
+          liveTrack.readyState === 'live' &&
+          liveTrack.enabled &&
+          !liveTrack.muted &&
+          selectedDeviceMatches
         ) {
           micStream = liveMicStreamRef.current;
           episodeOwnsMicRef.current = false;
@@ -1300,6 +1332,7 @@ export function JerryPodcastStudio() {
         } else {
           micStream = await navigator.mediaDevices.getUserMedia({
             audio: {
+              ...(selectedAudioInputId ? { deviceId: { exact: selectedAudioInputId } } : {}),
               echoCancellation: true,
               noiseSuppression: true,
               autoGainControl: true,
@@ -1368,6 +1401,7 @@ export function JerryPodcastStudio() {
           enabled: track.enabled,
           muted: track.muted,
           readyState: track.readyState,
+            settings: track.getSettings(),
         })),
       );
 
@@ -1826,6 +1860,24 @@ export function JerryPodcastStudio() {
 
           <div className="flex items-center justify-between bg-[#232321] p-2.5 rounded-[10px] border border-[#383835] flex-wrap gap-2">
             <div className="flex items-center gap-2.5">
+                  {audioInputDevices.length > 0 && (
+                    <label className="flex items-center gap-1.5 text-[10px] text-[#BDBBB4]">
+                      <span>מיקרופון</span>
+                      <select
+                        value={selectedAudioInputId}
+                        onChange={(event) => setSelectedAudioInputId(event.target.value)}
+                        disabled={isEpisodeRecording || isRecordingMic}
+                        className="max-w-[170px] rounded border border-[#484844] bg-[#31312E] px-1.5 py-1 text-[10px] text-white disabled:opacity-50"
+                        title="בחר את התקן הקלט לפני תחילת ההקלטה"
+                      >
+                        {audioInputDevices.map((device, index) => (
+                          <option key={device.deviceId || `audio-input-${index}`} value={device.deviceId}>
+                            {device.label || `Audio input ${index + 1}`}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
               <button
                 onClick={handleToggleEpisodeRecord}
                 className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] text-[12px] font-bold transition-all cursor-pointer shadow-xs ${

@@ -9,8 +9,8 @@ test('recording channels are a stable Jerry-left and guest-right contract', () =
   assert.match(graph, /export const RECORDING_CHANNELS = \{\s*jerry:\s*0,\s*guest:\s*1,\s*\} as const;/);
   assert.match(graph, /targetDbfs:\s*-18/);
   assert.match(graph, /gateDbfs:\s*-55/);
-  assert.match(graph, /minGainDb:\s*-6/);
-  assert.match(graph, /maxGainDb:\s*12/);
+  assert.match(graph, /minGainDb:\s*-12/);
+  assert.match(graph, /maxGainDb:\s*18/);
   assert.match(graph, /attackMs:\s*20/);
   assert.match(graph, /releaseMs:\s*300/);
 });
@@ -77,4 +77,13 @@ test('episode recording creates separate speaker files and a conversation log', 
   assert.match(turnLog, /startedAt/);
   assert.match(turnLog, /endedAt/);
   assert.match(studio, /conversation\.json/);
+});
+
+test('recording exposes input-device selection and rejects muted live tracks', () => {
+  const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
+  assert.match(studio, /audioInputDevices/);
+  assert.match(studio, /selectedAudioInputId/);
+  assert.match(studio, /enumerateDevices/);
+  assert.match(studio, /deviceId:\s*\{\s*exact:\s*selectedAudioInputId/);
+  assert.match(studio, /track\.muted/);
 });
