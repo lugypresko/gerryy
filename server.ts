@@ -900,16 +900,14 @@ CRITICAL RULES:
         },
         config: {
           responseModalities: [Modality.TEXT],
-          systemInstruction:
-            'Transcribe the guest faithfully. The guest may switch between Hebrew and English, especially for technical terms. Preserve names, numbers, product names, and code terms; do not invent or translate unclear words.',
           realtimeInputConfig: {
             automaticActivityDetection: {
               disabled: true,
             },
           },
           inputAudioTranscription: {
-            languageCodes: [],
-            mode: 'SMART',
+            languageCodes: ['he-IL'],
+            mode: 'VERBATIM',
             customVocabulary: [
               'ג\'רי',
               'איתי',
@@ -1007,7 +1005,7 @@ CRITICAL RULES:
             type: 'ready',
             engine: 'gemini-3.8-live',
             engineVersion: JERRY_ENGINE_VERSION,
-                inputPath: 'push-to-talk PCM -> Gemini 3.5 Transcribe Live (auto language + SMART) -> text -> Gemini 3.8 Live -> Jerry response',
+                inputPath: 'push-to-talk PCM -> Gemini 3.5 Transcribe Live (he-IL + VERBATIM) -> text -> Gemini 3.8 Live -> Jerry response',
           }),
         );
       }
