@@ -8,3 +8,4 @@ coverage/
 !.env.example
 .api-key.json
 recordings/
+data/recordings/

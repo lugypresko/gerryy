@@ -6,6 +6,7 @@ import { createServer as createViteServer } from 'vite';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, Modality } from '@google/genai';
+import { RecordingArchiveStore } from './server/recordingStore';
 
 const PORT = 3000;
 const JERRY_ENGINE_VERSION = 'jerry-conversation-v3-2026-09-26';
@@ -76,6 +77,9 @@ function sanitizeClientDebugDetails(
   }
   return sanitized;
 }
+const recordingArchiveStore = new RecordingArchiveStore(
+  path.resolve(process.env.JERRY_RECORDINGS_DIR || path.join(process.cwd(), 'data', 'recordings')),
+);
 
 const JERRY_LIVE_SYSTEM_PROMPT = `אתה ג'רי (Jerry), המנחה של "Engineering Leaders in Real Life".
 
@@ -277,6 +281,47 @@ async function transcribeGuestTurn(ai: GoogleGenAI, chunks: Buffer[]): Promise<s
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
+
+  // Durable append-only recording archive. The manifest is the commit marker;
+  // there are intentionally no update or delete routes for archived media.
+  app.post('/api/recordings', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const decode = (value: unknown) => {
+        if (typeof value !== 'string' || !value) return undefined;
+        return Buffer.from(value, 'base64');
+      };
+      const manifest = await recordingArchiveStore.createArchive({
+        master: decode(body.masterBase64) as Buffer,
+        jerry: decode(body.jerryBase64),
+        guest: decode(body.guestBase64),
+        conversation: decode(body.conversationBase64),
+        metadata: body.metadata && typeof body.metadata === 'object' ? body.metadata : {},
+        mimeTypes: body.mimeTypes && typeof body.mimeTypes === 'object' ? body.mimeTypes : undefined,
+      });
+      res.status(201).json(manifest);
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Invalid recording archive' });
+    }
+  });
+
+  app.get('/api/recordings/:archiveId', async (req, res) => {
+    try {
+      res.json(await recordingArchiveStore.getArchive(req.params.archiveId));
+    } catch (error: any) {
+      res.status(error?.message === 'Archive not found' ? 404 : 400).json({ error: error?.message || 'Archive unavailable' });
+    }
+  });
+
+  app.get('/api/recordings/:archiveId/:asset', async (req, res) => {
+    try {
+      const result = await recordingArchiveStore.getAsset(req.params.archiveId, req.params.asset);
+      res.type(result.manifest.mimeType).send(result.data);
+    } catch (error: any) {
+      const status = /not found/i.test(error?.message || '') ? 404 : 400;
+      res.status(status).json({ error: error?.message || 'Archive asset unavailable' });
+    }
+  });
 
   // CORS & Cache-Control headers
   app.use((req, res, next) => {
