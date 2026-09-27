@@ -12,6 +12,7 @@ export interface RecordingAssetManifest {
 export interface RecordingArchiveManifest {
   id: string;
   createdAt: string;
+  status: 'ready' | 'review' | 'failed';
   assets: Record<string, RecordingAssetManifest>;
   metadata: Record<string, unknown>;
 }
@@ -22,6 +23,7 @@ export interface RecordingArchiveInput {
   guest?: Buffer;
   conversation?: Buffer;
   metadata?: Record<string, unknown>;
+  status?: 'ready' | 'review' | 'failed';
   mimeTypes?: Partial<Record<'master' | 'jerry' | 'guest' | 'conversation', string>>;
 }
 
@@ -102,6 +104,7 @@ export class RecordingArchiveStore {
       const manifest: RecordingArchiveManifest = {
         id,
         createdAt: new Date().toISOString(),
+        status: input.status || 'ready',
         assets,
         metadata,
       };
@@ -114,12 +117,36 @@ export class RecordingArchiveStore {
     }
   }
 
+  async listArchives(): Promise<RecordingArchiveManifest[]> {
+    try {
+      const entries = await fs.readdir(this.rootDir, { withFileTypes: true });
+      const archives = await Promise.all(
+        entries
+          .filter((entry) => entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name))
+          .map(async (entry) => {
+            try {
+              return await this.getArchive(entry.name);
+            } catch {
+              return null;
+            }
+          }),
+      );
+      return archives
+        .filter((archive): archive is RecordingArchiveManifest => archive !== null)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') return [];
+      throw error;
+    }
+  }
+
   async getArchive(id: string): Promise<RecordingArchiveManifest> {
     assertArchiveId(id);
     try {
       const manifest = JSON.parse(await fs.readFile(path.join(this.rootDir, id, 'manifest.json'), 'utf8'));
       if (manifest?.id !== id || !manifest.assets) throw new Error('Invalid archive manifest');
-      return manifest as RecordingArchiveManifest;
+      const status = manifest.status === 'review' || manifest.status === 'failed' ? manifest.status : 'ready';
+      return { ...manifest, status } as RecordingArchiveManifest;
     } catch (error: any) {
       if (error?.code === 'ENOENT') throw new Error('Archive not found');
       throw error;

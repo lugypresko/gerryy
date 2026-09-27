@@ -305,11 +305,25 @@ async function startServer() {
         guest: decode(body.guestBase64),
         conversation: decode(body.conversationBase64),
         metadata: body.metadata && typeof body.metadata === 'object' ? body.metadata : {},
+        status:
+          body.status === 'review' || body.status === 'needs-review'
+            ? 'review'
+            : body.status === 'failed'
+              ? 'failed'
+              : 'ready',
         mimeTypes: body.mimeTypes && typeof body.mimeTypes === 'object' ? body.mimeTypes : undefined,
       });
       res.status(201).json(manifest);
     } catch (error: any) {
       res.status(400).json({ error: error?.message || 'Invalid recording archive' });
+    }
+  });
+
+  app.get('/api/recordings', async (_req, res) => {
+    try {
+      res.json(await recordingArchiveStore.listArchives());
+    } catch (error: any) {
+      res.status(500).json({ error: error?.message || 'Recording library unavailable' });
     }
   });
 
@@ -342,6 +356,50 @@ async function startServer() {
       res.json(await recordingArchiveStore.getArchive(req.params.archiveId));
     } catch (error: any) {
       res.status(error?.message === 'Archive not found' ? 404 : 400).json({ error: error?.message || 'Archive unavailable' });
+    }
+  });
+
+  app.get('/api/recordings/:archiveId/download', async (req, res) => {
+    try {
+      const archive = await recordingArchiveStore.getArchive(req.params.archiveId);
+      if (archive.status === 'failed') {
+        return res.status(409).json({ error: 'Failed recordings are not downloadable' });
+      }
+      const result = await recordingArchiveStore.getAsset(req.params.archiveId, 'master');
+      const data = result.data;
+      const total = data.length;
+      const range = req.headers.range;
+      res.setHeader('Content-Type', result.manifest.mimeType);
+      res.setHeader('Content-Disposition', `attachment; filename="jerry-${archive.id}.webm"`);
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('ETag', `"${result.manifest.sha256}"`);
+      res.setHeader('X-Content-SHA256', result.manifest.sha256);
+
+      if (!range) {
+        res.setHeader('Content-Length', total);
+        return res.status(200).send(data);
+      }
+
+      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+      if (!match || (!match[1] && !match[2])) {
+        res.setHeader('Content-Range', `bytes */${total}`);
+        return res.status(416).end();
+      }
+      const start = match[1] ? Number(match[1]) : Math.max(0, total - Number(match[2]));
+      const end = match[2] ? Number(match[2]) : total - 1;
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || start >= total) {
+        res.setHeader('Content-Range', `bytes */${total}`);
+        return res.status(416).end();
+      }
+      const boundedEnd = Math.min(end, total - 1);
+      const chunk = data.subarray(start, boundedEnd + 1);
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${boundedEnd}/${total}`);
+      res.setHeader('Content-Length', chunk.length);
+      return res.send(chunk);
+    } catch (error: any) {
+      const status = error?.message === 'Archive not found' ? 404 : 400;
+      return res.status(status).json({ error: error?.message || 'Recording download unavailable' });
     }
   });
 
