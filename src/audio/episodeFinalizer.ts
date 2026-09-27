@@ -52,6 +52,22 @@ const DEFAULT_OPTIONS: Required<FinalizerOptions> = {
   ceilingDbfs: -1,
 };
 
+const FINALIZER_STAGE_TIMEOUT_MS = 8_000;
+
+async function withFinalizerTimeout<T>(promise: Promise<T>, stage: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${stage} timed out after ${FINALIZER_STAGE_TIMEOUT_MS}ms`)), FINALIZER_STAGE_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 const dbToLinear = (db: number) => 10 ** (db / 20);
 const linearToDb = (value: number) => (value > 0 ? 20 * Math.log10(value) : -Infinity);
 
@@ -60,7 +76,10 @@ export async function decodeAudioBlob(blob: Blob): Promise<AudioBuffer> {
   if (!AudioContextCtor) throw new Error('AudioContext is unavailable');
   const context = new AudioContextCtor();
   try {
-    return await context.decodeAudioData(await blob.arrayBuffer());
+    return await withFinalizerTimeout(
+      context.decodeAudioData(await blob.arrayBuffer()),
+      'audio decode',
+    );
   } finally {
     await context.close().catch(() => undefined);
   }
@@ -187,7 +206,7 @@ export async function renderFinalMaster(
   }
   compressor.connect(offline.destination);
   source.start(0);
-  return encodeWav(await offline.startRendering(), ceilingDbfs);
+  return encodeWav(await withFinalizerTimeout(offline.startRendering(), 'offline render'), ceilingDbfs);
 }
 
 export async function finalizeEpisode(
