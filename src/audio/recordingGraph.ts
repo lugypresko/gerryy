@@ -9,30 +9,54 @@ export const RECORDING_CHANNELS = {
   guest: 1,
 } as const;
 
-export const RECORDING_LEVEL_CONFIG = {
-  targetDbfs: -16,
-  minGainDb: -12,
-  maxGainDb: 18,
+export const GUEST_LEVEL_CONFIG = {
+  targetDbfs: -18,
+  minGainDb: -6,
+  maxGainDb: 12,
   gateDbfs: -55,
   attackMs: 20,
   releaseMs: 300,
 } as const satisfies AutoLevelerConfig;
 
-export const RECORDING_MASTER_CONFIG = {
-  ceilingDb: -1,
-  threshold: -2,
+export const JERRY_LEVEL_CONFIG = {
+  targetDbfs: -18,
+  minGainDb: -6,
+  maxGainDb: 6,
+  gateDbfs: -55,
+  attackMs: 80,
+  releaseMs: 500,
+} as const satisfies AutoLevelerConfig;
+
+interface DynamicsConfig {
+  threshold: number;
+  knee: number;
+  ratio: number;
+  attack: number;
+  release: number;
+}
+
+export const GUEST_DYNAMICS_CONFIG: DynamicsConfig = {
+  threshold: -3,
+  knee: 6,
+  ratio: 12,
+  attack: 0.003,
+  release: 0.15,
+};
+
+export const JERRY_DYNAMICS_CONFIG: DynamicsConfig = {
+  threshold: -3,
+  knee: 6,
+  ratio: 3,
+  attack: 0.01,
+  release: 0.25,
+};
+
+const MASTER_LIMITER_CONFIG = {
+  threshold: -1,
   knee: 0,
   ratio: 20,
   attack: 0.001,
   release: 0.1,
-} as const;
-
-export const RECORDING_DYNAMICS_CONFIG = {
-  threshold: -3,
-  knee: 6,
-  ratio: 20,
-  attack: 0.003,
-  release: 0.15,
 } as const;
 
 type AudioContextLike = AudioContext;
@@ -52,9 +76,6 @@ export interface RecordingGraph {
   guestChain: RecordingChannelChain | null;
   merger: ChannelMergerNode;
   destination: MediaStreamAudioDestinationNode;
-  jerryDestination: MediaStreamAudioDestinationNode;
-  guestDestination: MediaStreamAudioDestinationNode | null;
-  masterGain: GainNode;
   masterLimiter: DynamicsCompressorNode;
   /** The centered monitor mix remains an integration responsibility. */
   monitorMix: null;
@@ -70,6 +91,7 @@ function createChannelChain(
   context: AudioContextLike,
   source: AudioNodeLike,
   levelConfig: AutoLevelerConfig,
+  dynamicsConfig: DynamicsConfig,
 ): RecordingChannelChain {
   const analyser = context.createAnalyser();
   const levelGain = context.createGain();
@@ -77,11 +99,11 @@ function createChannelChain(
 
   analyser.fftSize = 1024;
   levelGain.gain.value = 1;
-  setAudioParam(context, compressor.threshold, RECORDING_DYNAMICS_CONFIG.threshold);
-  setAudioParam(context, compressor.knee, RECORDING_DYNAMICS_CONFIG.knee);
-  setAudioParam(context, compressor.ratio, RECORDING_DYNAMICS_CONFIG.ratio);
-  setAudioParam(context, compressor.attack, RECORDING_DYNAMICS_CONFIG.attack);
-  setAudioParam(context, compressor.release, RECORDING_DYNAMICS_CONFIG.release);
+  setAudioParam(context, compressor.threshold, dynamicsConfig.threshold);
+  setAudioParam(context, compressor.knee, dynamicsConfig.knee);
+  setAudioParam(context, compressor.ratio, dynamicsConfig.ratio);
+  setAudioParam(context, compressor.attack, dynamicsConfig.attack);
+  setAudioParam(context, compressor.release, dynamicsConfig.release);
 
   source.connect(analyser);
   analyser.connect(levelGain);
@@ -106,13 +128,23 @@ function readRmsSamples(analyser: AnalyserNode): Float32Array {
 export function createRecordingGraph(
   context: AudioContextLike,
   sources: { jerry: AudioNodeLike; guest?: AudioNodeLike | null },
-  levelConfig: AutoLevelerConfig = RECORDING_LEVEL_CONFIG,
 ): RecordingGraph {
-  const jerryChain = createChannelChain(context, sources.jerry, levelConfig);
+  const jerryChain = createChannelChain(
+    context,
+    sources.jerry,
+    JERRY_LEVEL_CONFIG,
+    JERRY_DYNAMICS_CONFIG,
+  );
   const guestChain = sources.guest
-    ? createChannelChain(context, sources.guest, levelConfig)
+    ? createChannelChain(
+      context,
+      sources.guest,
+      GUEST_LEVEL_CONFIG,
+      GUEST_DYNAMICS_CONFIG,
+    )
     : null;
   const merger = context.createChannelMerger(2);
+  const masterLimiter = context.createDynamicsCompressor();
   const destination = context.createMediaStreamDestination();
   const jerryDestination = context.createMediaStreamDestination();
   const guestDestination = guestChain ? context.createMediaStreamDestination() : null;
@@ -128,22 +160,22 @@ export function createRecordingGraph(
   setAudioParam(context, masterLimiter.attack, RECORDING_MASTER_CONFIG.attack);
   setAudioParam(context, masterLimiter.release, RECORDING_MASTER_CONFIG.release);
 
+  setAudioParam(context, masterLimiter.threshold, MASTER_LIMITER_CONFIG.threshold);
+  setAudioParam(context, masterLimiter.knee, MASTER_LIMITER_CONFIG.knee);
+  setAudioParam(context, masterLimiter.ratio, MASTER_LIMITER_CONFIG.ratio);
+  setAudioParam(context, masterLimiter.attack, MASTER_LIMITER_CONFIG.attack);
+  setAudioParam(context, masterLimiter.release, MASTER_LIMITER_CONFIG.release);
+
   jerryChain.output.connect(merger, 0, RECORDING_CHANNELS.jerry);
   if (guestChain) guestChain.output.connect(merger, 0, RECORDING_CHANNELS.guest);
-  merger.connect(masterGain);
-  masterGain.connect(masterLimiter);
+  merger.connect(masterLimiter);
   masterLimiter.connect(destination);
-  jerryChain.output.connect(jerryDestination);
-  if (guestChain && guestDestination) guestChain.output.connect(guestDestination);
 
   return {
     jerryChain,
     guestChain,
     merger,
     destination,
-    jerryDestination,
-    guestDestination,
-    masterGain,
     masterLimiter,
     monitorMix: null,
     update(elapsedMs: number) {
@@ -173,7 +205,6 @@ export function createRecordingGraph(
         guestChain.compressor.disconnect();
       }
       merger.disconnect();
-      masterGain.disconnect();
       masterLimiter.disconnect();
       destination.disconnect();
       jerryDestination.disconnect();

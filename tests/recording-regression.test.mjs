@@ -7,12 +7,36 @@ const leveler = fs.readFileSync('src/audio/autoLeveler.ts', 'utf8');
 
 test('recording channels are a stable Jerry-left and guest-right contract', () => {
   assert.match(graph, /export const RECORDING_CHANNELS = \{\s*jerry:\s*0,\s*guest:\s*1,\s*\} as const;/);
-  assert.match(graph, /targetDbfs:\s*-16/);
-  assert.match(graph, /gateDbfs:\s*-55/);
-  assert.match(graph, /minGainDb:\s*-12/);
-  assert.match(graph, /maxGainDb:\s*18/);
-  assert.match(graph, /attackMs:\s*20/);
-  assert.match(graph, /releaseMs:\s*300/);
+});
+
+test('recording channels use bounded, intentionally different level configurations', () => {
+  const guestConfig = graph.match(/export const GUEST_LEVEL_CONFIG = \{([\s\S]*?)\} as const/);
+  const jerryConfig = graph.match(/export const JERRY_LEVEL_CONFIG = \{([\s\S]*?)\} as const/);
+
+  assert.ok(guestConfig, 'guest level config should be exported');
+  assert.ok(jerryConfig, 'Jerry level config should be exported');
+  assert.match(guestConfig[1], /targetDbfs:\s*-18/);
+  assert.match(guestConfig[1], /gateDbfs:\s*-55/);
+  assert.match(guestConfig[1], /minGainDb:\s*-6/);
+  assert.match(guestConfig[1], /maxGainDb:\s*(?:[0-9]|1[0-2])\b/);
+  assert.match(jerryConfig[1], /targetDbfs:\s*-18/);
+  assert.match(jerryConfig[1], /gateDbfs:\s*-55/);
+  assert.match(jerryConfig[1], /minGainDb:\s*-6/);
+  assert.match(jerryConfig[1], /maxGainDb:\s*(?:[0-6])\b/);
+  assert.notEqual(guestConfig[1].match(/maxGainDb:\s*(-?\d+)/)[1], jerryConfig[1].match(/maxGainDb:\s*(-?\d+)/)[1]);
+});
+
+test('recording channels use separate dynamics configurations with lighter, slower Jerry processing', () => {
+  const guestConfig = graph.match(/export const GUEST_DYNAMICS_CONFIG[^=]*= \{([\s\S]*?)\};/);
+  const jerryConfig = graph.match(/export const JERRY_DYNAMICS_CONFIG[^=]*= \{([\s\S]*?)\};/);
+
+  assert.ok(guestConfig, 'guest dynamics config should be exported');
+  assert.ok(jerryConfig, 'Jerry dynamics config should be exported');
+  assert.notEqual(guestConfig[1], jerryConfig[1]);
+  assert.match(guestConfig[1], /ratio:\s*(?:[4-9]|1\d|2\d)/);
+  assert.match(jerryConfig[1], /ratio:\s*(?:1|2|3|4)(?:\.\d+)?/);
+  assert.match(jerryConfig[1], /attack:\s*0\.01/);
+  assert.match(jerryConfig[1], /release:\s*0\.25/);
 });
 
 test('RMS leveler is pure, gated, bounded, and smoothed', () => {
@@ -32,13 +56,22 @@ test('recording graph creates independent source chains with compressors', () =>
   assert.match(graph, /createDynamicsCompressor\(\)/);
   assert.match(graph, /jerryChain\.compressor/);
   assert.match(graph, /guestChain\.compressor/);
+  assert.match(graph, /createChannelChain\([\s\S]*?sources\.jerry,[\s\S]*?JERRY_LEVEL_CONFIG,[\s\S]*?JERRY_DYNAMICS_CONFIG,[\s\S]*?\)/);
+  assert.match(graph, /createChannelChain\([\s\S]*?sources\.guest,[\s\S]*?GUEST_LEVEL_CONFIG,[\s\S]*?GUEST_DYNAMICS_CONFIG,[\s\S]*?\)/);
 });
 
 test('merger routes Jerry to channel zero and guest to channel one', () => {
   assert.match(graph, /jerryChain\.output\.connect\(merger, 0, RECORDING_CHANNELS\.jerry\)/);
   assert.match(graph, /guestChain\.output\.connect\(merger, 0, RECORDING_CHANNELS\.guest\)/);
-  assert.match(graph, /merger\.connect\(masterGain\)/);
+  assert.match(graph, /merger\.connect\(masterLimiter\)/);
+  assert.match(graph, /masterLimiter\.connect\(destination\)/);
   assert.match(graph, /createMediaStreamDestination\(\)/);
+});
+
+test('master limiter is the final recording safety boundary', () => {
+  assert.match(graph, /const MASTER_LIMITER_CONFIG = \{[\s\S]*?threshold:\s*-1/);
+  assert.match(graph, /const MASTER_LIMITER_CONFIG = \{[\s\S]*?ratio:\s*20/);
+  assert.match(graph, /merger\.connect\(masterLimiter\);\s*masterLimiter\.connect\(destination\);/);
 });
 
 test('recording graph exposes cleanup without owning the centered monitor mix', () => {

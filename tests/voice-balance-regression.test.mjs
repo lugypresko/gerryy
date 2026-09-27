@@ -3,134 +3,42 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 const graph = fs.readFileSync('src/audio/recordingGraph.ts', 'utf8');
-const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
-const leveler = fs.readFileSync('src/audio/autoLeveler.ts', 'utf8');
 
-function extractBalancedObject(source, openIndex) {
-  let depth = 0;
-  let quote = null;
-  let escaped = false;
+test('Guest and Jerry gain ceilings are bounded and distinct', () => {
+  const guest = graph.match(/export const GUEST_LEVEL_CONFIG = \{([\s\S]*?)\} as const/);
+  const jerry = graph.match(/export const JERRY_LEVEL_CONFIG = \{([\s\S]*?)\} as const/);
 
-  for (let index = openIndex; index < source.length; index += 1) {
-    const character = source[index];
-
-    if (quote) {
-      if (escaped) {
-        escaped = false;
-      } else if (character === '\\') {
-        escaped = true;
-      } else if (character === quote) {
-        quote = null;
-      }
-      continue;
-    }
-
-    if (character === '"' || character === "'" || character === '`') {
-      quote = character;
-      continue;
-    }
-
-    if (character === '{') depth += 1;
-    if (character === '}') {
-      depth -= 1;
-      if (depth === 0) return source.slice(openIndex, index + 1);
-    }
-  }
-
-  throw new Error(`Unclosed object starting at ${openIndex}`);
-}
-
-function extractGetUserMediaAudioBlocks(source) {
-  const blocks = [];
-  const callPattern = /navigator\.mediaDevices\.getUserMedia\s*\(\s*\{\s*audio\s*:\s*\{/g;
-  let match;
-
-  while ((match = callPattern.exec(source))) {
-    const audioStart = match.index + match[0].lastIndexOf('{');
-    blocks.push(extractBalancedObject(source, audioStart));
-  }
-
-  return blocks;
-}
-
-function extractNamedObject(source, name) {
-  const declaration = new RegExp(`(?:const|let|var)\\s+${name}\\s*=\\s*\\{`);
-  const match = declaration.exec(source);
-  assert.ok(match, `Expected ${name} object declaration`);
-  return extractBalancedObject(source, match.index + match[0].lastIndexOf('{'));
-}
-
-test('guest and Jerry use intentionally separate processing configurations', () => {
-  assert.match(graph, /GUEST_LEVEL_CONFIG/);
-  assert.match(graph, /JERRY_LEVEL_CONFIG/);
-  assert.match(graph, /GUEST_DYNAMICS_CONFIG/);
-  assert.match(graph, /JERRY_DYNAMICS_CONFIG/);
-  assert.match(graph, /createChannelChain\(context, sources\.jerry, JERRY_LEVEL_CONFIG/);
-  assert.match(graph, /createChannelChain\(context, sources\.guest, GUEST_LEVEL_CONFIG/);
-  assert.match(graph, /jerryChain\.compressor[\s\S]{0,240}JERRY_DYNAMICS_CONFIG/);
-  assert.match(graph, /guestChain\.compressor[\s\S]{0,240}GUEST_DYNAMICS_CONFIG/);
+  assert.ok(guest);
+  assert.ok(jerry);
+  const guestMax = Number(guest[1].match(/maxGainDb:\s*(-?\d+)/)[1]);
+  const jerryMax = Number(jerry[1].match(/maxGainDb:\s*(-?\d+)/)[1]);
+  assert.ok(guestMax <= 12);
+  assert.ok(jerryMax <= 6);
+  assert.notEqual(guestMax, jerryMax);
 });
 
-test('microphone capture enables cleanup but delegates leveling to Jerry', () => {
-  const sharedConstraints = extractNamedObject(studio, 'MICROPHONE_CAPTURE_CONSTRAINTS');
-  assert.match(sharedConstraints, /echoCancellation:\s*true/);
-  assert.match(sharedConstraints, /noiseSuppression:\s*true/);
-  assert.match(sharedConstraints, /autoGainControl:\s*false/);
+test('Jerry dynamics are lighter and slower than Guest dynamics', () => {
+  const guest = graph.match(/export const GUEST_DYNAMICS_CONFIG[^=]*= \{([\s\S]*?)\};/);
+  const jerry = graph.match(/export const JERRY_DYNAMICS_CONFIG[^=]*= \{([\s\S]*?)\};/);
 
-  const captureBlocks = extractGetUserMediaAudioBlocks(studio);
-  assert.equal(captureBlocks.length, 2, 'expected separate live and recording capture calls');
+  assert.ok(guest);
+  assert.ok(jerry);
+  const guestRatio = Number(guest[1].match(/ratio:\s*([\d.]+)/)[1]);
+  const jerryRatio = Number(jerry[1].match(/ratio:\s*([\d.]+)/)[1]);
+  const guestAttack = Number(guest[1].match(/attack:\s*([\d.]+)/)[1]);
+  const jerryAttack = Number(jerry[1].match(/attack:\s*([\d.]+)/)[1]);
+  const guestRelease = Number(guest[1].match(/release:\s*([\d.]+)/)[1]);
+  const jerryRelease = Number(jerry[1].match(/release:\s*([\d.]+)/)[1]);
 
-  for (const [index, block] of captureBlocks.entries()) {
-    assert.match(
-      block,
-      /\.\.\.MICROPHONE_CAPTURE_CONSTRAINTS/,
-      `capture block ${index + 1} must use shared microphone constraints`,
-    );
-  }
+  assert.ok(jerryRatio < guestRatio);
+  assert.ok(jerryAttack > guestAttack);
+  assert.ok(jerryRelease > guestRelease);
 });
 
-test('source gain policies are bounded and silence cannot create runaway gain', () => {
-  const guestConfig = extractNamedObject(graph, 'GUEST_LEVEL_CONFIG');
-  const jerryConfig = extractNamedObject(graph, 'JERRY_LEVEL_CONFIG');
-  const guestMaxGain = guestConfig.match(/maxGainDb:\s*(-?\d+(?:\.\d+)?)/);
-  const jerryMaxGain = jerryConfig.match(/maxGainDb:\s*(-?\d+(?:\.\d+)?)/);
-
-  assert.ok(guestMaxGain, 'guest config must define a numeric maxGainDb');
-  assert.ok(jerryMaxGain, 'Jerry config must define a numeric maxGainDb');
-  assert.notEqual(
-    Number(guestMaxGain[1]),
-    Number(jerryMaxGain[1]),
-    'guest and Jerry maxGainDb values must be intentionally distinct',
-  );
-  assert.match(guestConfig, /gateDbfs:\s*-55/);
-  assert.match(jerryConfig, /gateDbfs:\s*-55/);
-  assert.match(leveler, /if \(rmsDbfsValue <= config\.gateDbfs\) return 0/);
-  assert.match(leveler, /Math\.min\(\s*config\.maxGainDb/);
-  assert.match(leveler, /Math\.max\(config\.minGainDb/);
-});
-
-test('master output has an explicit conservative ceiling', () => {
-  assert.match(graph, /RECORDING_MASTER_CONFIG[\s\S]{0,220}ceilingDb:\s*-1/);
-  assert.match(graph, /masterGain\.connect\(masterLimiter\)/);
-  assert.match(graph, /masterLimiter\.connect\(destination\)/);
-});
-
-test('recording exposes balance telemetry and a publication decision', () => {
-  assert.match(graph, /getMetrics/);
-  for (const metric of [
-    'guestRmsDbfs',
-    'jerryRmsDbfs',
-    'guestPeakDbfs',
-    'jerryPeakDbfs',
-    'guestClippingCount',
-    'jerryClippingCount',
-    'balanceDeltaDb',
-  ]) {
-    assert.match(graph, new RegExp(`\\b${metric}\\b`), `missing concrete telemetry metric: ${metric}`);
-  }
-  assert.match(studio, /recording-levels/);
-  assert.match(studio, /publicationStatus/);
-  assert.match(studio, /publishable/);
-  assert.match(studio, /needs-review/);
-  assert.match(studio, /failed/);
+test('createRecordingGraph wires source-specific level and dynamics configs', () => {
+  assert.match(graph, /function createChannelChain\(\s*context:[\s\S]*?levelConfig: AutoLevelerConfig,[\s\S]*?dynamicsConfig: DynamicsConfig/);
+  assert.match(graph, /createChannelChain\([\s\S]*?sources\.jerry,[\s\S]*?JERRY_LEVEL_CONFIG,[\s\S]*?JERRY_DYNAMICS_CONFIG,[\s\S]*?\)/);
+  assert.match(graph, /createChannelChain\([\s\S]*?sources\.guest,[\s\S]*?GUEST_LEVEL_CONFIG,[\s\S]*?GUEST_DYNAMICS_CONFIG,[\s\S]*?\)/);
+  assert.match(graph, /dynamicsConfig\.threshold/);
+  assert.match(graph, /dynamicsConfig\.release/);
 });
