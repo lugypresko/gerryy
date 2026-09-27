@@ -233,7 +233,10 @@ export function createRecordingGraph(
 
   let jerryLevelGainDb = 0;
   let guestLevelGainDb = 0;
-  const metrics: RecordingMetrics = {
+  const metrics: Pick<
+    RecordingMetrics,
+    'guestPreampDb' | 'jerryPreampDb' | 'guestLevelGainDb' | 'jerryLevelGainDb'
+  > = {
     guestPreampDb: guestChain
       ? Math.min(GUEST_PREAMP_CONFIG.defaultGainDb, GUEST_PREAMP_CONFIG.maxGainDb)
       : 0,
