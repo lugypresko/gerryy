@@ -60,3 +60,21 @@ test('microphone failure falls back to a Jerry-only recording graph', () => {
   assert.match(studio, /createRecordingGraph\(ctx, \{ jerry: jerryRecordingInputRef\.current, guest: null \}\)/);
   assert.match(studio, /recordingModeRef\.current = 'jerry-only'/);
 });
+
+test('recording graph exposes independent Jerry and guest destinations', () => {
+  assert.match(graph, /jerryDestination: MediaStreamAudioDestinationNode/);
+  assert.match(graph, /guestDestination: MediaStreamAudioDestinationNode \| null/);
+  assert.match(graph, /jerryChain\.output\.connect\(jerryDestination\)/);
+  assert.match(graph, /guestChain\.output\.connect\(guestDestination\)/);
+});
+
+test('episode recording creates separate speaker files and a conversation log', () => {
+  const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
+  const turnLog = fs.readFileSync('src/audio/turnLog.ts', 'utf8');
+  assert.match(studio, /jerryTrackRecorderRef/);
+  assert.match(studio, /guestTrackRecorderRef/);
+  assert.match(studio, /episodeTurnLogUrl/);
+  assert.match(turnLog, /startedAt/);
+  assert.match(turnLog, /endedAt/);
+  assert.match(studio, /conversation\.json/);
+});

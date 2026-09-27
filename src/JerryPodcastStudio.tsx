@@ -16,6 +16,12 @@ import {
 } from 'lucide-react';
 import { createRecordingGraph, type RecordingGraph } from './audio/recordingGraph';
 import {
+  appendConversationTurn,
+  createConversationTurnLog,
+  type ConversationSpeaker,
+  type ConversationTurnLogEntry,
+} from './audio/turnLog';
+import {
   JERRY_MOUTH_ANCHORS,
   JERRY_POSES,
   JERRY_POSE_CROSSFADE_MS,
@@ -70,6 +76,9 @@ export function JerryPodcastStudio() {
   const [isEpisodeRecording, setIsEpisodeRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [episodeAudioUrl, setEpisodeAudioUrl] = useState<string | null>(null);
+  const [episodeJerryAudioUrl, setEpisodeJerryAudioUrl] = useState<string | null>(null);
+  const [episodeGuestAudioUrl, setEpisodeGuestAudioUrl] = useState<string | null>(null);
+  const [episodeTurnLogUrl, setEpisodeTurnLogUrl] = useState<string | null>(null);
   const [episodeFileExtension, setEpisodeFileExtension] = useState('webm');
   const [recordingNotice, setRecordingNotice] = useState<string | null>(null);
   const [isLiveReady, setIsLiveReady] = useState(false);
@@ -92,6 +101,13 @@ export function JerryPodcastStudio() {
   // Mixer refs for recording both Mic + Jerry
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
+  const jerryTrackRecorderRef = useRef<MediaRecorder | null>(null);
+  const guestTrackRecorderRef = useRef<MediaRecorder | null>(null);
+  const jerryTrackChunksRef = useRef<Blob[]>([]);
+  const guestTrackChunksRef = useRef<Blob[]>([]);
+  const recordingStartedAtRef = useRef<number | null>(null);
+  const turnLogRef = useRef<ConversationTurnLogEntry[]>(createConversationTurnLog());
+  const activeTurnRef = useRef<{ speaker: ConversationSpeaker; startedAt: number; text: string } | null>(null);
   const recordingGraphRef = useRef<RecordingGraph | null>(null);
   const jerryRecordingInputRef = useRef<GainNode | null>(null);
   const jerryPlaybackGainRef = useRef<GainNode | null>(null);
@@ -128,6 +144,34 @@ export function JerryPodcastStudio() {
   const pcmDebugRecordingRef = useRef(false);
   const getUserMediaRequestRef = useRef(0);
   const lastEnergyTransitionRef = useRef(0);
+
+  const recordingTime = useCallback(() => {
+    if (recordingStartedAtRef.current === null) return 0;
+    return (performance.now() - recordingStartedAtRef.current) / 1000;
+  }, []);
+
+  const endRecordedTurn = useCallback((text = '') => {
+    const active = activeTurnRef.current;
+    if (!active || recordingStartedAtRef.current === null) return;
+    turnLogRef.current = appendConversationTurn(
+      turnLogRef.current,
+      active.speaker,
+      text || active.text,
+      active.startedAt,
+      recordingTime(),
+    );
+    activeTurnRef.current = null;
+  }, [recordingTime]);
+
+  const beginRecordedTurn = useCallback((speaker: ConversationSpeaker, text = '') => {
+    if (recordingStartedAtRef.current === null) return;
+    if (activeTurnRef.current?.speaker === speaker) {
+      if (text) activeTurnRef.current.text = text;
+      return;
+    }
+    endRecordedTurn();
+    activeTurnRef.current = { speaker, startedAt: recordingTime(), text };
+  }, [endRecordedTurn, recordingTime]);
 
   const transitionAnimation = useCallback((event: JerryAnimationEvent) => {
     setAnimationState((current) => nextAnimationState(current, event));
@@ -282,6 +326,7 @@ export function JerryPodcastStudio() {
   }, []);
 
   const stopLiveMic = useCallback(() => {
+    endRecordedTurn(liveInputTranscriptRef.current);
     getUserMediaRequestRef.current += 1;
     liveMicActiveRef.current = false;
 
@@ -316,7 +361,7 @@ export function JerryPodcastStudio() {
     }
 
     setIsRecordingMic(false);
-  }, []);
+  }, [endRecordedTurn]);
 
   const startLiveMic = useCallback(async () => {
     if (!isLiveReady || liveSocketRef.current?.readyState !== WebSocket.OPEN) return;
@@ -336,6 +381,7 @@ export function JerryPodcastStudio() {
     setIsRecordingMic(true);
     setErrorNotice(null);
     liveInputTranscriptRef.current = '';
+    beginRecordedTurn('guest');
     liveUserTurnCommittedRef.current = false;
     setMicTranscript('');
     setInputText('');
@@ -538,7 +584,7 @@ export function JerryPodcastStudio() {
 
     livePlaybackProcessorRef.current = processor;
     return processor;
-  }, []);
+  }, [beginRecordedTurn]);
 
   const playLivePcmChunk = useCallback(
     (base64: string, mimeType = 'audio/pcm;rate=24000') => {
@@ -552,6 +598,7 @@ export function JerryPodcastStudio() {
       }
 
       const bytes = base64ToBytes(base64);
+      beginRecordedTurn('jerry');
       livePcmChunksRef.current.push(bytes);
 
       const sampleCount = Math.floor(bytes.byteLength / 2);
@@ -598,7 +645,7 @@ export function JerryPodcastStudio() {
       transitionAnimation('output-audio');
       setJerryPose('speaking');
     },
-    [isMuted, ensureLivePlaybackProcessor, transitionAnimation],
+    [beginRecordedTurn, isMuted, ensureLivePlaybackProcessor, transitionAnimation],
   );
 
   // Open one persistent Gemini Live session for the podcast instead of doing
@@ -709,6 +756,7 @@ export function JerryPodcastStudio() {
 
           if (msg.type === 'turn-complete') {
             const replyText = liveTranscriptRef.current.trim() || '...';
+            endRecordedTurn(replyText);
             const audioUrl = pcm16ChunksToWavUrl(livePcmChunksRef.current);
 
             setMessages((prev) => [
@@ -789,7 +837,7 @@ export function JerryPodcastStudio() {
       } catch {}
       liveSocketRef.current = null;
     };
-  }, [playLivePcmChunk, commitLiveUserTurn, transitionAnimation]);
+  }, [playLivePcmChunk, commitLiveUserTurn, endRecordedTurn, transitionAnimation]);
 
   // Episode Recording Timer
   useEffect(() => {
@@ -872,6 +920,13 @@ export function JerryPodcastStudio() {
         recorder.stop();
       } catch {}
     }
+    [jerryTrackRecorderRef.current, guestTrackRecorderRef.current].forEach((trackRecorder) => {
+      if (trackRecorder && trackRecorder.state !== 'inactive') {
+        try { trackRecorder.stop(); } catch {}
+      }
+    });
+    jerryTrackRecorderRef.current = null;
+    guestTrackRecorderRef.current = null;
     // Keep the direct teardown path explicit for browsers with a partially initialized recorder.
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'inactive') {
       mediaRecorderRef.current?.stop();
@@ -891,8 +946,11 @@ export function JerryPodcastStudio() {
     if (pcmDebugStopTimerRef.current) window.clearTimeout(pcmDebugStopTimerRef.current);
     pcmDebugRecordingRef.current = false;
     if (episodeAudioUrl) URL.revokeObjectURL(episodeAudioUrl);
+    if (episodeJerryAudioUrl) URL.revokeObjectURL(episodeJerryAudioUrl);
+    if (episodeGuestAudioUrl) URL.revokeObjectURL(episodeGuestAudioUrl);
+    if (episodeTurnLogUrl) URL.revokeObjectURL(episodeTurnLogUrl);
     if (pcmDebugAudioUrl) URL.revokeObjectURL(pcmDebugAudioUrl);
-  }, [stopLiveMic, cleanupRecordingResources, episodeAudioUrl, pcmDebugAudioUrl]);
+  }, [stopLiveMic, cleanupRecordingResources, episodeAudioUrl, episodeJerryAudioUrl, episodeGuestAudioUrl, episodeTurnLogUrl, pcmDebugAudioUrl]);
 
   useEffect(() => {
     const preloaders = Object.values(JERRY_POSES).map((src) => {
@@ -1055,6 +1113,7 @@ export function JerryPodcastStudio() {
 
   const playJerryAudio = (audioSrc: string, pose: 'speaking' | 'phone' = 'speaking') => {
     if (isMuted) return;
+    beginRecordedTurn('jerry');
 
     // Audio-source invariant: replay/opening/fallback audio must never overlap
     // with the streamed Gemini Live voice.
@@ -1079,6 +1138,7 @@ export function JerryPodcastStudio() {
     setJerryPose(pose);
 
     audio.onended = () => {
+      endRecordedTurn();
       setIsJerrySpeaking(false);
       transitionAnimation('turn-complete');
       setJerryPose('listening');
@@ -1086,6 +1146,7 @@ export function JerryPodcastStudio() {
       setMouthOpenAmount(0);
     };
     audio.onerror = () => {
+      endRecordedTurn();
       setIsJerrySpeaking(false);
       transitionAnimation('turn-complete');
       setJerryPose('listening');
@@ -1096,6 +1157,7 @@ export function JerryPodcastStudio() {
     audio.play().catch((err) => {
       console.warn('Audio play prevented:', err);
       setIsJerrySpeaking(false);
+      endRecordedTurn();
       transitionAnimation('turn-complete');
       setJerryPose('listening');
     });
@@ -1173,6 +1235,12 @@ export function JerryPodcastStudio() {
         try {
           console.info('[Podcast Recorder] stopping', { state: recorder.state, mimeType: recorder.mimeType });
           recorder.stop();
+          [jerryTrackRecorderRef.current, guestTrackRecorderRef.current].forEach((trackRecorder) => {
+            if (trackRecorder && trackRecorder.state !== 'inactive') {
+              try { trackRecorder.stop(); } catch {}
+            }
+          });
+          endRecordedTurn();
           setRecordingNotice('מסיים ושומר את ההקלטה...');
         } catch (e) {
           console.error('[Podcast Recorder] error stopping MediaRecorder:', e);
@@ -1193,7 +1261,15 @@ export function JerryPodcastStudio() {
     if (episodeAudioUrl) {
       URL.revokeObjectURL(episodeAudioUrl);
     }
+    if (episodeJerryAudioUrl) URL.revokeObjectURL(episodeJerryAudioUrl);
+    if (episodeGuestAudioUrl) URL.revokeObjectURL(episodeGuestAudioUrl);
+    if (episodeTurnLogUrl) URL.revokeObjectURL(episodeTurnLogUrl);
     setEpisodeAudioUrl(null);
+    setEpisodeJerryAudioUrl(null);
+    setEpisodeGuestAudioUrl(null);
+    setEpisodeTurnLogUrl(null);
+    turnLogRef.current = createConversationTurnLog();
+    activeTurnRef.current = null;
     setRecordingNotice(null);
 
     try {
@@ -1327,6 +1403,8 @@ export function JerryPodcastStudio() {
 
       setEpisodeFileExtension(extension);
       recordedChunksRef.current = [];
+      jerryTrackChunksRef.current = [];
+      guestTrackChunksRef.current = [];
 
       mediaRecorder.onstart = () => {
         console.info('[Podcast Recorder] started', { mimeType: actualMime, tracks: tracks.length });
@@ -1363,23 +1441,61 @@ export function JerryPodcastStudio() {
             setErrorNotice('ההקלטה נעצרה אך לא נלכדו נתוני שמע.');
             setRecordingNotice(null);
           }
+          const logBlob = new Blob([JSON.stringify(turnLogRef.current, null, 2)], { type: 'application/json' });
+          setEpisodeTurnLogUrl(URL.createObjectURL(logBlob));
         } finally {
           // Only now is it safe to release the microphone source.
           cleanupRecordingGraph();
           stopMicTracks();
           mediaRecorderRef.current = null;
+          jerryTrackRecorderRef.current = null;
+          guestTrackRecorderRef.current = null;
+          recordingStartedAtRef.current = null;
+          activeTurnRef.current = null;
           recordedChunksRef.current = [];
+          jerryTrackChunksRef.current = [];
+          guestTrackChunksRef.current = [];
         }
       };
+
+      const createSpeakerRecorder = (
+        stream: MediaStream,
+        speaker: 'jerry' | 'guest',
+      ) => {
+        const speakerRecorder = new MediaRecorder(stream, options);
+        const chunks = speaker === 'jerry' ? jerryTrackChunksRef.current : guestTrackChunksRef.current;
+        speakerRecorder.ondataavailable = (event) => {
+          if (event.data && event.data.size > 0) chunks.push(event.data);
+        };
+        speakerRecorder.onstop = () => {
+          const blob = new Blob(chunks, { type: speakerRecorder.mimeType || actualMime });
+          if (!blob.size) return;
+          const url = URL.createObjectURL(blob);
+          if (speaker === 'jerry') setEpisodeJerryAudioUrl(url);
+          else setEpisodeGuestAudioUrl(url);
+        };
+        speakerRecorder.start();
+        return speakerRecorder;
+      };
+
+      const activeRecordingGraph = recordingGraphRef.current;
+      if (!activeRecordingGraph) throw new Error('Recording graph disappeared before recorder start.');
+      jerryTrackRecorderRef.current = createSpeakerRecorder(activeRecordingGraph.jerryDestination.stream, 'jerry');
+      guestTrackRecorderRef.current = activeRecordingGraph.guestDestination
+        ? createSpeakerRecorder(activeRecordingGraph.guestDestination.stream, 'guest')
+        : null;
 
       // Let the browser own final chunking. This is more reliable for short podcast recordings.
       mediaRecorder.start();
       mediaRecorderRef.current = mediaRecorder;
+      recordingStartedAtRef.current = performance.now();
       setIsEpisodeRecording(true);
     } catch (err: any) {
       console.error('[Podcast Recorder] setup error:', err);
       stopMicTracks();
       mediaRecorderRef.current = null;
+      recordingStartedAtRef.current = null;
+      activeTurnRef.current = null;
       setErrorNotice(err.message || 'שגיאה בהפעלת ההקלטה. ודא הרשאת מיקרופון בדפדפן.');
       setIsEpisodeRecording(false);
     }
@@ -1389,6 +1505,9 @@ export function JerryPodcastStudio() {
   const handleSubmitTurn = async (userTextToSubmit?: string) => {
     const text = (userTextToSubmit || inputText).trim();
     if (!text || isJerryThinking) return;
+
+    beginRecordedTurn('guest', text);
+    endRecordedTurn(text);
 
     if (isRecordingMic && recognitionRef.current) {
       try {
@@ -1478,6 +1597,8 @@ export function JerryPodcastStudio() {
       if (audioUrl) {
         playJerryAudio(audioUrl, isPhonePose ? 'phone' : 'speaking');
       } else {
+        beginRecordedTurn('jerry', replyText);
+        endRecordedTurn(replyText);
         transitionAnimation('turn-complete');
         setJerryPose('listening');
       }
@@ -1497,8 +1618,16 @@ export function JerryPodcastStudio() {
     livePlaybackReadOffsetRef.current = 0;
     liveQueuedSamplesRef.current = 0;
     if (episodeAudioUrl) URL.revokeObjectURL(episodeAudioUrl);
+    if (episodeJerryAudioUrl) URL.revokeObjectURL(episodeJerryAudioUrl);
+    if (episodeGuestAudioUrl) URL.revokeObjectURL(episodeGuestAudioUrl);
+    if (episodeTurnLogUrl) URL.revokeObjectURL(episodeTurnLogUrl);
     if (pcmDebugAudioUrl) URL.revokeObjectURL(pcmDebugAudioUrl);
     setEpisodeAudioUrl(null);
+    setEpisodeJerryAudioUrl(null);
+    setEpisodeGuestAudioUrl(null);
+    setEpisodeTurnLogUrl(null);
+    turnLogRef.current = createConversationTurnLog();
+    activeTurnRef.current = null;
     setPcmDebugAudioUrl(null);
     if (audioPlayerRef.current) {
       audioPlayerRef.current.pause();
@@ -1732,6 +1861,21 @@ export function JerryPodcastStudio() {
                 <span>הורד פרק מלא (Audio)</span>
               </a>
             )}
+                {episodeJerryAudioUrl && (
+                  <a href={episodeJerryAudioUrl} download={`jerry-track.${episodeFileExtension}`} className="text-[11px] underline text-emerald-300">
+                    הורד ערוץ ג׳רי
+                  </a>
+                )}
+                {episodeGuestAudioUrl && (
+                  <a href={episodeGuestAudioUrl} download={`guest-track.${episodeFileExtension}`} className="text-[11px] underline text-emerald-300">
+                    הורד ערוץ אורח
+                  </a>
+                )}
+                {episodeTurnLogUrl && (
+                  <a href={episodeTurnLogUrl} download="conversation.json" className="text-[11px] underline text-amber-300">
+                    הורד יומן תורות
+                  </a>
+                )}
           </div>
 
           <div className="flex items-center justify-between text-[11px] text-[#A8A7A1] flex-wrap gap-2">

@@ -43,6 +43,8 @@ export interface RecordingGraph {
   guestChain: RecordingChannelChain | null;
   merger: ChannelMergerNode;
   destination: MediaStreamAudioDestinationNode;
+  jerryDestination: MediaStreamAudioDestinationNode;
+  guestDestination: MediaStreamAudioDestinationNode | null;
   /** The centered monitor mix remains an integration responsibility. */
   monitorMix: null;
   update: (elapsedMs: number) => void;
@@ -101,17 +103,25 @@ export function createRecordingGraph(
     : null;
   const merger = context.createChannelMerger(2);
   const destination = context.createMediaStreamDestination();
+  const jerryDestination = context.createMediaStreamDestination();
+  const guestDestination = guestChain ? context.createMediaStreamDestination() : null;
   destination.channelCount = guestChain ? 2 : 1;
+  jerryDestination.channelCount = 1;
+  if (guestDestination) guestDestination.channelCount = 1;
 
   jerryChain.output.connect(merger, 0, RECORDING_CHANNELS.jerry);
   if (guestChain) guestChain.output.connect(merger, 0, RECORDING_CHANNELS.guest);
   merger.connect(destination);
+  jerryChain.output.connect(jerryDestination);
+  if (guestChain && guestDestination) guestChain.output.connect(guestDestination);
 
   return {
     jerryChain,
     guestChain,
     merger,
     destination,
+    jerryDestination,
+    guestDestination,
     monitorMix: null,
     update(elapsedMs: number) {
       const jerryGainDb = jerryChain.leveler.update(
@@ -141,6 +151,8 @@ export function createRecordingGraph(
       }
       merger.disconnect();
       destination.disconnect();
+      jerryDestination.disconnect();
+      guestDestination?.disconnect();
     },
   };
 }
