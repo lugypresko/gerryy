@@ -55,7 +55,7 @@ test('authoritative guest transcript is finalized from the complete turn audio',
 
 test('live STT is interim-only and authoritative text is what reaches Jerry', () => {
   assert.match(server, /input-transcript-interim/);
-  assert.match(server, /transcribeGuestTurn\(ai,\s*completedTurnChunks\)/);
+  assert.match(server, /transcribeGuestTurn\(aiClient,\s*completedTurnChunks\)/);
   assert.match(server, /finalTranscript[\s\S]{0,500}sendClientContent\(/);
   assert.doesNotMatch(
     server,
@@ -66,6 +66,12 @@ test('live STT is interim-only and authoritative text is what reaches Jerry', ()
 test('transcription service failure keeps a live candidate fallback', () => {
   assert.match(server, /lastLiveFinalCandidate/);
   assert.match(server, /authoritativeTranscript \|\| lastLiveFinalCandidate/);
+});
+
+test('authoritative transcription keeps the Gemini client in WebSocket handler scope', () => {
+  assert.match(server, /let aiClient:\s*GoogleGenAI \| null = null/);
+  assert.match(server, /aiClient = new GoogleGenAI\(\{ apiKey: key \}\)/);
+  assert.match(server, /transcribeGuestTurn\(aiClient,\s*completedTurnChunks\)/);
 });
 
 test('Gemini Live output PCM is resampled to the browser AudioContext rate', () => {

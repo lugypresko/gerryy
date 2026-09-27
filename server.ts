@@ -891,13 +891,14 @@ CRITICAL RULES:
     let transcribeSession: any = null;
     let lastFinalGuestTranscript = '';
     let lastLiveFinalCandidate = '';
+    let aiClient: GoogleGenAI | null = null;
     let guestPcmChunks: Buffer[] = [];
     let guestTurnId = 0;
 
     try {
-      const ai = new GoogleGenAI({ apiKey: key });
+      aiClient = new GoogleGenAI({ apiKey: key });
 
-      transcribeSession = await ai.live.connect({
+      transcribeSession = await aiClient.live.connect({
         model: 'gemini-3.5-transcribe-live',
         callbacks: {
           onopen: () => {
@@ -967,7 +968,7 @@ CRITICAL RULES:
         },
       });
 
-      liveSession = await ai.live.connect({
+      liveSession = await aiClient.live.connect({
         model: 'gemini-3.8-live',
         callbacks: {
           onopen: () => {
@@ -1123,7 +1124,8 @@ CRITICAL RULES:
           void (async () => {
             let authoritativeTranscript = '';
             try {
-              authoritativeTranscript = await transcribeGuestTurn(ai, completedTurnChunks);
+                  if (!aiClient) throw new Error('Gemini client is not initialized');
+                  authoritativeTranscript = await transcribeGuestTurn(aiClient, completedTurnChunks);
             } catch (err) {
               console.warn('[Jerry STT] authoritative transcription failed; using live candidate:', err);
             }
