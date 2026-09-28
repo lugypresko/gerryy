@@ -6,16 +6,52 @@ import { createServer as createViteServer } from 'vite';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, Modality } from '@google/genai';
+import { RecordingArchiveStore } from './server/recordingStore';
+import { CanonicalCaptureStore } from './server/recordings/capture';
+import { RecordingControlQueue, RecordingStopCoordinator } from './server/recordingLifecycle';
+import { RecordingMediaJobQueue, RecordingObservabilityStore, type RecordingProcessingMode } from './server/recordings/jobs';
+import {
+  buildJerryLanguagePrompt,
+  CODE_SWITCH_TRANSCRIPTION_CONFIG,
+  extractGeneratedTranscript,
+  selectTtsLanguage,
+} from './server/languageRouting';
 
 const PORT = 3000;
 const JERRY_ENGINE_VERSION = 'jerry-conversation-v3-2026-09-26';
 const KEY_FILE = path.resolve(process.cwd(), '.api-key.json');
 const ALIGNMENT_LOG_FILE = path.resolve(process.cwd(), '.alignment-logs.json');
 const VOICE_LOG_FILE = path.resolve(process.cwd(), '.voice-logs.json');
-const RECORDINGS_DIR = path.resolve(process.cwd(), 'recordings');
+const RECORDINGS_DIR = path.resolve(process.env.JERRY_RECORDINGS_DIR || path.join(process.cwd(), 'data', 'recordings'));
+const canonicalCaptureHttpStore = new CanonicalCaptureStore(RECORDINGS_DIR);
 const JERRY_DEBUG_MAX_EVENTS = 200;
 const jerryDebugEvents: Array<Record<string, unknown>> = [];
 let nextJerryConnectionId = 1;
+
+interface JerryPcmCaptureMetadata {
+  captureId: string;
+  episodeId: string;
+  connectionId: number;
+  streamId: 'jerry';
+  sampleRate: number | null;
+  mimeTypes: string[];
+  startedAt: string;
+  stoppedAt?: string;
+  stopReason?: string;
+  chunkCount: number;
+  byteLength: number;
+}
+
+function parsePcmMimeType(mimeType: string): { sampleRate: number | null; mimeType: string } {
+  const normalized = mimeType.trim() || 'audio/pcm;rate=24000';
+  const rate = /(?:^|;)\s*rate\s*=\s*(\d+)/i.exec(normalized)?.[1];
+  return { mimeType: normalized, sampleRate: rate ? Number(rate) : null };
+}
+
+function captureToken(value: unknown, fallback: string): string {
+  const token = typeof value === 'string' ? value.trim() : '';
+  return (token || fallback).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80);
+}
 
 function recordJerryDebug(event: string, details: Record<string, unknown> = {}) {
   const entry = {
@@ -38,6 +74,28 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
       setTimeout(() => reject(new Error(label)), timeoutMs);
     }),
   ]);
+}
+
+function pcmToWav(data: Buffer, format: { sampleRate: number; channels: 1 | 2; encoding: 'pcm_s16le' | 'pcm_f32le' }): Buffer {
+  const bitsPerSample = format.encoding === 'pcm_f32le' ? 32 : 16;
+  const audioFormat = format.encoding === 'pcm_f32le' ? 3 : 1;
+  const blockAlign = format.channels * (bitsPerSample / 8);
+  const byteRate = format.sampleRate * blockAlign;
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + data.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(audioFormat, 20);
+  header.writeUInt16LE(format.channels, 22);
+  header.writeUInt32LE(format.sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(data.length, 40);
+  return Buffer.concat([header, data]);
 }
 
 const RECORDING_TELEMETRY_KEYS = new Set([
@@ -75,6 +133,27 @@ function sanitizeClientDebugDetails(
     }
   }
   return sanitized;
+}
+const recordingArchiveStore = new RecordingArchiveStore(
+  RECORDINGS_DIR,
+);
+const recordingObservability = new RecordingObservabilityStore(RECORDINGS_DIR);
+const recordingMediaJobQueue = new RecordingMediaJobQueue(RECORDINGS_DIR, { observability: recordingObservability });
+
+async function recordObservabilityEvent(
+  stage: 'capture' | 'upload' | 'download',
+  episodeId: string,
+  reasonCode: string,
+  processingMode: RecordingProcessingMode = 'processed',
+): Promise<void> {
+  await recordingObservability.record({
+    episodeId,
+    stage,
+    event: 'succeeded',
+    elapsedMs: 0,
+    reasonCode,
+    processingMode,
+  });
 }
 
 const JERRY_LIVE_SYSTEM_PROMPT = `אתה ג'רי (Jerry), המנחה של "Engineering Leaders in Real Life".
@@ -141,7 +220,7 @@ REACT BEFORE YOU ASK.
 18. מותר להתלונן על איתי, הבוס שלך, פעם אחת בשיחה, בחיבה עצבנית. לא להפוך את זה לבדיחה חוזרת.
 19. אסור לתת עצות, רשימות או "חמישה טיפים" אלא אם האורח ביקש במפורש.
 20. דבר בעברית טבעית. Tech English כמו deploy, production, rollback, latency, incident, PR, Kubernetes נשאר טבעי.
-21. כרגע האורח מדבר עברית. התייחס לכל קלט קולי כעברית כברירת מחדל, וענה בעברית. אם התמלול נראה כמו שפה אחרת, הנח שזו שגיאת תמלול ולא שהאורח החליף שפה.
+21. האורח עשוי לעבור בין עברית לאנגלית גם באמצע משפט. שמור על השפה ועל מונחי הקוד כפי שנאמרו; מעבר שפה אינו שגיאת תמלול.
 22. הקול יבש, חם, מעט מחוספס, בקצב ניו-יורקי קל. פאוזות טבעיות. לא תיאטרלי ולא קריקטורה.
 23. אל תקריא תגיות במה כמו <sigh> או <chuckle>. בצע אותן בקול אם מתאים.
 24. התחל מהר. אל תחשוב בקול ואל תאריך הקדמות.
@@ -253,7 +332,7 @@ async function transcribeGuestTurn(ai: GoogleGenAI, chunks: Buffer[]): Promise<s
     }],
     config: {
       audioTranscriptionConfig: {
-        languageCodes: ['he-IL'],
+        languageCodes: [...CODE_SWITCH_TRANSCRIPTION_CONFIG.languageCodes],
         customVocabulary: [
           'ג\'רי',
           'איתי',
@@ -271,12 +350,270 @@ async function transcribeGuestTurn(ai: GoogleGenAI, chunks: Buffer[]): Promise<s
       },
     },
   });
-  return response.text?.trim() || '';
+  return extractGeneratedTranscript(response);
 }
 
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
+  await recordingMediaJobQueue.recoverStaleJobs();
+
+  // Durable append-only recording archive. The manifest is the commit marker;
+  // there are intentionally no update or delete routes for archived media.
+  app.post('/api/recordings', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const decode = (value: unknown) => {
+        if (typeof value !== 'string' || !value) return undefined;
+        return Buffer.from(value, 'base64');
+      };
+      const manifest = await recordingArchiveStore.createArchive({
+        master: decode(body.masterBase64) as Buffer,
+        jerry: decode(body.jerryBase64),
+        guest: decode(body.guestBase64),
+        conversation: decode(body.conversationBase64),
+        metadata: body.metadata && typeof body.metadata === 'object' ? body.metadata : {},
+        status:
+          body.status === 'review' || body.status === 'needs-review'
+            ? 'review'
+            : body.status === 'failed'
+              ? 'failed'
+              : 'ready',
+        mimeTypes: body.mimeTypes && typeof body.mimeTypes === 'object' ? body.mimeTypes : undefined,
+      });
+      const processingMode: RecordingProcessingMode = body.processingMode === 'fallback' ? 'fallback' : 'processed';
+      await recordObservabilityEvent('capture', manifest.id, 'capture_received', processingMode);
+      await recordObservabilityEvent('upload', manifest.id, 'archive_persisted', processingMode);
+      res.status(201).json(manifest);
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Invalid recording archive' });
+    }
+  });
+
+  // Canonical capture API: source preservation only. It never mixes, normalizes,
+  // or replaces the publication/archive API above.
+  app.post(['/api/recordings/capture/start', '/api/captures/start'], async (req, res) => {
+    try {
+      const episodeId = captureToken(req.body?.episodeId, `episode-${Date.now()}`);
+      const manifest = await canonicalCaptureHttpStore.start({
+        episodeId,
+        startedAtMs: Number.isFinite(req.body?.startedAtMs) ? Number(req.body.startedAtMs) : Date.now(),
+        metadata: req.body?.metadata && typeof req.body.metadata === 'object' ? req.body.metadata : {},
+      });
+      res.status(201).json(manifest);
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Unable to start canonical capture' });
+    }
+  });
+
+  app.post(['/api/recordings/capture/:captureId/chunk', '/api/captures/:captureId/chunks'], async (req, res) => {
+    try {
+      const body = req.body || {};
+      const source = body.source === 'human' || body.source === 'jerry' ? body.source : null;
+      if (!source || typeof body.data !== 'string') throw new Error('source and base64 data are required');
+      const data = Buffer.from(body.data, 'base64');
+      const sampleRate = Number(body.sampleRate);
+      const channels = body.channels === 2 ? 2 : 1;
+      const encoding = body.encoding === 'pcm_f32le' ? 'pcm_f32le' : 'pcm_s16le';
+      const sampleCount = Number(body.sampleCount);
+      const captureStartMs = Number(body.captureStartMs);
+      const captureEndMs = Number(body.captureEndMs);
+      const receipt = await canonicalCaptureHttpStore.appendChunk(req.params.captureId, {
+        source,
+        sequence: Number(body.sequence),
+        captureStartMs,
+        captureEndMs,
+        sampleCount,
+        format: { sampleRate, channels, encoding },
+        data,
+      });
+      res.status(receipt.status === 'duplicate' ? 200 : 201).json(receipt);
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Unable to append canonical capture chunk' });
+    }
+  });
+
+  app.post(['/api/recordings/capture/:captureId/stop', '/api/captures/:captureId/stop'], async (req, res) => {
+    try {
+      const stopAt = Number(req.body?.stopAt) || Date.now();
+      const manifest = await canonicalCaptureHttpStore.requestStop(req.params.captureId, stopAt);
+      return res.json(manifest);
+    } catch (error: any) {
+      return res.status(400).json({ error: error?.message || 'Unable to finalize canonical capture' });
+    }
+  });
+
+  app.post(['/api/recordings/capture/:captureId/finalize', '/api/captures/:captureId/finalize'], async (req, res) => {
+    try {
+      const manifest = await canonicalCaptureHttpStore.get(req.params.captureId);
+      if (manifest.streams.human.byteCount <= 0 || manifest.streams.jerry.byteCount <= 0) {
+        return res.status(409).json({ error: 'Canonical capture requires non-zero Human and Jerry stems', manifest });
+      }
+      return res.json(await canonicalCaptureHttpStore.finalize(req.params.captureId));
+    } catch (error: any) {
+      return res.status(400).json({ error: error?.message || 'Unable to finalize canonical capture' });
+    }
+  });
+
+  app.get(['/api/recordings/capture/:captureId', '/api/captures/:captureId/status'], async (req, res) => {
+    try {
+      const manifest = await canonicalCaptureHttpStore.get(req.params.captureId);
+      res.json({ manifest, events: await canonicalCaptureHttpStore.listEvents(req.params.captureId) });
+    } catch (error: any) {
+      res.status(error?.message === 'Capture not found' ? 404 : 400).json({ error: error?.message || 'Canonical capture unavailable' });
+    }
+  });
+
+  app.get(['/api/recordings/capture/:captureId/events', '/api/captures/:captureId/events'], async (req, res) => {
+    try {
+      res.json(await canonicalCaptureHttpStore.listEvents(req.params.captureId));
+    } catch (error: any) {
+      res.status(404).json({ error: error?.message || 'Canonical capture events unavailable' });
+    }
+  });
+
+  app.get(['/api/recordings/capture/:captureId/transcript', '/api/captures/:captureId/transcript'], async (req, res) => {
+    try {
+      const events = await canonicalCaptureHttpStore.listEvents(req.params.captureId);
+      res.json(events.filter((event) => event.type === 'transcript'));
+    } catch (error: any) {
+      res.status(404).json({ error: error?.message || 'Canonical capture transcript unavailable' });
+    }
+  });
+
+  app.get(['/api/recordings/capture/:captureId/:source', '/api/captures/:captureId/source/:source', '/api/captures/:captureId/source/:source/download'], async (req, res) => {
+    try {
+      if (req.params.source !== 'human' && req.params.source !== 'jerry') throw new Error('Invalid source');
+      const manifest = await canonicalCaptureHttpStore.get(req.params.captureId);
+      const chunks = await canonicalCaptureHttpStore.listChunks(req.params.captureId, req.params.source);
+      if (!manifest.streams[req.params.source].format || chunks.length === 0) throw new Error('Source is empty');
+      const pcm = await canonicalCaptureHttpStore.readSource(req.params.captureId, req.params.source);
+      const wav = pcmToWav(pcm, manifest.streams[req.params.source].format!);
+      res.setHeader('Content-Type', 'audio/wav');
+      res.setHeader('Content-Disposition', `attachment; filename="${req.params.captureId}-${req.params.source}.wav"`);
+      res.setHeader('X-Capture-Source', req.params.source);
+      res.setHeader('X-Capture-Sample-Rate', String(manifest.streams[req.params.source].format!.sampleRate));
+      res.send(wav);
+    } catch (error: any) {
+      res.status(error?.message === 'Capture not found' ? 404 : 400).json({ error: error?.message || 'Canonical source unavailable' });
+    }
+  });
+
+  app.get('/api/recordings', async (_req, res) => {
+    try {
+      res.json(await recordingArchiveStore.listArchives());
+    } catch (error: any) {
+      res.status(500).json({ error: error?.message || 'Recording library unavailable' });
+    }
+  });
+
+  app.post('/api/recordings/:archiveId/process', async (req, res) => {
+    try {
+      const archive = await recordingArchiveStore.getArchive(req.params.archiveId);
+      const master = archive.assets.master;
+      if (!master) throw new Error('Archive master asset not found');
+      const job = await recordingMediaJobQueue.enqueue({
+        archiveId: archive.id,
+        episodeId: archive.id,
+        sourcePath: path.join(RECORDINGS_DIR, archive.id, master.fileName),
+        processingMode: req.body?.processingMode === 'fallback' ? 'fallback' : 'processed',
+      });
+      void recordingMediaJobQueue.run(job.id);
+      res.status(202).json(job);
+    } catch (error: any) {
+      res.status(error?.message === 'Archive not found' ? 404 : 400).json({ error: error?.message || 'Unable to start media processing' });
+    }
+  });
+
+  app.get('/api/recordings/jobs/:jobId', async (req, res) => {
+    try {
+      res.json(await recordingMediaJobQueue.get(req.params.jobId));
+    } catch (error: any) {
+      res.status(error?.message === 'Media job not found' ? 404 : 400).json({ error: error?.message || 'Media job unavailable' });
+    }
+  });
+
+  app.get('/api/recordings/jobs/:jobId/events', async (req, res) => {
+    try {
+      res.json(await recordingMediaJobQueue.getEvents(req.params.jobId));
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Media job events unavailable' });
+    }
+  });
+
+  app.post('/api/recordings/jobs/:jobId/retry', async (req, res) => {
+    try {
+      const job = await recordingMediaJobQueue.retry(req.params.jobId);
+      void recordingMediaJobQueue.run(job.id);
+      res.status(202).json(job);
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Media job retry unavailable' });
+    }
+  });
+
+  app.get('/api/recordings/:archiveId', async (req, res) => {
+    try {
+      res.json(await recordingArchiveStore.getArchive(req.params.archiveId));
+    } catch (error: any) {
+      res.status(error?.message === 'Archive not found' ? 404 : 400).json({ error: error?.message || 'Archive unavailable' });
+    }
+  });
+
+  app.get('/api/recordings/:archiveId/download', async (req, res) => {
+    try {
+      const archive = await recordingArchiveStore.getArchive(req.params.archiveId);
+      if (archive.status === 'failed') {
+        await recordObservabilityEvent('download', archive.id, 'download_blocked_failed_archive');
+        return res.status(409).json({ error: 'Failed recordings are not downloadable' });
+      }
+      const result = await recordingArchiveStore.getAsset(req.params.archiveId, 'master');
+      const data = result.data;
+      const total = data.length;
+      const range = req.headers.range;
+      res.setHeader('Content-Type', result.manifest.mimeType);
+      res.setHeader('Content-Disposition', `attachment; filename="jerry-${archive.id}.webm"`);
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('ETag', `"${result.manifest.sha256}"`);
+      res.setHeader('X-Content-SHA256', result.manifest.sha256);
+      await recordObservabilityEvent('download', archive.id, 'download_served');
+
+      if (!range) {
+        res.setHeader('Content-Length', total);
+        return res.status(200).send(data);
+      }
+
+      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+      if (!match || (!match[1] && !match[2])) {
+        res.setHeader('Content-Range', `bytes */${total}`);
+        return res.status(416).end();
+      }
+      const start = match[1] ? Number(match[1]) : Math.max(0, total - Number(match[2]));
+      const end = match[2] ? Number(match[2]) : total - 1;
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || start >= total) {
+        res.setHeader('Content-Range', `bytes */${total}`);
+        return res.status(416).end();
+      }
+      const boundedEnd = Math.min(end, total - 1);
+      const chunk = data.subarray(start, boundedEnd + 1);
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${boundedEnd}/${total}`);
+      res.setHeader('Content-Length', chunk.length);
+      return res.send(chunk);
+    } catch (error: any) {
+      const status = error?.message === 'Archive not found' ? 404 : 400;
+      return res.status(status).json({ error: error?.message || 'Recording download unavailable' });
+    }
+  });
+
+  app.get('/api/recordings/:archiveId/:asset', async (req, res) => {
+    try {
+      const result = await recordingArchiveStore.getAsset(req.params.archiveId, req.params.asset);
+      res.type(result.manifest.mimeType).send(result.data);
+    } catch (error: any) {
+      const status = /not found/i.test(error?.message || '') ? 404 : 400;
+      res.status(status).json({ error: error?.message || 'Archive asset unavailable' });
+    }
+  });
 
   // CORS & Cache-Control headers
   app.use((req, res, next) => {
@@ -735,7 +1072,7 @@ CRITICAL RULES:
         return res.status(400).json({ error: 'userMessage is required.' });
       }
 
-      const JERRY_SYSTEM_PROMPT = JERRY_LIVE_SYSTEM_PROMPT;
+      const JERRY_SYSTEM_PROMPT = buildJerryLanguagePrompt(JERRY_LIVE_SYSTEM_PROMPT);
 
       // Format conversation contents for Gemini
       const contents: any[] = [];
@@ -794,6 +1131,7 @@ CRITICAL RULES:
       // Synthesize audio using Gemini TTS.
       // Keep stage directions out of speech even if the model emits one.
       const ttsText = replyText.replace(/<[^>]+>/g, '').trim();
+      const ttsLanguageCode = selectTtsLanguage(ttsText);
       let audioBase64 = '';
       const ttsErrors: string[] = [];
       const ttsModels = ['models/gemini-3.8-flash-lite-tts', 'models/gemini-3.8-flash-tts'];
@@ -810,7 +1148,7 @@ CRITICAL RULES:
                 generationConfig: {
                   responseModalities: ['AUDIO'],
                   speechConfig: {
-                    languageCode: 'he-IL',
+                    ...(ttsLanguageCode ? { languageCode: ttsLanguageCode } : {}),
                     voiceConfig: {
                       voice: 'Charon',
                     },
@@ -992,12 +1330,146 @@ CRITICAL RULES:
     let transcribeSession: any = null;
     let lastFinalGuestTranscript = '';
     let lastLiveFinalCandidate = '';
+    let lastLiveInterimTranscript = '';
+    let guestTurnEnded = false;
     let aiClient: GoogleGenAI | null = null;
     let guestPcmChunks: Buffer[] = [];
     let guestTurnId = 0;
     let guestTurnStartedAt = 0;
     let guestAudioChunkCount = 0;
     let guestAudioBytes = 0;
+    const recordingLifecycle = new RecordingStopCoordinator();
+    const recordingControlQueue = new RecordingControlQueue();
+    const canonicalCaptureStore = new CanonicalCaptureStore(RECORDINGS_DIR);
+    let canonicalCaptureId: string | null = null;
+    let canonicalAppendQueue: Promise<void> = Promise.resolve();
+    let jerryPcmChunks: Buffer[] = [];
+    let jerryCapture: JerryPcmCaptureMetadata | null = null;
+    let jerryCaptureActive = false;
+    let jerryCaptureSequence = 0;
+    let jerryCaptureFinalization: Promise<void> | null = null;
+
+    const appendCanonicalEvent = async (type: 'transcript' | 'conversation-event', metadata: Record<string, unknown>) => {
+      if (!canonicalCaptureId) return;
+      try {
+        await canonicalCaptureStore.appendEventRecord(canonicalCaptureId, {
+          type,
+          atMs: Date.now(),
+          metadata: { connectionId, ...metadata },
+        });
+      } catch (error) {
+        recordJerryDebug('canonical-event-append-error', {
+          connectionId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+
+    const startJerryPcmCapture = (details: Record<string, unknown> = {}) => {
+      if (jerryCaptureActive) return jerryCapture;
+      const episodeId = captureToken(details.episodeId, `episode-${connectionId}-${Date.now()}`);
+      const captureId = `${episodeId}-jerry-${connectionId}-${++jerryCaptureSequence}`;
+      jerryPcmChunks = [];
+      jerryCapture = {
+        captureId,
+        episodeId,
+        connectionId,
+        streamId: 'jerry',
+        sampleRate: null,
+        mimeTypes: [],
+        startedAt: new Date().toISOString(),
+        chunkCount: 0,
+        byteLength: 0,
+      };
+      jerryCaptureActive = true;
+      recordJerryDebug('jerry-capture-started', { ...jerryCapture });
+      return jerryCapture;
+    };
+
+    const captureJerryPcmChunk = (data: string, mimeType: string, turnId: number) => {
+      if (!jerryCaptureActive || !jerryCapture) return null;
+      const parsed = parsePcmMimeType(mimeType);
+      const chunk = Buffer.from(data, 'base64');
+      const sequence = jerryCapture.chunkCount;
+      jerryPcmChunks.push(chunk);
+      jerryCapture.chunkCount += 1;
+      jerryCapture.byteLength += chunk.length;
+      if (jerryCapture.sampleRate === null && parsed.sampleRate !== null) {
+        jerryCapture.sampleRate = parsed.sampleRate;
+      }
+      if (!jerryCapture.mimeTypes.includes(parsed.mimeType)) {
+        jerryCapture.mimeTypes.push(parsed.mimeType);
+      }
+      recordJerryDebug('jerry-audio-captured', {
+        connectionId,
+        episodeId: jerryCapture.episodeId,
+        captureId: jerryCapture.captureId,
+        streamId: jerryCapture.streamId,
+        turnId,
+        sequence,
+        bytes: chunk.length,
+        sampleRate: parsed.sampleRate,
+        mimeType: parsed.mimeType,
+      });
+      return { chunk, sequence, metadata: jerryCapture };
+    };
+
+    const appendCanonicalJerryChunk = async (captured: { chunk: Buffer; sequence: number; metadata: JerryPcmCaptureMetadata }, mimeType: string) => {
+      if (!canonicalCaptureId) return;
+      const parsed = parsePcmMimeType(mimeType);
+      if (!parsed.sampleRate || captured.chunk.length % 2 !== 0) return;
+      await canonicalCaptureStore.appendChunk(canonicalCaptureId, {
+        source: 'jerry',
+        sequence: captured.sequence,
+        captureStartMs: Date.now(),
+        captureEndMs: Date.now(),
+        sampleCount: captured.chunk.length / 2,
+        format: { sampleRate: parsed.sampleRate, channels: 1, encoding: 'pcm_s16le' },
+        data: captured.chunk,
+      });
+    };
+
+    const enqueueCanonicalAppend = (work: () => Promise<void>): Promise<void> => {
+      const next = canonicalAppendQueue.then(work, work);
+      canonicalAppendQueue = next.catch(() => undefined);
+      return next;
+    };
+
+    const finalizeJerryPcmCapture = async (reason: string) => {
+      if (!jerryCapture || !jerryCaptureActive) return;
+      jerryCaptureActive = false;
+      const metadata: JerryPcmCaptureMetadata = {
+        ...jerryCapture,
+        stoppedAt: new Date().toISOString(),
+        stopReason: reason,
+        mimeTypes: [...jerryCapture.mimeTypes],
+      };
+      const pcm = Buffer.concat(jerryPcmChunks);
+      jerryPcmChunks = [];
+      jerryCapture = metadata;
+      const captureDir = path.join(RECORDINGS_DIR, 'jerry-captures', metadata.captureId);
+      jerryCaptureFinalization = (async () => {
+        try {
+          await fs.promises.mkdir(captureDir, { recursive: true });
+          await fs.promises.writeFile(path.join(captureDir, 'jerry.pcm'), pcm);
+          await fs.promises.writeFile(
+            path.join(captureDir, 'jerry-capture-metadata.json'),
+            JSON.stringify(metadata, null, 2),
+          );
+          recordJerryDebug('jerry-capture-finalized', {
+            ...metadata,
+            file: path.relative(RECORDINGS_DIR, path.join(captureDir, 'jerry.pcm')),
+            persistedBytes: pcm.length,
+          });
+        } catch (error) {
+          recordJerryDebug('jerry-capture-finalization-error', {
+            ...metadata,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      })();
+      await jerryCaptureFinalization;
+    };
 
     try {
       aiClient = new GoogleGenAI({ apiKey: key });
@@ -1006,7 +1478,7 @@ CRITICAL RULES:
         model: 'gemini-3.5-transcribe-live',
         callbacks: {
           onopen: () => {
-            console.info('[Jerry STT] dedicated Hebrew transcriber opened');
+            console.info('[Jerry STT] Hebrew/English code-switching transcriber opened');
             recordJerryDebug('stt-ready', { connectionId });
           },
           onmessage: (message: any) => {
@@ -1018,6 +1490,7 @@ CRITICAL RULES:
               serverContent?.interim_input_transcription?.text ||
               '';
             if (interim) {
+              lastLiveInterimTranscript = interim.trim();
               client.send(JSON.stringify({ type: 'input-transcript-interim', text: interim }));
             }
 
@@ -1037,7 +1510,7 @@ CRITICAL RULES:
               client.send(
                 JSON.stringify({
                   type: 'stt-error',
-                  message: event?.message || 'Hebrew transcription session error',
+                  message: event?.message || 'Transcription session error',
                 }),
               );
             }
@@ -1054,8 +1527,8 @@ CRITICAL RULES:
             },
           },
           inputAudioTranscription: {
-            languageCodes: ['he-IL'],
-            mode: 'VERBATIM',
+            // Deterministic mocks cover routing; live-provider proof remains a separate credentialed check.
+            ...CODE_SWITCH_TRANSCRIPTION_CONFIG,
             customVocabulary: [
               'ג\'רי',
               'איתי',
@@ -1082,34 +1555,59 @@ CRITICAL RULES:
             recordJerryDebug('jerry-live-ready', { connectionId });
           },
           onmessage: (message: any) => {
-            if (client.readyState !== WebSocket.OPEN) return;
-
             const serverContent = message?.serverContent || message?.server_content;
             const parts = serverContent?.modelTurn?.parts || serverContent?.model_turn?.parts || [];
 
             for (const part of parts) {
               const inlineData = part?.inlineData || part?.inline_data;
               if (inlineData?.data) {
+                const actualMimeType = inlineData.mimeType || inlineData.mime_type || 'audio/pcm;rate=24000';
+                const capturedJerry = captureJerryPcmChunk(inlineData.data, actualMimeType, guestTurnId);
+                if (capturedJerry) {
+                  void enqueueCanonicalAppend(() => appendCanonicalJerryChunk(capturedJerry, actualMimeType)).catch((error) => {
+                    recordJerryDebug('canonical-jerry-append-error', {
+                      connectionId,
+                      message: error instanceof Error ? error.message : String(error),
+                    });
+                  });
+                }
+                if (client.readyState !== WebSocket.OPEN) continue;
+                const captureIdentity = jerryCapture
+                  ? {
+                      episodeId: jerryCapture.episodeId,
+                      captureId: jerryCapture.captureId,
+                      streamId: jerryCapture.streamId,
+                    }
+                  : {};
                 recordJerryDebug('jerry-audio', {
                   connectionId,
                   turnId: guestTurnId,
                   bytes: Math.floor((inlineData.data.length * 3) / 4),
+                  ...captureIdentity,
                 });
                 client.send(
                   JSON.stringify({
                     type: 'audio',
                     data: inlineData.data,
-                    mimeType: inlineData.mimeType || inlineData.mime_type || 'audio/pcm;rate=24000',
+                    mimeType: actualMimeType,
                   }),
                 );
               }
             }
+
+            if (client.readyState !== WebSocket.OPEN) return;
 
             const transcription =
               serverContent?.outputTranscription?.text ||
               serverContent?.output_transcription?.text ||
               '';
             if (transcription) {
+              void appendCanonicalEvent('transcript', {
+                speaker: 'jerry',
+                text: transcription,
+                turnId: guestTurnId,
+                source: 'gemini',
+              });
               client.send(JSON.stringify({ type: 'transcript', text: transcription }));
             }
 
@@ -1154,7 +1652,7 @@ CRITICAL RULES:
               },
             },
           },
-          systemInstruction: JERRY_LIVE_SYSTEM_PROMPT,
+          systemInstruction: buildJerryLanguagePrompt(JERRY_LIVE_SYSTEM_PROMPT),
         },
       });
 
@@ -1164,7 +1662,7 @@ CRITICAL RULES:
             type: 'ready',
             engine: 'gemini-3.8-live',
             engineVersion: JERRY_ENGINE_VERSION,
-                    inputPath: 'push-to-talk PCM -> Live interim STT -> full-turn Gemini 3.5 Transcribe (he-IL) -> Gemini 3.8 Live -> Jerry response',
+                    inputPath: 'push-to-talk PCM -> Live interim STT -> full-turn Gemini 3.5 Transcribe (he-IL/en-US code-switch) -> Gemini 3.8 Live -> Jerry response',
           }),
         );
             recordJerryDebug('socket-ready-sent', { connectionId, engineVersion: JERRY_ENGINE_VERSION });
@@ -1178,7 +1676,7 @@ CRITICAL RULES:
       return;
     }
 
-    client.on('message', (raw) => {
+    client.on('message', async (raw) => {
       if (!liveSession || !transcribeSession) return;
       try {
         const rawText = raw?.toString?.() || '';
@@ -1192,7 +1690,112 @@ CRITICAL RULES:
         }
         const msg = JSON.parse(rawText);
 
-        if (msg.type === 'restore-history' && Array.isArray(msg.turns)) {
+        if (msg.type === 'recording-start' && typeof msg.recordingId === 'string') {
+          recordingLifecycle.start(msg.recordingId);
+          canonicalCaptureId = msg.recordingId;
+          canonicalAppendQueue = Promise.resolve();
+          await canonicalCaptureStore.start({ episodeId: canonicalCaptureId, metadata: { connectionId } });
+          startJerryPcmCapture({ episodeId: canonicalCaptureId });
+          recordJerryDebug('recording-started', {
+            connectionId,
+            recordingId: msg.recordingId,
+          });
+          client.send(JSON.stringify({
+            type: 'recording-started',
+            recordingId: msg.recordingId,
+          }));
+        } else if (msg.type === 'recording-stop-request' && typeof msg.requestId === 'string') {
+          await recordingControlQueue.run(async () => {
+            try {
+              const accepted = recordingLifecycle.requestStop(msg.requestId, Number(msg.stopAt) || Date.now());
+              if (canonicalCaptureId) {
+                await canonicalCaptureStore.requestStop(canonicalCaptureId, accepted.stopAt);
+              }
+              recordJerryDebug('recording-stop-accepted', {
+                connectionId,
+                recordingId: accepted.recordingId,
+                requestId: accepted.requestId,
+                status: accepted.status,
+                stopAt: accepted.stopAt,
+              });
+              client.send(JSON.stringify({ type: 'recording-stop-accepted', ...accepted }));
+            } catch (error) {
+              recordJerryDebug('recording-stop-rejected', {
+                connectionId,
+                requestId: msg.requestId,
+                message: error instanceof Error ? error.message : String(error),
+              });
+              client.send(JSON.stringify({
+                type: 'recording-stop-error',
+                requestId: msg.requestId,
+                message: error instanceof Error ? error.message : String(error),
+              }));
+            }
+          });
+        } else if (msg.type === 'recording-finalize' && typeof msg.requestId === 'string') {
+          void recordingControlQueue.run(async () => {
+            try {
+              const ack = await recordingLifecycle.finalize(msg.requestId, async () => {
+                if (canonicalCaptureId) {
+                  await canonicalAppendQueue;
+                  await finalizeJerryPcmCapture('recording-finalize');
+                  const manifest = await canonicalCaptureStore.get(canonicalCaptureId);
+                  if (manifest.streams.human.byteCount <= 0 || manifest.streams.jerry.byteCount <= 0) {
+                    throw new Error('Canonical capture is missing Human or Jerry audio');
+                  }
+                  await canonicalCaptureStore.finalize(canonicalCaptureId);
+                }
+                recordJerryDebug('recording-finalize-commit', {
+                  connectionId,
+                  recordingId: msg.recordingId,
+                  requestId: msg.requestId,
+                  shadowBytes: Number(msg.shadowBytes) || 0,
+                });
+              });
+              recordJerryDebug('recording-stop-ack-sent', {
+                connectionId,
+                recordingId: ack.recordingId,
+                requestId: ack.requestId,
+                inflight: ack.inflight,
+              });
+              if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(ack));
+            } catch (error) {
+              recordJerryDebug('recording-finalize-error', {
+                connectionId,
+                requestId: msg.requestId,
+                message: error instanceof Error ? error.message : String(error),
+              });
+              if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({
+                  type: 'recording-stop-error',
+                  requestId: msg.requestId,
+                  message: error instanceof Error ? error.message : String(error),
+                }));
+              }
+            }
+          });
+        } else if (msg.type === 'human-archive' && typeof msg.data === 'string' && canonicalCaptureId) {
+          try {
+            const data = Buffer.from(msg.data, 'base64');
+            const sampleRate = Number(msg.sampleRate);
+            const sampleCount = Number(msg.sampleCount);
+            const capturedAtMs = Number(msg.capturedAtMs) || Date.now();
+            await enqueueCanonicalAppend(() => canonicalCaptureStore.appendChunk(canonicalCaptureId!, {
+              source: 'human',
+              sequence: Number(msg.sequence),
+              captureStartMs: capturedAtMs,
+              captureEndMs: capturedAtMs + (sampleCount / sampleRate) * 1000,
+              sampleCount,
+              format: { sampleRate, channels: 1, encoding: 'pcm_s16le' },
+              data,
+            }).then(() => undefined));
+          } catch (error) {
+            recordJerryDebug('canonical-human-append-error', {
+              connectionId,
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        } else if (msg.type === 'restore-history' && Array.isArray(msg.turns)) {
           const restoredTurns = msg.turns
             .filter(
               (turn: any) =>
@@ -1234,16 +1837,30 @@ CRITICAL RULES:
           const category = typeof msg.category === 'string' ? msg.category.slice(0, 40) : 'client';
           const details = msg.details && typeof msg.details === 'object' ? msg.details : {};
           const sanitizedDetails = sanitizeClientDebugDetails(msg.event.trim(), details as Record<string, unknown>);
+              if (msg.event.trim() === 'recording-start-request' || msg.event.trim() === 'recording-started') {
+                startJerryPcmCapture(sanitizedDetails);
+              } else if (msg.event.trim() === 'recording-stop-request') {
+                void finalizeJerryPcmCapture('recording-stop-request');
+              }
           recordJerryDebug('client-debug', {
             connectionId,
             turnId: guestTurnId,
             category,
             clientEvent: msg.event.trim().slice(0, 80),
             details: sanitizedDetails,
+                ...(jerryCapture
+                  ? {
+                      episodeId: jerryCapture.episodeId,
+                      captureId: jerryCapture.captureId,
+                      streamId: jerryCapture.streamId,
+                    }
+                  : {}),
           });
         } else if (msg.type === 'activity-start') {
           lastFinalGuestTranscript = '';
           lastLiveFinalCandidate = '';
+          lastLiveInterimTranscript = '';
+          guestTurnEnded = false;
           guestTurnId += 1;
           guestTurnStartedAt = Date.now();
           guestAudioChunkCount = 0;
@@ -1251,7 +1868,7 @@ CRITICAL RULES:
           guestPcmChunks = [];
           console.info('[Jerry Engine]', {
             engineVersion: JERRY_ENGINE_VERSION,
-            stage: 'hebrew-transcribe-start',
+              stage: 'code-switch-transcribe-start',
           });
           recordJerryDebug('guest-turn-start', { connectionId, turnId: guestTurnId });
           transcribeSession.sendRealtimeInput({ activityStart: {} });
@@ -1267,12 +1884,25 @@ CRITICAL RULES:
             },
           });
         } else if (msg.type === 'activity-end') {
+          if (guestTurnEnded) {
+            recordJerryDebug('duplicate-activity-end-ignored', {
+              connectionId,
+              turnId: guestTurnId,
+            });
+          void appendCanonicalEvent('conversation-event', {
+            event: msg.event.trim(),
+            category,
+            details: sanitizedDetails,
+          });
+            return;
+          }
+          guestTurnEnded = true;
           const completedTurnId = guestTurnId;
           const completedTurnChunks = guestPcmChunks;
           guestPcmChunks = [];
           console.info('[Jerry Engine]', {
             engineVersion: JERRY_ENGINE_VERSION,
-            stage: 'hebrew-transcribe-end-awaiting-authoritative-final',
+            stage: 'code-switch-transcribe-end-awaiting-authoritative-final',
           });
           recordJerryDebug('guest-turn-end', {
             connectionId,
@@ -1307,10 +1937,18 @@ CRITICAL RULES:
                 recordJerryDebug('authoritative-timeout', { connectionId, turnId: completedTurnId });
               }
             }
-            const finalTranscript = authoritativeTranscript || lastLiveFinalCandidate;
             if (completedTurnId !== guestTurnId) return;
+            const finalTranscript =
+              authoritativeTranscript || lastLiveFinalCandidate || lastLiveInterimTranscript;
             if (!finalTranscript) {
-              recordJerryDebug('turn-aborted-no-transcript', { connectionId, turnId: completedTurnId });
+              recordJerryDebug('turn-aborted-no-transcript', {
+                connectionId,
+                turnId: completedTurnId,
+                audioChunks: completedTurnChunks.length,
+                audioBytes: completedTurnChunks.reduce((total, chunk) => total + chunk.length, 0),
+                hadLiveFinalCandidate: Boolean(lastLiveFinalCandidate),
+                hadLiveInterimTranscript: Boolean(lastLiveInterimTranscript),
+              });
               if (client.readyState === WebSocket.OPEN) {
                 client.send(JSON.stringify({ type: 'stt-error', message: 'No final Hebrew transcript was produced' }));
               }
@@ -1318,6 +1956,12 @@ CRITICAL RULES:
             }
             if (finalTranscript === lastFinalGuestTranscript) return;
             lastFinalGuestTranscript = finalTranscript;
+            void appendCanonicalEvent('transcript', {
+              speaker: 'human',
+              text: finalTranscript,
+              turnId: completedTurnId,
+              source: 'stt',
+            });
             console.info('[Jerry STT] authoritative Hebrew transcript:', finalTranscript);
             recordJerryDebug(authoritativeTranscript ? 'authoritative-success' : 'authoritative-fallback', {
               connectionId,
@@ -1346,6 +1990,7 @@ CRITICAL RULES:
 
     client.on('close', () => {
       recordJerryDebug('socket-closed', { connectionId, turnId: guestTurnId });
+      void finalizeJerryPcmCapture('socket-closed');
       try {
         liveSession?.close();
       } catch {}

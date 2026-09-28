@@ -8,7 +8,10 @@
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
     "lint": "tsc --noEmit",
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --import tsx --test tests/*.test.mjs",
+    "test:e2e:podcast": "tsx tests/e2e/podcast.spec.ts",
+    "test:e2e:canonical": "tsx tests/e2e/canonical-capture.spec.ts",
+    "release:gate": "npm test && npm run lint && npm run build && npm run test:e2e:podcast"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
