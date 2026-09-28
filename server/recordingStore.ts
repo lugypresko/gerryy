@@ -30,6 +30,11 @@ export interface RecordingArchiveInput {
 const ASSET_NAMES = ['master', 'jerry', 'guest', 'conversation'] as const;
 type AssetName = (typeof ASSET_NAMES)[number];
 
+/** Root for append-only canonical capture sessions owned by the recording store. */
+export function canonicalCaptureRoot(rootDir: string): string {
+  return path.join(rootDir, 'captures');
+}
+
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   if (value && typeof value === 'object') {

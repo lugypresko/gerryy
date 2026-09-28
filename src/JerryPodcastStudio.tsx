@@ -18,6 +18,7 @@ import { createRecordingGraph, type RecordingGraph, type RecordingMetrics } from
 import { finalizeEpisode, type FinalizedEpisode } from './audio/episodeFinalizer';
 import { createRecordingSession, type RecordingSession } from './audio/recordingSession';
 import { createRecordingOutbox, type RecordingOutbox } from './audio/recordingOutbox';
+import { createHumanArchiveCapture } from './audio/humanArchiveCapture';
 import { RecordingLibrary } from './components/RecordingLibrary';
 import {
   appendConversationTurn,
@@ -58,10 +59,14 @@ const JERRY_INITIAL_OPENING =
 const MICROPHONE_CAPTURE_CONSTRAINTS = {
   echoCancellation: true,
   noiseSuppression: true,
-  autoGainControl: false,
+  // The live STT path bypasses the recording graph, so browser AGC is required
+  // to prevent quiet microphones from reaching Gemini below the speech floor.
+  // The recording graph still applies bounded per-speaker leveling afterwards.
+  autoGainControl: true,
 } as const;
 
 export const RECORDING_LEVELS_INTERVAL_MS = 1000;
+export const LIVE_MIC_SPEECH_FLOOR_DBFS = -60;
 const RECORDING_REVIEW_DELTA_DB = 3;
 const RECORDING_FAILURE_DELTA_DB = 6;
 
@@ -179,10 +184,21 @@ export function JerryPodcastStudio() {
   const micMediaStreamRef = useRef<MediaStream | null>(null);
   const episodeOwnsMicRef = useRef(false);
   const recordingModeRef = useRef<'dual-channel' | 'jerry-only' | null>(null);
+  const humanArchiveCaptureRef = useRef<ReturnType<typeof createHumanArchiveCapture> | null>(null);
+  const humanArchiveUsesLiveTapRef = useRef(false);
+  const isEpisodeRecordingRef = useRef(false);
+  const episodeIdRef = useRef<string | null>(null);
   const timerIntervalRef = useRef<any>(null);
   const recordingLevelsLastSentAtRef = useRef(0);
   const latestRecordingMetricsRef = useRef<RecordingMetrics | null>(null);
   const publicationStatusRef = useRef<RecordingPublicationStatus>('failed');
+  const recordingIdRef = useRef<string | null>(null);
+  const recordingStopRequestRef = useRef<string | null>(null);
+  const recordingStopPromiseRef = useRef<Promise<void> | null>(null);
+  const recordingStopCompletionRef = useRef<{ resolve: () => void; reject: (error: unknown) => void } | null>(null);
+  const recordingAckWaitersRef = useRef(
+    new Map<string, { resolve: (value: unknown) => void; reject: (error: unknown) => void; timeout: number }>(),
+  );
 
   // Gemini Live low-latency streaming refs
   const liveSocketRef = useRef<WebSocket | null>(null);
@@ -210,6 +226,7 @@ export function JerryPodcastStudio() {
   const getUserMediaRequestRef = useRef(0);
   const lastEnergyTransitionRef = useRef(0);
   const liveMicDebugChunkCountRef = useRef(0);
+  const liveMicMaxRmsDbfsRef = useRef(-Infinity);
   const liveJerryDebugChunkCountRef = useRef(0);
   const isJerrySpeakingRef = useRef(false);
   const guestVadStateRef = useRef<GuestVadState>(createGuestVadState());
@@ -232,6 +249,36 @@ export function JerryPodcastStudio() {
   const emitRecordingDebugEvent = useCallback((event: string, details: Record<string, unknown> = {}) => {
     sendDebugEvent(event, 'recording', details);
   }, [sendDebugEvent]);
+
+  const waitForRecordingAck = useCallback((requestId: string) => {
+    const socket = liveSocketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error('Jerry Live socket is unavailable for recording finalization'));
+    }
+    return new Promise((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        recordingAckWaitersRef.current.delete(requestId);
+        reject(new Error('Timed out waiting for recording-stop-ack'));
+      }, 8000);
+      recordingAckWaitersRef.current.set(requestId, { resolve, reject, timeout });
+    });
+  }, []);
+
+  const finalizeServerRecording = useCallback(async (requestId: string, shadowBytes: number) => {
+    const socket = liveSocketRef.current;
+    const recordingId = recordingIdRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN || !recordingId) {
+      throw new Error('Server recording session is unavailable');
+    }
+    const ackPromise = waitForRecordingAck(requestId);
+    socket.send(JSON.stringify({
+      type: 'recording-finalize',
+      recordingId,
+      requestId,
+      shadowBytes,
+    }));
+    await ackPromise;
+  }, [waitForRecordingAck]);
 
   const refreshAudioInputDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -508,11 +555,34 @@ export function JerryPodcastStudio() {
   }, []);
 
   const stopLiveMic = useCallback(() => {
+    const maxRmsDbfs = liveMicMaxRmsDbfsRef.current;
+    if (maxRmsDbfs < LIVE_MIC_SPEECH_FLOOR_DBFS) {
+      sendDebugEvent('input-too-quiet', 'noise', {
+        maxRmsDbfs: Number.isFinite(maxRmsDbfs) ? Number(maxRmsDbfs.toFixed(2)) : null,
+        speechFloorDbfs: LIVE_MIC_SPEECH_FLOOR_DBFS,
+      });
+      setErrorNotice('קלט המיקרופון חלש מדי לתמלול אמין. בדוק את המיקרופון, ההרשאה והעוצמה ונסה שוב.');
+    }
     finishGuestInterruption();
     guestVadStateRef.current = createGuestVadState();
     endRecordedTurn(liveInputTranscriptRef.current);
     getUserMediaRequestRef.current += 1;
     liveMicActiveRef.current = false;
+
+    if (isEpisodeRecordingRef.current && humanArchiveUsesLiveTapRef.current && liveMicStreamRef.current) {
+      const archiveContext = liveMicContextRef.current;
+      if (archiveContext) {
+        humanArchiveCaptureRef.current?.stop();
+        humanArchiveCaptureRef.current = createHumanArchiveCapture({
+          context: archiveContext,
+          stream: liveMicStreamRef.current,
+          episodeId: episodeIdRef.current || `episode-${Date.now()}`,
+          getSocket: () => liveSocketRef.current,
+        });
+        humanArchiveCaptureRef.current.start();
+        humanArchiveUsesLiveTapRef.current = false;
+      }
+    }
 
     try {
       liveMicProcessorRef.current?.disconnect();
@@ -599,6 +669,7 @@ export function JerryPodcastStudio() {
         liveSocketRef.current.send(JSON.stringify({ type: 'activity-start' }));
       }
       liveMicDebugChunkCountRef.current = 0;
+      liveMicMaxRmsDbfsRef.current = -Infinity;
       sendDebugEvent('mic-activity-start', 'mic', {
         deviceId: selectedAudioInputId || 'default',
       });
@@ -609,7 +680,7 @@ export function JerryPodcastStudio() {
       }
 
       track.onended = () => {
-        if (!liveMicActiveRef.current) return;
+        if (!liveMicActiveRef.current && !humanArchiveUsesLiveTapRef.current) return;
         liveMicActiveRef.current = false;
         setIsRecordingMic(false);
         setErrorNotice('המיקרופון נסגר על ידי הדפדפן או מערכת ההפעלה. בדוק הרשאת מיקרופון ונסה שוב.');
@@ -635,6 +706,7 @@ export function JerryPodcastStudio() {
         for (let i = 0; i < input.length; i++) vadSumSquares += input[i] * input[i];
         const vadRms = Math.sqrt(vadSumSquares / Math.max(1, input.length));
         const guestSpeechRmsDbfs = 20 * Math.log10(Math.max(vadRms, 0.00001));
+        liveMicMaxRmsDbfsRef.current = Math.max(liveMicMaxRmsDbfsRef.current, guestSpeechRmsDbfs);
         const vadTransition = updateGuestVad(guestVadStateRef.current, guestSpeechRmsDbfs);
         guestVadStateRef.current = vadTransition.state;
 
@@ -654,6 +726,11 @@ export function JerryPodcastStudio() {
           finishGuestInterruption();
         }
 
+        if (humanArchiveUsesLiveTapRef.current) {
+          humanArchiveCaptureRef.current?.sendFrame(input, micCtx.sampleRate);
+        }
+
+        if (!liveMicActiveRef.current) return;
         const socket = liveSocketRef.current;
         if (!socket || socket.readyState !== WebSocket.OPEN) return;
         const pcm = resampleTo16kPcm(input, micCtx.sampleRate);
@@ -958,6 +1035,36 @@ export function JerryPodcastStudio() {
             return;
           }
 
+          if (msg.type === 'recording-stop-ack') {
+            const waiter = typeof msg.requestId === 'string'
+              ? recordingAckWaitersRef.current.get(msg.requestId)
+              : undefined;
+            if (waiter) {
+              window.clearTimeout(waiter.timeout);
+              recordingAckWaitersRef.current.delete(msg.requestId);
+              waiter.resolve(msg);
+            }
+            sendDebugEvent('recording-stop-ack', 'recording', {
+              recordingId: msg.recordingId,
+              requestId: msg.requestId,
+              inflight: msg.inflight,
+            });
+            return;
+          }
+
+          if (msg.type === 'recording-stop-error') {
+            const waiter = typeof msg.requestId === 'string'
+              ? recordingAckWaitersRef.current.get(msg.requestId)
+              : undefined;
+            if (waiter) {
+              window.clearTimeout(waiter.timeout);
+              recordingAckWaitersRef.current.delete(msg.requestId);
+              waiter.reject(new Error(msg.message || 'Server recording finalization failed'));
+            }
+            sendDebugEvent('recording-stop-error', 'recording', { requestId: msg.requestId, message: msg.message });
+            return;
+          }
+
           if (msg.type === 'audio' && msg.data) {
             liveJerryDebugChunkCountRef.current += 1;
             if (liveJerryDebugChunkCountRef.current % 10 === 0) {
@@ -1184,6 +1291,11 @@ export function JerryPodcastStudio() {
   }, []);
 
   const cleanupRecordingResources = useCallback(() => {
+    humanArchiveCaptureRef.current?.stop();
+    humanArchiveCaptureRef.current = null;
+    humanArchiveUsesLiveTapRef.current = false;
+    isEpisodeRecordingRef.current = false;
+    episodeIdRef.current = null;
     const session = recordingSessionRef.current;
     recordingSessionRef.current = null;
     if (session) session.abort();
@@ -1531,8 +1643,35 @@ export function JerryPodcastStudio() {
       episodeOwnsMicRef.current = false;
     };
 
+    if (recordingStopPromiseRef.current) {
+      return recordingStopPromiseRef.current;
+    }
+
     if (isEpisodeRecording) {
-      sendDebugEvent('recording-stop-request', 'recording', { mode: recordingModeRef.current });
+      isEpisodeRecordingRef.current = false;
+      humanArchiveCaptureRef.current?.stop();
+      emitRecordingDebugEvent('human-archive-stop', { episodeId: episodeIdRef.current });
+      const requestId = `stop-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+      const stopAt = Date.now();
+      const stopPromise = new Promise<void>((resolve, reject) => {
+        recordingStopCompletionRef.current = { resolve, reject };
+      });
+      recordingStopPromiseRef.current = stopPromise;
+      recordingStopRequestRef.current = requestId;
+      sendDebugEvent('recording-stop-request', 'recording', {
+        mode: recordingModeRef.current,
+        recordingId: recordingIdRef.current,
+        requestId,
+        stopAt,
+      });
+      if (liveSocketRef.current?.readyState === WebSocket.OPEN && recordingIdRef.current) {
+        liveSocketRef.current.send(JSON.stringify({
+          type: 'recording-stop-request',
+          recordingId: recordingIdRef.current,
+          requestId,
+          stopAt,
+        }));
+      }
       // STOP recording. Important: do not stop the mic tracks here.
       // MediaRecorder still needs its source alive while it flushes/finalizes the last chunk.
       const recorder = mediaRecorderRef.current;
@@ -1551,14 +1690,22 @@ export function JerryPodcastStudio() {
           console.error('[Podcast Recorder] error stopping MediaRecorder:', e);
           cleanupRecordingGraph();
           stopMicTracks();
+          recordingStopCompletionRef.current?.reject(e);
+          recordingStopCompletionRef.current = null;
+          recordingStopPromiseRef.current = null;
+          recordingStopRequestRef.current = null;
           setErrorNotice('לא ניתן היה לסיים את ההקלטה כראוי.');
         }
       } else {
         cleanupRecordingGraph();
         stopMicTracks();
+        recordingStopCompletionRef.current?.resolve();
+        recordingStopCompletionRef.current = null;
+        recordingStopPromiseRef.current = null;
+        recordingStopRequestRef.current = null;
       }
       setIsEpisodeRecording(false);
-      return;
+      return stopPromise;
     }
 
     // START recording
@@ -1629,6 +1776,32 @@ export function JerryPodcastStudio() {
         }
 
         micMediaStreamRef.current = micStream;
+        const episodeId = `episode-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        episodeIdRef.current = episodeId;
+        // Establish the server-owned capture before the archive processor can
+        // emit its first frame; otherwise the first Human chunks have no
+        // canonical episode to attach to.
+        if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
+          liveSocketRef.current.send(JSON.stringify({
+            type: 'recording-start',
+            recordingId: episodeId,
+          }));
+        } else {
+          emitRecordingDebugEvent('recording-server-session-unavailable', { recordingId: episodeId });
+        }
+        const usesLiveTap = micStream === liveMicStreamRef.current && liveMicActiveRef.current;
+        humanArchiveCaptureRef.current?.stop();
+        humanArchiveCaptureRef.current = createHumanArchiveCapture({
+          context: ctx,
+          stream: usesLiveTap ? undefined : micStream,
+          captureFromStream: !usesLiveTap,
+          episodeId,
+          getSocket: () => liveSocketRef.current,
+        });
+        humanArchiveCaptureRef.current.start();
+        humanArchiveUsesLiveTapRef.current = usesLiveTap;
+        isEpisodeRecordingRef.current = true;
+        emitRecordingDebugEvent('human-archive-start', { episodeId, sampleRate: ctx.sampleRate });
 
         const guestSource = ctx ? ctx.createMediaStreamSource(micStream) : null;
         const graph = ctx && jerryRecordingInputRef.current
@@ -1721,8 +1894,9 @@ export function JerryPodcastStudio() {
       const options: MediaRecorderOptions = chosenMime ? { mimeType: chosenMime } : {};
       const mediaRecorder = new MediaRecorder(streamToRecord, options);
       const actualMime = mediaRecorder.mimeType || chosenMime || 'audio/webm';
-      const recordingOutbox = await createRecordingOutbox();
+      const recordingOutbox = await createRecordingOutbox({ episodeId: episodeIdRef.current || undefined });
       recordingOutboxRef.current = recordingOutbox;
+      recordingIdRef.current = recordingOutbox.episodeId;
       const extension = actualMime.includes('mp4')
         ? 'm4a'
         : actualMime.includes('ogg')
@@ -1760,6 +1934,7 @@ export function JerryPodcastStudio() {
       };
 
       mediaRecorder.onstop = async () => {
+        let serverFinalizationError: unknown = null;
         try {
           const finalMetrics = recordingGraphRef.current?.getMetrics() || latestRecordingMetricsRef.current;
           const finalPublicationStatus = evaluateRecordingPublication(finalMetrics);
@@ -1785,6 +1960,26 @@ export function JerryPodcastStudio() {
             mode: recordingModeRef.current,
             turnLogEntries: turnLogRef.current.length,
           });
+
+          const stopRequestId = recordingStopRequestRef.current;
+          if (stopRequestId && recordingIdRef.current) {
+            try {
+              await finalizeServerRecording(stopRequestId, blob.size);
+              emitRecordingDebugEvent('recording-server-finalized', {
+                recordingId: recordingIdRef.current,
+                requestId: stopRequestId,
+                shadowBytes: blob.size,
+              });
+            } catch (error) {
+              serverFinalizationError = error;
+              emitRecordingDebugEvent('recording-server-finalization-error', {
+                recordingId: recordingIdRef.current,
+                requestId: stopRequestId,
+                message: error instanceof Error ? error.message : String(error),
+              });
+              setErrorNotice('השרת לא אישר את סיום ההקלטה. קובץ ה־shadow נשמר מקומית לבדיקה.');
+            }
+          }
 
           if (blob.size > 0) {
             const recordingId = `episode-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
@@ -1862,6 +2057,15 @@ export function JerryPodcastStudio() {
           recordedChunksRef.current = [];
           jerryTrackChunksRef.current = [];
           guestTrackChunksRef.current = [];
+          const completion = recordingStopCompletionRef.current;
+          recordingStopCompletionRef.current = null;
+          recordingStopPromiseRef.current = null;
+          recordingStopRequestRef.current = null;
+          recordingIdRef.current = null;
+          if (completion) {
+            if (serverFinalizationError) completion.reject(serverFinalizationError);
+            else completion.resolve();
+          }
         }
       };
 

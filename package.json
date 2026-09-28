@@ -10,6 +10,7 @@
     "lint": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.mjs",
     "test:e2e:podcast": "tsx tests/e2e/podcast.spec.ts",
+    "test:e2e:canonical": "tsx tests/e2e/canonical-capture.spec.ts",
     "release:gate": "npm test && npm run lint && npm run build && npm run test:e2e:podcast"
   },
   "dependencies": {

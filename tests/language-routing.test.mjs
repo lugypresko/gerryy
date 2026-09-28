@@ -7,6 +7,7 @@ const routing = fs.existsSync('server/languageRouting.ts')
   : '';
 const server = fs.readFileSync('server.ts', 'utf8');
 const manifest = JSON.parse(fs.readFileSync('tests/fixtures/code-switching-manifest.json', 'utf8'));
+const { extractGeneratedTranscript } = await import('../server/languageRouting.ts');
 
 test('language routing defines mixed Hebrew/English preservation policy', () => {
   assert.match(routing, /export const CODE_SWITCH_LANGUAGE_CODES/);
@@ -38,4 +39,18 @@ test('live-provider proof is explicitly separated from deterministic mocks', () 
   assert.equal(manifest.liveProviderProof.required, true);
   assert.match(manifest.liveProviderProof.note, /real Gemini credential/i);
   assert.match(server, /live-provider|provider proof|providerProof/i);
+});
+
+test('authoritative transcription extracts Gemini audioTranscription parts', () => {
+  const response = {
+    text: '',
+    candidates: [{
+      content: {
+        parts: [
+          { audioTranscription: { text: 'אז איך החיים שלך?' } },
+        ],
+      },
+    }],
+  };
+  assert.equal(extractGeneratedTranscript(response), 'אז איך החיים שלך?');
 });

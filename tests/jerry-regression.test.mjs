@@ -52,6 +52,31 @@ test('Hebrew/English code-switch transcription path is present', () => {
   assert.match(server, /type:\s*'stt-error'/);
 });
 
+test('Live STT keeps an interim transcript as a safe fallback when no final arrives', () => {
+  assert.match(server, /let lastLiveInterimTranscript = ''/);
+  assert.match(server, /lastLiveInterimTranscript = interim\.trim\(\)/);
+  assert.match(server, /authoritativeTranscript \|\| lastLiveFinalCandidate \|\| lastLiveInterimTranscript/);
+});
+
+test('STT failure reports whether audio reached the server', () => {
+  assert.match(server, /turn-aborted-no-transcript/);
+  assert.match(server, /audioChunks: completedTurnChunks\.length/);
+  assert.match(server, /audioBytes: completedTurnChunks\.reduce/);
+});
+
+test('live mic exposes a speech-floor guard for unusably quiet input', () => {
+  assert.match(studio, /LIVE_MIC_SPEECH_FLOOR_DBFS/);
+  assert.match(studio, /input-too-quiet/);
+  assert.match(studio, /maxRmsDbfs/);
+});
+
+test('activity-end is idempotent and cannot finalize an empty duplicate turn', () => {
+  assert.match(server, /let guestTurnEnded = false/);
+  assert.match(server, /guestTurnEnded = true/);
+  assert.match(server, /if \(guestTurnEnded\) \{/);
+  assert.match(server, /guestTurnEnded = false/);
+});
+
 test('authoritative guest transcript is finalized from the complete turn audio', () => {
   assert.match(server, /guestPcmChunks/);
   assert.match(server, /Buffer\.from\(msg\.data,\s*'base64'\)/);
@@ -92,6 +117,39 @@ test('Jerry debug monitor records the complete live turn chain', () => {
   assert.match(server, /guest-transcript-forwarded/);
   assert.match(server, /jerry-audio/);
   assert.match(server, /jerry-turn-complete/);
+});
+
+test('server captures Jerry PCM before browser forwarding with stable stream identity', () => {
+  assert.match(server, /interface JerryPcmCaptureMetadata/);
+  assert.match(server, /jerryPcmChunks/);
+  assert.match(server, /jerry-audio-captured/);
+  assert.match(server, /captureId/);
+  assert.match(server, /sequence/);
+  assert.match(server, /sampleRate/);
+  assert.match(server, /mimeType/);
+
+  const captureIndex = server.indexOf("recordJerryDebug('jerry-audio-captured'");
+  const forwardingIndex = server.indexOf("type: 'audio'", captureIndex);
+  assert.ok(captureIndex >= 0, 'Jerry PCM must be captured and identified');
+  assert.ok(forwardingIndex > captureIndex, 'capture must happen before browser forwarding');
+});
+
+test('Jerry PCM capture follows recording lifecycle and finalizes on stop or socket close', () => {
+  assert.match(server, /recording-start-request/);
+  assert.match(server, /recording-stop-request/);
+  assert.match(server, /jerry-capture-started/);
+  assert.match(server, /jerry-capture-finalized/);
+  assert.match(server, /finalizeJerryPcmCapture\(/);
+  assert.match(server, /client\.on\('close'[\s\S]{0,1200}finalizeJerryPcmCapture/);
+  assert.match(server, /Buffer\.concat\(jerryPcmChunks\)/);
+});
+
+test('Jerry PCM capture preserves actual MIME/sample-rate metadata without changing STT input', () => {
+  assert.match(server, /parsePcmMimeType/);
+  assert.match(server, /actualMimeType/);
+  assert.match(server, /jerry-capture-metadata\.json/);
+  assert.match(server, /audio\/pcm;rate=24000/);
+  assert.match(server, /transcribeSession\.sendRealtimeInput\(/);
 });
 
 test('authoritative STT cannot hang silently and reports an explicit timeout', () => {

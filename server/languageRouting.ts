@@ -11,6 +11,35 @@ export const CODE_SWITCH_PRESERVATION_POLICY = {
   preserveCodeSwitching: true,
 };
 
+export function extractGeneratedTranscript(response: unknown): string {
+  if (!response || typeof response !== 'object') return '';
+  const candidateResponse = response as {
+    text?: unknown;
+    candidates?: Array<{ content?: { parts?: Array<Record<string, unknown>> } }>;
+  };
+
+  if (typeof candidateResponse.text === 'string' && candidateResponse.text.trim()) {
+    return candidateResponse.text.trim();
+  }
+
+  const parts = (candidateResponse.candidates || []).flatMap(
+    (candidate) => candidate.content?.parts || [],
+  );
+  const text = parts
+    .map((part) => {
+      if (typeof part.text === 'string') return part.text;
+      const transcription = part.audioTranscription || part.audio_transcription;
+      return transcription && typeof transcription === 'object' && 'text' in transcription
+        ? transcription.text
+        : '';
+    })
+    .filter((value): value is string => typeof value === 'string')
+    .join('')
+    .trim();
+
+  return text;
+}
+
 export function buildJerryLanguagePrompt(basePrompt: string): string {
   return `${basePrompt}
 
