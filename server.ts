@@ -852,7 +852,9 @@ CRITICAL RULES:
     let lastFinalGuestTranscript = '';
 
     try {
-      const ai = new GoogleGenAI({ apiKey: key });
+      // This app uses Gemini Developer API keys (GEMINI_API_KEY), not Vertex AI.
+      // Explicitly opt out of SDK environment-based Vertex AI selection.
+      const ai = new GoogleGenAI({ apiKey: key, vertexai: false });
 
       transcribeSession = await ai.live.connect({
         model: 'gemini-3.5-transcribe-live',
