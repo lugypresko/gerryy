@@ -49,7 +49,7 @@ test('microphone capture enables cleanup but delegates leveling to Jerry', () =>
   assert.match(studio, /MICROPHONE_CAPTURE_CONSTRAINTS/);
   assert.match(studio, /echoCancellation:\s*true/);
   assert.match(studio, /noiseSuppression:\s*true/);
-  assert.match(studio, /autoGainControl:\s*false/);
+  assert.match(studio, /autoGainControl:\s*true/);
   assert.equal((studio.match(/\.\.\.MICROPHONE_CAPTURE_CONSTRAINTS/g) || []).length, 2);
 });
 

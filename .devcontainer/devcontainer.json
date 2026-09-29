@@ -1,0 +1,21 @@
+{
+  "name": "gerryy",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "forwardPorts": [3000],
+  "portsAttributes": {
+    "3000": {
+      "label": "gerryy",
+      "onAutoForward": "openBrowser"
+    }
+  },
+  "postCreateCommand": "npm ci",
+  "remoteUser": "node",
+  "customizations": {
+    "vscode": {
+      "extensions": ["dbaeumer.vscode-eslint"]
+    }
+  }
+}
