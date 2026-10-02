@@ -7,7 +7,10 @@ export type JerryHealthComponent =
   | 'jerry_capture'
   | 'recording'
   | 'finalization'
-  | 'processing';
+  | 'processing'
+  | 'client_runtime'
+  | 'network'
+  | 'server_runtime';
 
 export type JerryHealthState =
   | 'unknown'
@@ -54,6 +57,9 @@ const COMPONENTS: JerryHealthComponent[] = [
   'recording',
   'finalization',
   'processing',
+  'client_runtime',
+  'network',
+  'server_runtime',
 ];
 
 function initialComponent(): JerryComponentHealth {
