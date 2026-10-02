@@ -1,0 +1,58 @@
+name: Health Monitor POC CI
+
+on:
+  push:
+    branches:
+      - poc/slow-brain-observer
+
+jobs:
+  verify-health-monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Health supervisor tests
+        run: node --import tsx --test tests/health-supervisor.test.mjs
+      - name: Slow brain tests
+        run: node --import tsx --test tests/slow-brain.test.mjs
+      - name: Typecheck
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Production smoke + health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          NODE_ENV=production JERRY_SLOW_BRAIN_ENABLED=true node dist/server.cjs > /tmp/jerry-server.log 2>&1 &
+          PID=$!
+          trap 'kill $PID || true; cat /tmp/jerry-server.log' EXIT
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:3000/api/jerry-health > /tmp/health.json; then
+              break
+            fi
+            sleep 0.25
+          done
+          grep -q '"ok":true' /tmp/health.json
+          grep -q '"sessions":' /tmp/health.json
+
+          node --input-type=module <<'NODE'
+          import WebSocket from 'ws';
+          const ws = new WebSocket('ws://127.0.0.1:3000/api/jerry-live-socket');
+          const timeout = setTimeout(() => process.exit(1), 5000);
+          ws.on('message', async (data) => {
+            const msg = JSON.parse(data.toString());
+            if (msg.type === 'health-update' || (msg.type === 'error' && /No Gemini API key/.test(msg.message || ''))) {
+              const res = await fetch('http://127.0.0.1:3000/api/jerry-health');
+              const body = await res.json();
+              if (!body.ok || !Array.isArray(body.sessions) || body.sessions.length < 1) process.exit(2);
+              clearTimeout(timeout);
+              ws.close();
+              process.exit(0);
+            }
+          });
+          ws.on('error', () => process.exit(3));
+          NODE
