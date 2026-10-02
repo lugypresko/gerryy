@@ -1,0 +1,79 @@
+name: Slow Brain POC CI
+
+on:
+  push:
+    branches:
+      - poc/slow-brain-observer
+
+jobs:
+  test-build-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm install
+
+      - name: Unit and regression tests
+        run: npm test
+
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Smoke production server without provider key
+        shell: bash
+        run: |
+          set -euo pipefail
+          NODE_ENV=production JERRY_SLOW_BRAIN_ENABLED=true node dist/server.cjs > /tmp/jerry-server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID || true; cat /tmp/jerry-server.log' EXIT
+
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:3000/api/key > /tmp/key.json; then
+              break
+            fi
+            sleep 0.5
+          done
+
+          grep -q '"apiKey"' /tmp/key.json
+          curl -fsS http://127.0.0.1:3000/ > /tmp/index.html
+          grep -qi '<html' /tmp/index.html
+
+          node --input-type=module <<'NODE'
+          import WebSocket from 'ws';
+
+          const ws = new WebSocket('ws://127.0.0.1:3000/api/jerry-live-socket');
+
+          const timeout = setTimeout(() => {
+            console.error('WebSocket smoke test timed out');
+            process.exit(1);
+          }, 5000);
+
+          ws.on('message', (data) => {
+            const msg = JSON.parse(data.toString());
+            if (msg.type === 'error' && /No Gemini API key/.test(msg.message || '')) {
+              clearTimeout(timeout);
+              ws.close();
+              process.exit(0);
+            }
+          });
+
+          ws.on('error', (err) => {
+            clearTimeout(timeout);
+            console.error(err);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Slow brain focused test
+        run: node --import tsx --test tests/slow-brain.test.mjs
