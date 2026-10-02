@@ -80,15 +80,27 @@ async function runTool(command, args) {
 }
 
 function findChrome() {
-  return process.env.CHROME_PATH || [
-    'C:/Program Files/Google/Chrome/Application/chrome.exe',
-    'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
-    'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
-    '/usr/bin/google-chrome',
-    '/usr/bin/chromium',
-  ].find((candidate) => candidate.includes('/') && candidate.includes(':')
-    ? true
-    : false);
+  if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
+
+  const candidates = process.platform === 'win32'
+    ? [
+        'C:/Program Files/Google/Chrome/Application/chrome.exe',
+        'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
+        'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+      ]
+    : [
+        '/usr/bin/google-chrome',
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+      ];
+
+  return candidates.find((candidate) => {
+    try {
+      return require('node:fs').existsSync(candidate);
+    } catch {
+      return false;
+    }
+  });
 }
 
 async function freePort() {
