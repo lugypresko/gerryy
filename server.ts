@@ -24,6 +24,11 @@ import {
   SLOW_BRAIN_FAST_BRAIN_INSTRUCTION,
   type SlowBrainTurn,
 } from './server/slowBrain';
+import {
+  JerryHealthRegistry,
+  type JerryHealthComponent,
+  type JerryHealthState,
+} from './server/healthSupervisor';
 
 const PORT = 3000;
 const JERRY_ENGINE_VERSION = 'jerry-conversation-v3-2026-09-26';
@@ -41,6 +46,7 @@ const canonicalCaptureHttpStore = new CanonicalCaptureStore(RECORDINGS_DIR);
 const JERRY_DEBUG_MAX_EVENTS = 200;
 const jerryDebugEvents: Array<Record<string, unknown>> = [];
 let nextJerryConnectionId = 1;
+const jerryHealthRegistry = new JerryHealthRegistry(30);
 
 interface JerryPcmCaptureMetadata {
   captureId: string;
@@ -653,6 +659,16 @@ async function startServer() {
       maxEvents: JERRY_DEBUG_MAX_EVENTS,
       events: jerryDebugEvents,
     });
+  });
+
+  app.get('/api/jerry-health', (req, res) => {
+    const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : '';
+    if (sessionId) {
+      const supervisor = jerryHealthRegistry.get(sessionId);
+      if (!supervisor) return res.status(404).json({ ok: false, error: 'Unknown Jerry health session' });
+      return res.json({ ok: true, session: supervisor.snapshot() });
+    }
+    return res.json({ ok: true, sessions: jerryHealthRegistry.list() });
   });
 
   app.post('/api/recordings/artifact', (req, res) => {
@@ -1332,9 +1348,56 @@ CRITICAL RULES:
 
   wss.on('connection', async (client) => {
     const connectionId = nextJerryConnectionId++;
-    recordJerryDebug('socket-connected', { connectionId });
+    const healthSessionId = `conn-${connectionId}`;
+    const health = jerryHealthRegistry.create(healthSessionId);
+    const healthRecord = (
+      component: JerryHealthComponent,
+      event: string,
+      state: JerryHealthState,
+      details: {
+        latencyMs?: number;
+        errorCode?: string;
+        recoveryAction?: string;
+        details?: Record<string, unknown>;
+      } = {},
+    ) => {
+      const healthEvent = health.record({
+        component,
+        event,
+        state,
+        ...(details.latencyMs !== undefined ? { latencyMs: details.latencyMs } : {}),
+        ...(details.errorCode ? { errorCode: details.errorCode } : {}),
+        ...(details.recoveryAction ? { recoveryAction: details.recoveryAction } : {}),
+        ...(details.details ? { details: details.details } : {}),
+      });
+      recordJerryDebug('health-event', {
+        connectionId,
+        healthSessionId,
+        component,
+        healthEvent: event,
+        state,
+        errorCode: details.errorCode,
+        recoveryAction: details.recoveryAction,
+      });
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({
+          type: 'health-update',
+          sessionId: healthSessionId,
+          event: healthEvent,
+          snapshot: health.snapshot(),
+        }));
+      }
+      return healthEvent;
+    };
+
+    healthRecord('socket', 'connected', 'healthy');
+    recordJerryDebug('socket-connected', { connectionId, healthSessionId });
     const key = getApiKey();
     if (!key) {
+      healthRecord('live', 'missing_api_key', 'failed_safe', {
+        errorCode: 'missing_api_key',
+        recoveryAction: 'configure_api_key',
+      });
       client.send(JSON.stringify({ type: 'error', message: 'No Gemini API key available on server.' }));
       client.close();
       return;
@@ -1377,6 +1440,9 @@ CRITICAL RULES:
       if (!slowBrain) return;
       void slowBrain.kick().then((observation) => {
         if (!observation) return;
+        healthRecord('slow_brain', 'observation_ready', 'healthy', {
+          details: { type: observation.type, confidence: observation.confidence },
+        });
         recordJerryDebug('slow-brain-observation-ready', {
           connectionId,
           type: observation.type,
@@ -1435,6 +1501,7 @@ CRITICAL RULES:
         byteLength: 0,
       };
       jerryCaptureActive = true;
+      healthRecord('jerry_capture', 'capture_started', 'recovering', { recoveryAction: 'await_first_frame' });
       recordJerryDebug('jerry-capture-started', { ...jerryCapture });
       return jerryCapture;
     };
@@ -1452,6 +1519,9 @@ CRITICAL RULES:
       }
       if (!jerryCapture.mimeTypes.includes(parsed.mimeType)) {
         jerryCapture.mimeTypes.push(parsed.mimeType);
+      }
+      if (jerryCapture.chunkCount === 1) {
+        healthRecord('jerry_capture', 'first_audio_frame', 'healthy');
       }
       recordJerryDebug('jerry-audio-captured', {
         connectionId,
@@ -1509,12 +1579,19 @@ CRITICAL RULES:
             path.join(captureDir, 'jerry-capture-metadata.json'),
             JSON.stringify(metadata, null, 2),
           );
+          healthRecord('jerry_capture', 'capture_finalized', 'healthy', {
+            details: { persistedBytes: pcm.length },
+          });
           recordJerryDebug('jerry-capture-finalized', {
             ...metadata,
             file: path.relative(RECORDINGS_DIR, path.join(captureDir, 'jerry.pcm')),
             persistedBytes: pcm.length,
           });
         } catch (error) {
+          healthRecord('jerry_capture', 'capture_finalize_error', 'degraded', {
+            errorCode: 'jerry_capture_finalize_error',
+            recoveryAction: 'preserve_raw_and_continue',
+          });
           recordJerryDebug('jerry-capture-finalization-error', {
             ...metadata,
             message: error instanceof Error ? error.message : String(error),
@@ -1533,26 +1610,47 @@ CRITICAL RULES:
           analyze: async (turns) => {
             if (!aiClient) return null;
             const startedAt = Date.now();
-            const response = await aiClient.models.generateContent({
-              model: SLOW_BRAIN_MODEL,
-              contents: [{
-                role: 'user',
-                parts: [{ text: buildSlowBrainPrompt(turns) }],
-              }],
-              config: {
-                temperature: 0.15,
-              },
-            });
-            const raw = extractGeneratedTranscript(response);
-            const observation = parseSlowBrainObservation(raw);
-            recordJerryDebug('slow-brain-analysis-complete', {
-              connectionId,
-              model: SLOW_BRAIN_MODEL,
-              elapsedMs: Date.now() - startedAt,
-              signal: observation?.type || 'NO_SIGNAL',
-              confidence: observation?.confidence ?? null,
-            });
-            return observation;
+            try {
+              const response = await aiClient.models.generateContent({
+                model: SLOW_BRAIN_MODEL,
+                contents: [{
+                  role: 'user',
+                  parts: [{ text: buildSlowBrainPrompt(turns) }],
+                }],
+                config: {
+                  temperature: 0.15,
+                },
+              });
+              const raw = extractGeneratedTranscript(response);
+              const observation = parseSlowBrainObservation(raw);
+              const elapsedMs = Date.now() - startedAt;
+              healthRecord('slow_brain', 'analysis_complete', 'healthy', {
+                latencyMs: elapsedMs,
+                details: { signal: observation?.type || 'NO_SIGNAL' },
+              });
+              recordJerryDebug('slow-brain-analysis-complete', {
+                connectionId,
+                model: SLOW_BRAIN_MODEL,
+                elapsedMs,
+                signal: observation?.type || 'NO_SIGNAL',
+                confidence: observation?.confidence ?? null,
+              });
+              return observation;
+            } catch (error) {
+              const elapsedMs = Date.now() - startedAt;
+              healthRecord('slow_brain', 'analysis_failed', 'degraded', {
+                latencyMs: elapsedMs,
+                errorCode: 'slow_brain_failed',
+                recoveryAction: 'drop_observation_continue_live',
+              });
+              recordJerryDebug('slow-brain-analysis-failed', {
+                connectionId,
+                model: SLOW_BRAIN_MODEL,
+                elapsedMs,
+                message: error instanceof Error ? error.message : String(error),
+              });
+              return null;
+            }
           },
         });
         recordJerryDebug('slow-brain-enabled', {
@@ -1567,6 +1665,7 @@ CRITICAL RULES:
         callbacks: {
           onopen: () => {
             console.info('[Jerry STT] Hebrew/English code-switching transcriber opened');
+            healthRecord('stt', 'ready', 'healthy');
             recordJerryDebug('stt-ready', { connectionId });
           },
           onmessage: (message: any) => {
@@ -1593,6 +1692,10 @@ CRITICAL RULES:
           },
           onerror: (event: any) => {
             console.error('[Jerry STT] error:', event?.message || event);
+            healthRecord('stt', 'error', 'degraded', {
+              errorCode: 'stt_session_error',
+              recoveryAction: 'reconnect_full_live_session',
+            });
             recordJerryDebug('stt-error', { connectionId, message: event?.message || String(event) });
             if (client.readyState === WebSocket.OPEN) {
               client.send(
@@ -1601,10 +1704,24 @@ CRITICAL RULES:
                   message: event?.message || 'Transcription session error',
                 }),
               );
+              healthRecord('stt', 'reconnect_requested', 'recovering', {
+                recoveryAction: 'browser_socket_reconnect',
+              });
+              client.close(1012, 'stt-restart');
             }
           },
           onclose: (event: any) => {
             console.info('[Jerry STT] closed:', event?.reason || '');
+            healthRecord('stt', 'closed', 'degraded', {
+              errorCode: 'stt_closed',
+              recoveryAction: 'reconnect_full_live_session',
+            });
+            if (client.readyState === WebSocket.OPEN) {
+              healthRecord('stt', 'reconnect_requested', 'recovering', {
+                recoveryAction: 'browser_socket_reconnect',
+              });
+              client.close(1012, 'stt-closed');
+            }
           },
         },
         config: {
@@ -1640,6 +1757,7 @@ CRITICAL RULES:
         callbacks: {
           onopen: () => {
             console.info('[Jerry Live] Gemini session opened');
+            healthRecord('live', 'ready', 'healthy');
             recordJerryDebug('jerry-live-ready', { connectionId });
           },
           onmessage: (message: any) => {
@@ -1725,6 +1843,10 @@ CRITICAL RULES:
           },
           onerror: (event: any) => {
             console.error('[Jerry Live] Gemini error:', event?.message || event);
+            healthRecord('live', 'error', 'degraded', {
+              errorCode: 'gemini_live_error',
+              recoveryAction: 'reconnect_and_restore_history',
+            });
             recordJerryDebug('jerry-live-error', { connectionId, message: event?.message || String(event) });
             if (client.readyState === WebSocket.OPEN) {
               client.send(
@@ -1733,12 +1855,24 @@ CRITICAL RULES:
                   message: event?.message || 'Gemini Live session error',
                 }),
               );
+              healthRecord('live', 'reconnect_requested', 'recovering', {
+                recoveryAction: 'browser_socket_reconnect_restore_history',
+              });
+              client.close(1012, 'live-restart');
             }
           },
           onclose: (event: any) => {
             console.info('[Jerry Live] Gemini session closed:', event?.reason || '');
+            healthRecord('live', 'closed', 'degraded', {
+              errorCode: 'gemini_live_closed',
+              recoveryAction: 'reconnect_and_restore_history',
+            });
             if (client.readyState === WebSocket.OPEN) {
               client.send(JSON.stringify({ type: 'closed' }));
+              healthRecord('live', 'reconnect_requested', 'recovering', {
+                recoveryAction: 'browser_socket_reconnect_restore_history',
+              });
+              client.close(1012, 'live-closed');
             }
           },
         },
@@ -1767,9 +1901,14 @@ CRITICAL RULES:
                     inputPath: 'push-to-talk PCM -> Live interim STT -> full-turn Gemini 3.5 Transcribe (he-IL/en-US code-switch) -> Gemini 3.8 Live -> Jerry response',
           }),
         );
+            healthRecord('socket', 'ready_sent', 'healthy');
             recordJerryDebug('socket-ready-sent', { connectionId, engineVersion: JERRY_ENGINE_VERSION });
       }
     } catch (err: any) {
+      healthRecord('live', 'setup_failed', 'failed_safe', {
+        errorCode: 'live_setup_failed',
+        recoveryAction: 'browser_reconnect_after_socket_close',
+      });
       console.error('[Jerry Live] setup failed:', err);
       if (client.readyState === WebSocket.OPEN) {
         client.send(JSON.stringify({ type: 'error', message: err?.message || String(err) }));
@@ -1794,6 +1933,10 @@ CRITICAL RULES:
 
         if (msg.type === 'recording-start' && typeof msg.recordingId === 'string') {
           recordingLifecycle.start(msg.recordingId);
+          health.setEpisode(msg.recordingId);
+          healthRecord('recording', 'recording_started', 'healthy');
+          healthRecord('human_capture', 'capture_armed', 'recovering', { recoveryAction: 'await_first_frame' });
+          healthRecord('jerry_capture', 'capture_armed', 'recovering', { recoveryAction: 'await_first_frame' });
           canonicalCaptureId = msg.recordingId;
           canonicalAppendQueue = Promise.resolve();
           await canonicalCaptureStore.start({ episodeId: canonicalCaptureId, metadata: { connectionId } });
@@ -1847,6 +1990,8 @@ CRITICAL RULES:
                   }
                   await canonicalCaptureStore.finalize(canonicalCaptureId);
                 }
+                healthRecord('finalization', 'commit_complete', 'healthy');
+                healthRecord('recording', 'finalized', 'healthy');
                 recordJerryDebug('recording-finalize-commit', {
                   connectionId,
                   recordingId: msg.recordingId,
@@ -1862,6 +2007,10 @@ CRITICAL RULES:
               });
               if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(ack));
             } catch (error) {
+              healthRecord('finalization', 'finalize_error', 'failed_safe', {
+                errorCode: 'recording_finalize_error',
+                recoveryAction: 'preserve_raw_require_retry',
+              });
               recordJerryDebug('recording-finalize-error', {
                 connectionId,
                 requestId: msg.requestId,
@@ -1882,6 +2031,9 @@ CRITICAL RULES:
             const sampleRate = Number(msg.sampleRate);
             const sampleCount = Number(msg.sampleCount);
             const capturedAtMs = Number(msg.capturedAtMs) || Date.now();
+            healthRecord('human_capture', 'audio_frame', 'healthy', {
+              details: { sequence: Number(msg.sequence), sampleRate },
+            });
             await enqueueCanonicalAppend(() => canonicalCaptureStore.appendChunk(canonicalCaptureId!, {
               source: 'human',
               sequence: Number(msg.sequence),
@@ -1892,6 +2044,10 @@ CRITICAL RULES:
               data,
             }).then(() => undefined));
           } catch (error) {
+            healthRecord('human_capture', 'append_error', 'degraded', {
+              errorCode: 'human_capture_append_error',
+              recoveryAction: 'continue_capture_and_preserve_other_streams',
+            });
             recordJerryDebug('canonical-human-append-error', {
               connectionId,
               message: error instanceof Error ? error.message : String(error),
@@ -2129,6 +2285,9 @@ CRITICAL RULES:
     });
 
     client.on('close', () => {
+      healthRecord('socket', 'closed', 'degraded', {
+        recoveryAction: 'browser_auto_reconnect',
+      });
       recordJerryDebug('socket-closed', { connectionId, turnId: guestTurnId });
       void finalizeJerryPcmCapture('socket-closed');
       try {
