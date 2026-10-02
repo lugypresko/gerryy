@@ -4,6 +4,7 @@ import path from 'path';
 import 'dotenv/config';
 import { createServer as createViteServer } from 'vite';
 import { createServer } from 'http';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { RecordingArchiveStore } from './server/recordingStore';
@@ -47,6 +48,41 @@ const JERRY_DEBUG_MAX_EVENTS = 200;
 const jerryDebugEvents: Array<Record<string, unknown>> = [];
 let nextJerryConnectionId = 1;
 const jerryHealthRegistry = new JerryHealthRegistry(30);
+
+const serverEventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+serverEventLoopDelay.enable();
+let lastServerCpuUsage = process.cpuUsage();
+let lastServerCpuSampleAt = process.hrtime.bigint();
+let serverRuntimeSample = {
+  cpuPercent: 0,
+  eventLoopP99Ms: 0,
+  eventLoopMeanMs: 0,
+  rssMb: 0,
+  heapUsedMb: 0,
+};
+
+const serverRuntimeTimer = setInterval(() => {
+  const now = process.hrtime.bigint();
+  const elapsedUs = Number(now - lastServerCpuSampleAt) / 1000;
+  const current = process.cpuUsage();
+  const cpuDeltaUs =
+    (current.user - lastServerCpuUsage.user) +
+    (current.system - lastServerCpuUsage.system);
+  const memory = process.memoryUsage();
+
+  serverRuntimeSample = {
+    cpuPercent: elapsedUs > 0 ? Number(((cpuDeltaUs / elapsedUs) * 100).toFixed(1)) : 0,
+    eventLoopP99Ms: Number((serverEventLoopDelay.percentile(99) / 1e6).toFixed(1)),
+    eventLoopMeanMs: Number((serverEventLoopDelay.mean / 1e6).toFixed(1)),
+    rssMb: Number((memory.rss / 1024 / 1024).toFixed(1)),
+    heapUsedMb: Number((memory.heapUsed / 1024 / 1024).toFixed(1)),
+  };
+
+  serverEventLoopDelay.reset();
+  lastServerCpuUsage = current;
+  lastServerCpuSampleAt = now;
+}, 1000);
+serverRuntimeTimer.unref?.();
 
 interface JerryPcmCaptureMetadata {
   captureId: string;
@@ -1931,7 +1967,34 @@ CRITICAL RULES:
         }
         const msg = JSON.parse(rawText);
 
-        if (msg.type === 'recording-start' && typeof msg.recordingId === 'string') {
+        if (msg.type === 'health-ping' && Number.isFinite(Number(msg.sentAt))) {
+          const runtimeDegraded =
+            serverRuntimeSample.eventLoopP99Ms > 150 ||
+            serverRuntimeSample.cpuPercent > 90;
+          healthRecord(
+            'server_runtime',
+            'runtime_sample',
+            runtimeDegraded ? 'degraded' : 'healthy',
+            {
+              ...(runtimeDegraded
+                ? {
+                    errorCode: 'server_runtime_pressure',
+                    recoveryAction: 'reduce_local_work_and_preserve_live_path',
+                  }
+                : {}),
+              details: serverRuntimeSample,
+            },
+          );
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+              type: 'health-pong',
+              seq: Number(msg.seq) || 0,
+              sentAt: Number(msg.sentAt),
+              serverAt: Date.now(),
+              serverRuntime: serverRuntimeSample,
+            }));
+          }
+        } else if (msg.type === 'recording-start' && typeof msg.recordingId === 'string') {
           recordingLifecycle.start(msg.recordingId);
           health.setEpisode(msg.recordingId);
           healthRecord('recording', 'recording_started', 'healthy');
@@ -2095,7 +2158,59 @@ CRITICAL RULES:
           const category = typeof msg.category === 'string' ? msg.category.slice(0, 40) : 'client';
           const details = msg.details && typeof msg.details === 'object' ? msg.details : {};
           const sanitizedDetails = sanitizeClientDebugDetails(msg.event.trim(), details as Record<string, unknown>);
-              if (msg.event.trim() === 'recording-start-request' || msg.event.trim() === 'recording-started') {
+          const clientEvent = msg.event.trim();
+
+          if (clientEvent === 'client-runtime-sample') {
+            const eventLoopLagMs = Number((details as Record<string, unknown>).eventLoopLagMs) || 0;
+            const maxLongTaskMs = Number((details as Record<string, unknown>).maxLongTaskMs) || 0;
+            const audioUnderruns = Number((details as Record<string, unknown>).audioUnderruns) || 0;
+            const degraded = eventLoopLagMs > 150 || maxLongTaskMs > 200 || audioUnderruns > 0;
+            healthRecord('client_runtime', 'runtime_sample', degraded ? 'degraded' : 'healthy', {
+              ...(degraded
+                ? {
+                    errorCode: 'client_runtime_pressure',
+                    recoveryAction: 'reduce_browser_load_keep_audio_path',
+                  }
+                : {}),
+              details: {
+                eventLoopLagMs,
+                maxLongTaskMs,
+                audioUnderruns,
+                heapUsedMb: Number((details as Record<string, unknown>).heapUsedMb) || 0,
+                audioQueueMs: Number((details as Record<string, unknown>).audioQueueMs) || 0,
+              },
+            });
+          } else if (clientEvent === 'network-rtt') {
+            const rttMs = Number((details as Record<string, unknown>).rttMs) || 0;
+            const degraded = rttMs > 500;
+            healthRecord('network', 'rtt_sample', degraded ? 'degraded' : 'healthy', {
+              latencyMs: rttMs,
+              ...(degraded
+                ? {
+                    errorCode: 'high_rtt',
+                    recoveryAction: 'continue_and_observe_provider_latency',
+                  }
+                : {}),
+            });
+          } else if (clientEvent === 'mic-capture-gap') {
+            healthRecord('human_capture', 'capture_gap', 'degraded', {
+              errorCode: 'mic_capture_gap',
+              recoveryAction: 'continue_capture_and_flag_local_runtime',
+              details: {
+                gapMs: Number((details as Record<string, unknown>).gapMs) || 0,
+              },
+            });
+          } else if (clientEvent === 'audio-underrun') {
+            healthRecord('client_runtime', 'audio_underrun', 'degraded', {
+              errorCode: 'audio_underrun',
+              recoveryAction: 'continue_playback_and_measure_queue_depth',
+              details: {
+                queueMs: Number((details as Record<string, unknown>).queueMs) || 0,
+              },
+            });
+          }
+
+              if (clientEvent === 'recording-start-request' || clientEvent === 'recording-started') {
                 startJerryPcmCapture(sanitizedDetails);
               } else if (msg.event.trim() === 'recording-stop-request') {
                 void finalizeJerryPcmCapture('recording-stop-request');
