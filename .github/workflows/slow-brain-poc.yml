@@ -16,12 +16,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Install system audio dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg chromium
-          echo "CHROME_PATH=/usr/bin/chromium" >> "$GITHUB_ENV"
-
       - name: Install
         run: npm install
       - name: Slow brain focused test
