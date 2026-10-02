@@ -19,6 +19,8 @@ jobs:
         run: node --import tsx --test tests/health-supervisor.test.mjs
       - name: Slow brain tests
         run: node --import tsx --test tests/slow-brain.test.mjs
+      - name: Accelerated live conversation scenario
+        run: node --import tsx --test tests/live-poc-scenario.test.mjs
       - name: Typecheck
         run: npm run lint
       - name: Build
