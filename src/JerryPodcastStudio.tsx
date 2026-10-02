@@ -236,7 +236,7 @@ export function JerryPodcastStudio() {
   const sendDebugEvent = useCallback(
     (
       event: string,
-      category: 'mic' | 'pcm' | 'noise' | 'recording' | 'animation' | 'video' | 'stt' | 'jerry-audio' | 'turn-log' | 'socket',
+      category: 'mic' | 'pcm' | 'noise' | 'recording' | 'animation' | 'video' | 'stt' | 'jerry-audio' | 'turn-log' | 'socket' | 'slow-brain' | 'health',
       details: Record<string, unknown> = {},
     ) => {
       const socket = liveSocketRef.current;
