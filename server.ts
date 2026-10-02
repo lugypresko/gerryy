@@ -1385,6 +1385,14 @@ CRITICAL RULES:
           note: observation.note,
           suggestedMove: observation.suggestedMove,
         });
+        void appendCanonicalEvent('conversation-event', {
+          event: 'slow-brain-observation-ready',
+          type: observation.type,
+          confidence: observation.confidence,
+          evidence: observation.evidence,
+          note: observation.note,
+          suggestedMove: observation.suggestedMove,
+        });
         if (client.readyState === WebSocket.OPEN) {
           client.send(JSON.stringify({
             type: 'slow-brain-observation',
@@ -1693,6 +1701,7 @@ CRITICAL RULES:
             }
 
             if (serverContent?.interrupted) {
+              currentJerryTranscript = '';
               client.send(JSON.stringify({ type: 'interrupted' }));
             }
 
@@ -2083,6 +2092,15 @@ CRITICAL RULES:
                 turnId: completedTurnId,
                 type: pendingObservation.type,
                 confidence: pendingObservation.confidence,
+              });
+              void appendCanonicalEvent('conversation-event', {
+                event: 'slow-brain-observation-used',
+                turnId: completedTurnId,
+                type: pendingObservation.type,
+                confidence: pendingObservation.confidence,
+                evidence: pendingObservation.evidence,
+                note: pendingObservation.note,
+                suggestedMove: pendingObservation.suggestedMove,
               });
               if (client.readyState === WebSocket.OPEN) {
                 client.send(JSON.stringify({
