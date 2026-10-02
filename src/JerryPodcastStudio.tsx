@@ -232,6 +232,11 @@ export function JerryPodcastStudio() {
   const guestVadStateRef = useRef<GuestVadState>(createGuestVadState());
   const guestInterruptionTurnRef = useRef<GuestInterruptionTurn | null>(null);
   const liveTurnLogRef = useRef<TurnLogEntry[]>([]);
+  const lastMicProcessAtRef = useRef(0);
+  const lastMicGapDebugAtRef = useRef(0);
+  const lastPlaybackProcessAtRef = useRef(0);
+  const lastPlaybackUnderrunDebugAtRef = useRef(0);
+  const audioUnderrunsRef = useRef(0);
 
   const sendDebugEvent = useCallback(
     (
@@ -702,6 +707,23 @@ export function JerryPodcastStudio() {
       processor.onaudioprocess = (event) => {
         if (!liveMicActiveRef.current) return;
         const input = event.inputBuffer.getChannelData(0);
+        const processNow = performance.now();
+        const expectedCallbackMs = (input.length / micCtx.sampleRate) * 1000;
+        if (lastMicProcessAtRef.current > 0) {
+          const gapMs = processNow - lastMicProcessAtRef.current;
+          if (
+            gapMs > Math.max(120, expectedCallbackMs * 3) &&
+            processNow - lastMicGapDebugAtRef.current > 1500
+          ) {
+            lastMicGapDebugAtRef.current = processNow;
+            sendDebugEvent('mic-capture-gap', 'health', {
+              gapMs,
+              expectedCallbackMs,
+              sampleRate: micCtx.sampleRate,
+            });
+          }
+        }
+        lastMicProcessAtRef.current = processNow;
         let vadSumSquares = 0;
         for (let i = 0; i < input.length; i++) vadSumSquares += input[i] * input[i];
         const vadRms = Math.sqrt(vadSumSquares / Math.max(1, input.length));
@@ -876,6 +898,30 @@ export function JerryPodcastStudio() {
       const output = event.outputBuffer.getChannelData(0);
       output.fill(0);
 
+      const processNow = performance.now();
+      const expectedCallbackMs = (output.length / ctx.sampleRate) * 1000;
+      const callbackGapMs = lastPlaybackProcessAtRef.current > 0
+        ? processNow - lastPlaybackProcessAtRef.current
+        : expectedCallbackMs;
+      lastPlaybackProcessAtRef.current = processNow;
+
+      const queueMsBefore =
+        (liveQueuedSamplesRef.current / Math.max(1, ctx.sampleRate)) * 1000;
+      if (
+        isJerrySpeakingRef.current &&
+        livePlaybackQueueRef.current.length === 0 &&
+        processNow - lastPlaybackUnderrunDebugAtRef.current > 1000
+      ) {
+        audioUnderrunsRef.current += 1;
+        lastPlaybackUnderrunDebugAtRef.current = processNow;
+        sendDebugEvent('audio-underrun', 'health', {
+          queueMs: queueMsBefore,
+          callbackGapMs,
+          expectedCallbackMs,
+          underruns: audioUnderrunsRef.current,
+        });
+      }
+
       let writeOffset = 0;
       while (writeOffset < output.length && livePlaybackQueueRef.current.length > 0) {
         const head = livePlaybackQueueRef.current[0];
@@ -907,7 +953,7 @@ export function JerryPodcastStudio() {
 
     livePlaybackProcessorRef.current = processor;
     return processor;
-  }, [beginRecordedTurn, selectedAudioInputId]);
+  }, [beginRecordedTurn, selectedAudioInputId, sendDebugEvent]);
 
   const playLivePcmChunk = useCallback(
     (base64: string, mimeType = 'audio/pcm;rate=24000') => {
@@ -971,11 +1017,70 @@ export function JerryPodcastStudio() {
     [beginRecordedTurn, isMuted, ensureLivePlaybackProcessor, transitionAnimation],
   );
 
+  useEffect(() => {
+    let expectedTickAt = performance.now() + 2000;
+    let longTaskCount = 0;
+    let maxLongTaskMs = 0;
+
+    const PerformanceObserverCtor = (window as any).PerformanceObserver;
+    let observer: PerformanceObserver | null = null;
+    if (PerformanceObserverCtor) {
+      try {
+        observer = new PerformanceObserverCtor((list: PerformanceObserverEntryList) => {
+          for (const entry of list.getEntries()) {
+            longTaskCount += 1;
+            maxLongTaskMs = Math.max(maxLongTaskMs, entry.duration);
+          }
+        });
+        observer.observe({ entryTypes: ['longtask'] });
+      } catch {
+        observer = null;
+      }
+    }
+
+    const timer = window.setInterval(() => {
+      const now = performance.now();
+      const eventLoopLagMs = Math.max(0, now - expectedTickAt);
+      expectedTickAt = now + 2000;
+
+      const memory = (performance as Performance & {
+        memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number };
+      }).memory;
+      const audioContext = audioContextRef.current;
+      const playbackRate = audioContext?.sampleRate || 48000;
+      const audioQueueMs =
+        (liveQueuedSamplesRef.current / Math.max(1, playbackRate)) * 1000;
+
+      sendDebugEvent('client-runtime-sample', 'health', {
+        eventLoopLagMs,
+        longTaskCount,
+        maxLongTaskMs,
+        heapUsedMb: memory ? memory.usedJSHeapSize / 1024 / 1024 : 0,
+        heapLimitMb: memory ? memory.jsHeapSizeLimit / 1024 / 1024 : 0,
+        hardwareConcurrency: navigator.hardwareConcurrency || 0,
+        deviceMemoryGb: Number((navigator as Navigator & { deviceMemory?: number }).deviceMemory) || 0,
+        audioQueueMs,
+        audioUnderruns: audioUnderrunsRef.current,
+        audioContextState: audioContext?.state || 'none',
+      });
+
+      longTaskCount = 0;
+      maxLongTaskMs = 0;
+    }, 2000);
+
+    return () => {
+      window.clearInterval(timer);
+      observer?.disconnect();
+    };
+  }, [sendDebugEvent]);
+
   // Open one persistent Gemini Live session for the podcast instead of doing
   // LLM -> full TTS -> playback on every turn.
   useEffect(() => {
     let disposed = false;
     let reconnectTimer: number | null = null;
+    let healthPingTimer: number | null = null;
+    let healthPingSeq = 0;
 
     const connect = () => {
       if (disposed) return;
@@ -987,14 +1092,42 @@ export function JerryPodcastStudio() {
       socket.onopen = () => {
         console.info('[Jerry Live] browser socket connected');
         sendDebugEvent('socket-open', 'socket');
+        if (healthPingTimer) window.clearInterval(healthPingTimer);
+        const sendHealthPing = () => {
+          if (socket.readyState !== WebSocket.OPEN) return;
+          socket.send(JSON.stringify({
+            type: 'health-ping',
+            seq: ++healthPingSeq,
+            sentAt: Date.now(),
+          }));
+        };
+        sendHealthPing();
+        healthPingTimer = window.setInterval(sendHealthPing, 3000);
       };
 
       socket.onerror = () => sendDebugEvent('socket-error', 'socket');
-      socket.onclose = (event) => sendDebugEvent('socket-close', 'socket', { code: event.code, reason: event.reason });
+      socket.onclose = (event) => {
+        if (healthPingTimer) {
+          window.clearInterval(healthPingTimer);
+          healthPingTimer = null;
+        }
+        sendDebugEvent('socket-close', 'socket', { code: event.code, reason: event.reason });
+      };
 
       socket.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
+
+          if (msg.type === 'health-pong' && Number.isFinite(Number(msg.sentAt))) {
+            const rttMs = Math.max(0, Date.now() - Number(msg.sentAt));
+            sendDebugEvent('network-rtt', 'health', {
+              rttMs,
+              seq: Number(msg.seq) || 0,
+              serverEventLoopP99Ms: Number(msg.serverRuntime?.eventLoopP99Ms) || 0,
+              serverCpuPercent: Number(msg.serverRuntime?.cpuPercent) || 0,
+            });
+            return;
+          }
 
           if (msg.type === 'ready') {
             setIsLiveReady(true);
@@ -1223,6 +1356,7 @@ export function JerryPodcastStudio() {
     return () => {
       disposed = true;
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (healthPingTimer) window.clearInterval(healthPingTimer);
       if (liveTurnTimerRef.current) window.clearTimeout(liveTurnTimerRef.current);
       try {
         livePlaybackProcessorRef.current?.disconnect();
