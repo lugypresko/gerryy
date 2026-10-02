@@ -1065,6 +1065,28 @@ export function JerryPodcastStudio() {
             return;
           }
 
+          if (msg.type === 'slow-brain-observation' && msg.observation) {
+            console.info('[Jerry Slow Brain] observation ready', msg.observation);
+            sendDebugEvent('slow-brain-observation-ready', 'slow-brain', {
+              type: msg.observation.type,
+              confidence: msg.observation.confidence,
+              note: msg.observation.note,
+              suggestedMove: msg.observation.suggestedMove,
+            });
+            return;
+          }
+
+          if (msg.type === 'slow-brain-observation-used' && msg.observation) {
+            console.info('[Jerry Slow Brain] observation used', msg.observation);
+            sendDebugEvent('slow-brain-observation-used', 'slow-brain', {
+              type: msg.observation.type,
+              confidence: msg.observation.confidence,
+              note: msg.observation.note,
+              suggestedMove: msg.observation.suggestedMove,
+            });
+            return;
+          }
+
           if (msg.type === 'audio' && msg.data) {
             liveJerryDebugChunkCountRef.current += 1;
             if (liveJerryDebugChunkCountRef.current % 10 === 0) {
