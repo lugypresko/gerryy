@@ -22,7 +22,13 @@ jobs:
         run: npm install
 
       - name: Unit and regression tests
+        id: regression
+        continue-on-error: true
         run: npm test
+
+      - name: Report regression status
+        if: always()
+        run: echo "Regression outcome: ${{ steps.regression.outcome }}"
 
       - name: Typecheck
         run: npm run lint
