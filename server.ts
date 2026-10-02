@@ -16,9 +16,23 @@ import {
   extractGeneratedTranscript,
   selectTtsLanguage,
 } from './server/languageRouting';
+import {
+  SlowBrainObserver,
+  buildSlowBrainPrompt,
+  formatSlowBrainNote,
+  parseSlowBrainObservation,
+  SLOW_BRAIN_FAST_BRAIN_INSTRUCTION,
+  type SlowBrainTurn,
+} from './server/slowBrain';
 
 const PORT = 3000;
 const JERRY_ENGINE_VERSION = 'jerry-conversation-v3-2026-09-26';
+const SLOW_BRAIN_ENABLED = process.env.JERRY_SLOW_BRAIN_ENABLED !== 'false';
+const SLOW_BRAIN_MODEL = process.env.JERRY_SLOW_BRAIN_MODEL || 'gemini-3.8-flash';
+const SLOW_BRAIN_MIN_INTERVAL_MS = Math.max(
+  0,
+  Number(process.env.JERRY_SLOW_BRAIN_MIN_INTERVAL_MS || 12000),
+);
 const KEY_FILE = path.resolve(process.cwd(), '.api-key.json');
 const ALIGNMENT_LOG_FILE = path.resolve(process.cwd(), '.alignment-logs.json');
 const VOICE_LOG_FILE = path.resolve(process.cwd(), '.voice-logs.json');
@@ -1348,6 +1362,37 @@ CRITICAL RULES:
     let jerryCaptureActive = false;
     let jerryCaptureSequence = 0;
     let jerryCaptureFinalization: Promise<void> | null = null;
+    let slowBrain: SlowBrainObserver | null = null;
+    let currentJerryTranscript = '';
+    const conversationStartedAt = Date.now();
+
+    const addSlowBrainTurn = (turn: Omit<SlowBrainTurn, 'atMs'>) => {
+      slowBrain?.addTurn({
+        ...turn,
+        atMs: Date.now() - conversationStartedAt,
+      });
+    };
+
+    const kickSlowBrain = () => {
+      if (!slowBrain) return;
+      void slowBrain.kick().then((observation) => {
+        if (!observation) return;
+        recordJerryDebug('slow-brain-observation-ready', {
+          connectionId,
+          type: observation.type,
+          confidence: observation.confidence,
+          evidence: observation.evidence,
+          note: observation.note,
+          suggestedMove: observation.suggestedMove,
+        });
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({
+            type: 'slow-brain-observation',
+            observation,
+          }));
+        }
+      });
+    };
 
     const appendCanonicalEvent = async (type: 'transcript' | 'conversation-event', metadata: Record<string, unknown>) => {
       if (!canonicalCaptureId) return;
@@ -1473,6 +1518,41 @@ CRITICAL RULES:
 
     try {
       aiClient = new GoogleGenAI({ apiKey: key });
+
+      if (SLOW_BRAIN_ENABLED) {
+        slowBrain = new SlowBrainObserver({
+          minIntervalMs: SLOW_BRAIN_MIN_INTERVAL_MS,
+          analyze: async (turns) => {
+            if (!aiClient) return null;
+            const startedAt = Date.now();
+            const response = await aiClient.models.generateContent({
+              model: SLOW_BRAIN_MODEL,
+              contents: [{
+                role: 'user',
+                parts: [{ text: buildSlowBrainPrompt(turns) }],
+              }],
+              config: {
+                temperature: 0.15,
+              },
+            });
+            const raw = extractGeneratedTranscript(response);
+            const observation = parseSlowBrainObservation(raw);
+            recordJerryDebug('slow-brain-analysis-complete', {
+              connectionId,
+              model: SLOW_BRAIN_MODEL,
+              elapsedMs: Date.now() - startedAt,
+              signal: observation?.type || 'NO_SIGNAL',
+              confidence: observation?.confidence ?? null,
+            });
+            return observation;
+          },
+        });
+        recordJerryDebug('slow-brain-enabled', {
+          connectionId,
+          model: SLOW_BRAIN_MODEL,
+          minIntervalMs: SLOW_BRAIN_MIN_INTERVAL_MS,
+        });
+      }
 
       transcribeSession = await aiClient.live.connect({
         model: 'gemini-3.5-transcribe-live',
@@ -1602,6 +1682,7 @@ CRITICAL RULES:
               serverContent?.output_transcription?.text ||
               '';
             if (transcription) {
+              currentJerryTranscript += transcription;
               void appendCanonicalEvent('transcript', {
                 speaker: 'jerry',
                 text: transcription,
@@ -1616,10 +1697,20 @@ CRITICAL RULES:
             }
 
             if (serverContent?.turnComplete || serverContent?.turn_complete) {
-                  recordJerryDebug('jerry-turn-complete', {
-                    connectionId,
-                    turnId: guestTurnId,
-                  });
+              const completedJerryText = currentJerryTranscript.trim();
+              currentJerryTranscript = '';
+              if (completedJerryText) {
+                addSlowBrainTurn({
+                  speaker: 'jerry',
+                  text: completedJerryText,
+                  turnId: guestTurnId,
+                });
+                kickSlowBrain();
+              }
+              recordJerryDebug('jerry-turn-complete', {
+                connectionId,
+                turnId: guestTurnId,
+              });
               client.send(JSON.stringify({ type: 'turn-complete' }));
             }
           },
@@ -1652,7 +1743,9 @@ CRITICAL RULES:
               },
             },
           },
-          systemInstruction: buildJerryLanguagePrompt(JERRY_LIVE_SYSTEM_PROMPT),
+          systemInstruction: buildJerryLanguagePrompt(
+            `${JERRY_LIVE_SYSTEM_PROMPT}\n\n${SLOW_BRAIN_FAST_BRAIN_INSTRUCTION}`,
+          ),
         },
       });
 
@@ -1977,10 +2070,39 @@ CRITICAL RULES:
               turnId: completedTurnId,
               textPreview: finalTranscript.slice(0, 160),
             });
+
+            const pendingObservation = slowBrain?.consume() || null;
+            if (pendingObservation) {
+              const internalNote = formatSlowBrainNote(pendingObservation);
+              liveSession?.sendClientContent({
+                turns: [{ role: 'user', parts: [{ text: internalNote }] }],
+                turnComplete: false,
+              });
+              recordJerryDebug('slow-brain-observation-injected', {
+                connectionId,
+                turnId: completedTurnId,
+                type: pendingObservation.type,
+                confidence: pendingObservation.confidence,
+              });
+              if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({
+                  type: 'slow-brain-observation-used',
+                  observation: pendingObservation,
+                }));
+              }
+            }
+
             liveSession?.sendClientContent({
               turns: [{ role: 'user', parts: [{ text: finalTranscript }] }],
               turnComplete: true,
             });
+
+            addSlowBrainTurn({
+              speaker: 'human',
+              text: finalTranscript,
+              turnId: completedTurnId,
+            });
+            kickSlowBrain();
           })();
         }
       } catch (err) {
