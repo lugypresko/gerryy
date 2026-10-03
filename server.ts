@@ -2362,6 +2362,8 @@ CRITICAL RULES:
           guestTurnEnded = true;
           const completedTurnId = guestTurnId;
           const completedTurnChunks = guestPcmChunks;
+          const completedLiveFinalCandidate = lastLiveFinalCandidate;
+          const completedLiveInterimTranscript = lastLiveInterimTranscript;
           guestPcmChunks = [];
           setGuestTurnState('committed', {
             audioChunks: guestAudioChunkCount,
@@ -2429,13 +2431,13 @@ CRITICAL RULES:
 
             const transcriptSource = authoritativeTranscript
               ? 'verified'
-              : lastLiveFinalCandidate
+              : completedLiveFinalCandidate
                 ? 'live_candidate'
-                : lastLiveInterimTranscript
+                : completedLiveInterimTranscript
                   ? 'interim_fallback'
                   : 'missing';
             const finalTranscript =
-              authoritativeTranscript || lastLiveFinalCandidate || lastLiveInterimTranscript;
+              authoritativeTranscript || completedLiveFinalCandidate || completedLiveInterimTranscript;
 
             if (!finalTranscript) {
               healthRecord('stt', 'turn_transcript_missing', 'degraded', {
