@@ -1660,18 +1660,18 @@ CRITICAL RULES:
         sampleRate: parsed.sampleRate,
         mimeType: parsed.mimeType,
       });
-      return { chunk, sequence, metadata: jerryCapture };
+      return { chunk, sequence, metadata: jerryCapture, captureAtMs: Date.now() };
     };
 
-    const appendCanonicalJerryChunk = async (captured: { chunk: Buffer; sequence: number; metadata: JerryPcmCaptureMetadata }, mimeType: string) => {
+    const appendCanonicalJerryChunk = async (captured: { chunk: Buffer; sequence: number; metadata: JerryPcmCaptureMetadata; captureAtMs: number }, mimeType: string) => {
       if (!canonicalCaptureId) return;
       const parsed = parsePcmMimeType(mimeType);
       if (!parsed.sampleRate || captured.chunk.length % 2 !== 0) return;
       await canonicalCaptureStore.appendChunk(canonicalCaptureId, {
         source: 'jerry',
         sequence: captured.sequence,
-        captureStartMs: Date.now(),
-        captureEndMs: Date.now(),
+        captureStartMs: captured.captureAtMs,
+        captureEndMs: captured.captureAtMs,
         sampleCount: captured.chunk.length / 2,
         format: { sampleRate: parsed.sampleRate, channels: 1, encoding: 'pcm_s16le' },
         data: captured.chunk,
@@ -2121,8 +2121,15 @@ CRITICAL RULES:
           await recordingControlQueue.run(async () => {
             try {
               const accepted = recordingLifecycle.requestStop(msg.requestId, Number(msg.stopAt) || Date.now());
+              // Freeze Jerry capture first, then drain already-captured canonical appends.
+              // Only after the drain do we establish the canonical stop boundary.
+              // This prevents pre-stop audio that was queued asynchronously from being
+              // rejected as "after capture stop boundary".
+              await finalizeJerryPcmCapture('recording-stop-request');
+              await canonicalAppendQueue;
               if (canonicalCaptureId) {
-                await canonicalCaptureStore.requestStop(canonicalCaptureId, accepted.stopAt);
+                const canonicalStopAt = Math.max(accepted.stopAt, Date.now());
+                await canonicalCaptureStore.requestStop(canonicalCaptureId, canonicalStopAt);
               }
               recordJerryDebug('recording-stop-accepted', {
                 connectionId,
@@ -2318,11 +2325,8 @@ CRITICAL RULES:
             });
           }
 
-              if (clientEvent === 'recording-start-request' || clientEvent === 'recording-started') {
-                startJerryPcmCapture(sanitizedDetails);
-              } else if (msg.event.trim() === 'recording-stop-request') {
-                void finalizeJerryPcmCapture('recording-stop-request');
-              }
+              // Debug events are observability-only. Recording lifecycle is controlled
+              // exclusively by recording-start / recording-stop-request messages.
           recordJerryDebug('client-debug', {
             connectionId,
             turnId: guestTurnId,
