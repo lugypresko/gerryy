@@ -5,6 +5,7 @@ import 'dotenv/config';
 import { createServer as createViteServer } from 'vite';
 import { createServer } from 'http';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
+import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { RecordingArchiveStore } from './server/recordingStore';
@@ -30,6 +31,11 @@ import {
   formatJerryCharacterState,
   JERRY_CHARACTER_STATE_INSTRUCTION,
 } from './server/characterState';
+import {
+  decideConversationalCognition,
+  formatConversationalCognitionCue,
+  CONVERSATIONAL_COGNITION_INSTRUCTION,
+} from './server/conversationalCognition';
 import {
   JerryHealthRegistry,
   type JerryHealthComponent,
@@ -407,8 +413,70 @@ async function transcribeGuestTurn(ai: GoogleGenAI, chunks: Buffer[]): Promise<s
 
 async function startServer() {
   const app = express();
+  app.use('/api/recording-smoke', express.raw({ type: () => true, limit: '20mb' }));
   app.use(express.json({ limit: '50mb' }));
   await recordingMediaJobQueue.recoverStaleJobs();
+
+  app.post('/api/recording-smoke', async (req, res) => {
+    try {
+      const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      if (body.length < 512) {
+        return res.status(400).json({ ok: false, error: 'recording_smoke_empty' });
+      }
+
+      const mimeType = String(req.headers['content-type'] || 'application/octet-stream').split(';')[0];
+      const extension =
+        mimeType.includes('webm') ? 'webm'
+          : mimeType.includes('ogg') ? 'ogg'
+            : mimeType.includes('wav') ? 'wav'
+              : 'bin';
+      const id = `smoke-${Date.now()}-${randomUUID().slice(0, 8)}`;
+      const smokeDir = path.join(RECORDINGS_DIR, 'smoke-tests');
+      fs.mkdirSync(smokeDir, { recursive: true });
+      const filePath = path.join(smokeDir, `${id}.${extension}`);
+      fs.writeFileSync(filePath, body);
+      fs.writeFileSync(
+        path.join(smokeDir, `${id}.json`),
+        JSON.stringify({ id, bytes: body.length, mimeType, extension, createdAt: new Date().toISOString() }, null, 2),
+        'utf8',
+      );
+
+      recordJerryDebug('recording-smoke-saved', { id, bytes: body.length, mimeType });
+      return res.status(201).json({
+        ok: true,
+        id,
+        bytes: body.length,
+        mimeType,
+        playbackUrl: `/api/recording-smoke/${id}`,
+      });
+    } catch (error: any) {
+      return res.status(500).json({ ok: false, error: error?.message || 'recording_smoke_save_failed' });
+    }
+  });
+
+  app.get('/api/recording-smoke/:id', (req, res) => {
+    const id = String(req.params.id || '');
+    if (!/^smoke-\d+-[a-f0-9]{8}$/.test(id)) {
+      return res.status(400).json({ ok: false, error: 'invalid_smoke_id' });
+    }
+
+    const smokeDir = path.join(RECORDINGS_DIR, 'smoke-tests');
+    const metadataPath = path.join(smokeDir, `${id}.json`);
+    if (!fs.existsSync(metadataPath)) {
+      return res.status(404).json({ ok: false, error: 'recording_smoke_not_found' });
+    }
+
+    const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+    const filePath = path.join(smokeDir, `${id}.${metadata.extension}`);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ ok: false, error: 'recording_smoke_file_missing' });
+    }
+
+    res.setHeader('Content-Type', metadata.mimeType || 'application/octet-stream');
+    res.setHeader('Content-Length', String(fs.statSync(filePath).size));
+    res.setHeader('Cache-Control', 'no-store');
+    return fs.createReadStream(filePath).pipe(res);
+  });
 
   // Durable append-only recording archive. The manifest is the commit marker;
   // there are intentionally no update or delete routes for archived media.
@@ -1462,6 +1530,7 @@ CRITICAL RULES:
     let slowBrain: SlowBrainObserver | null = null;
     const characterState = new JerryCharacterState();
     let lastCharacterStateInjectedRevision = -1;
+    let lastCognitionFingerprint = '';
     let currentJerryTranscript = '';
     const conversationStartedAt = Date.now();
 
@@ -1550,6 +1619,33 @@ CRITICAL RULES:
         state,
         ...details,
       });
+    };
+
+    const injectConversationalCognition = (turnId: number) => {
+      const snapshot = characterState.snapshot();
+      const pendingObservation = slowBrain?.peek() || null;
+      const cue = decideConversationalCognition(snapshot, pendingObservation);
+      if (cue.mode === 'direct' || cue.fingerprint === lastCognitionFingerprint) return cue;
+
+      liveSession?.sendClientContent({
+        turns: [{ role: 'user', parts: [{ text: formatConversationalCognitionCue(cue) }] }],
+        turnComplete: false,
+      });
+      lastCognitionFingerprint = cue.fingerprint;
+      recordJerryDebug('cognition-cue-injected', {
+        connectionId,
+        turnId,
+        mode: cue.mode,
+        pauseMs: cue.pauseMs,
+        fingerprint: cue.fingerprint,
+      });
+      void appendCanonicalEvent('conversation-event', {
+        event: 'cognition-cue-injected',
+        turnId,
+        mode: cue.mode,
+        pauseMs: cue.pauseMs,
+      });
+      return cue;
     };
 
     const injectCharacterState = (turnId: number) => {
@@ -2026,7 +2122,7 @@ CRITICAL RULES:
             },
           },
           systemInstruction: buildJerryLanguagePrompt(
-            `${JERRY_LIVE_SYSTEM_PROMPT}\n\n${SLOW_BRAIN_FAST_BRAIN_INSTRUCTION}\n\n${JERRY_CHARACTER_STATE_INSTRUCTION}`,
+            `${JERRY_LIVE_SYSTEM_PROMPT}\n\n${SLOW_BRAIN_FAST_BRAIN_INSTRUCTION}\n\n${JERRY_CHARACTER_STATE_INSTRUCTION}\n\n${CONVERSATIONAL_COGNITION_INSTRUCTION}`,
           ),
         },
       });
@@ -2359,6 +2455,7 @@ CRITICAL RULES:
             // A note discovered from earlier closed turns is private context for
             // the next turn. Inject it before audio begins, never after the user
             // has already committed the current audio turn.
+            injectConversationalCognition(guestTurnId);
             injectCharacterState(guestTurnId);
             injectPendingSlowBrainObservation(guestTurnId);
             liveSession?.sendRealtimeInput({ activityStart: {} });
@@ -2540,6 +2637,7 @@ CRITICAL RULES:
             // In direct-audio mode the transcript is evidence for the observer,
             // not conversational input for the Fast Brain.
             if (!CONVERSATION_AUDIO_INPUT) {
+              injectConversationalCognition(completedTurnId);
               injectCharacterState(completedTurnId);
               injectPendingSlowBrainObservation(completedTurnId);
               liveSession?.sendClientContent({
