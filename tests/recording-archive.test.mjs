@@ -39,3 +39,20 @@ test('recording archive storage is configured outside the repository', () => {
   assert.match(gitignore, /data\/recordings\//);
   assert.match(server, /process\.env\.JERRY_RECORDINGS_DIR/);
 });
+
+
+test('studio publishes finalized recordings into the persistent archive library', () => {
+  const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
+  assert.match(studio, /persistRecordingArchive/);
+  assert.match(studio, /fetch\(['"]\/api\/recordings['"]/);
+  assert.match(studio, /publicationStatus === 'publishable'[\s\S]*?'ready'/);
+  assert.match(studio, /publicationStatus === 'needs-review'[\s\S]*?'review'/);
+  assert.match(studio, /recording-archive-persisted/);
+});
+
+test('recording outbox and canonical capture share the same episode id', () => {
+  const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
+  assert.match(studio, /const episodeId = `episode-/);
+  assert.match(studio, /createRecordingOutbox\(\{ episodeId \}\)/);
+  assert.match(studio, /type: 'recording-start',[\s\S]*?recordingId: episodeId/);
+});
