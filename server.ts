@@ -835,6 +835,194 @@ async function startServer() {
   });
 
   // =========================================================================
+
+  // Temporary GPT-Live-1 spike. Deliberately isolated from the production Jerry path.
+  // Purpose: answer one question quickly — does GPT-Live-1 sound more naturally conversational?
+  app.get('/openai-live-spike', (_req, res) => {
+    res.type('html').send(\`<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Jerry GPT-Live-1 Spike</title>
+  <style>
+    body{font-family:system-ui,sans-serif;background:#171715;color:#f5f5f0;max-width:760px;margin:40px auto;padding:0 20px}
+    button{font:inherit;padding:12px 18px;border-radius:10px;border:1px solid #555;background:#2b2b28;color:white;cursor:pointer;margin-left:8px}
+    button.primary{background:#0f766e;border-color:#14b8a6} button:disabled{opacity:.45;cursor:not-allowed}
+    .card{background:#232321;border:1px solid #3a3a36;border-radius:14px;padding:18px;margin-top:18px}
+    #status{font-weight:700}.muted{color:#aaa}.good{color:#86efac}.bad{color:#fca5a5}
+    pre{white-space:pre-wrap;word-break:break-word;max-height:260px;overflow:auto;font-size:12px;color:#c8c8c0}
+  </style>
+</head>
+<body>
+  <h1>Jerry — GPT-Live-1 Spike</h1>
+  <p>בדיקה זמנית בלבד. אותו Jerry prompt, בלי Slow Brain, הקלטה או pipeline. המטרה: לבדוק אם השיחה עצמה נשמעת חיה יותר.</p>
+  <div>
+    <button id="connect" class="primary">התחל שיחה</button>
+    <button id="disconnect" disabled>נתק</button>
+  </div>
+  <div class="card">
+    <div>סטטוס: <span id="status" class="muted">מנותק</span></div>
+    <div style="margin-top:12px">תמלול של ג'רי:</div>
+    <div id="transcript" style="min-height:50px;margin-top:6px"></div>
+  </div>
+  <div class="card">
+    <div>Events</div>
+    <pre id="events"></pre>
+  </div>
+  <audio id="remoteAudio" autoplay></audio>
+<script>
+(() => {
+  let pc = null, stream = null, dc = null;
+  const connectBtn = document.getElementById('connect');
+  const disconnectBtn = document.getElementById('disconnect');
+  const statusEl = document.getElementById('status');
+  const transcriptEl = document.getElementById('transcript');
+  const eventsEl = document.getElementById('events');
+  const remoteAudio = document.getElementById('remoteAudio');
+
+  const setStatus = (text, cls='muted') => {
+    statusEl.textContent = text;
+    statusEl.className = cls;
+  };
+  const log = (value) => {
+    const line = typeof value === 'string' ? value : JSON.stringify(value);
+    eventsEl.textContent = (line + '\\n' + eventsEl.textContent).slice(0, 12000);
+  };
+  const waitForIce = (peer) => new Promise((resolve) => {
+    if (peer.iceGatheringState === 'complete') return resolve();
+    const fn = () => {
+      if (peer.iceGatheringState === 'complete') {
+        peer.removeEventListener('icegatheringstatechange', fn);
+        resolve();
+      }
+    };
+    peer.addEventListener('icegatheringstatechange', fn);
+  });
+
+  connectBtn.onclick = async () => {
+    connectBtn.disabled = true;
+    transcriptEl.textContent = '';
+    eventsEl.textContent = '';
+    setStatus('מתחבר...');
+    try {
+      pc = new RTCPeerConnection();
+      pc.ontrack = (event) => {
+        remoteAudio.srcObject = event.streams[0];
+        remoteAudio.play().catch(() => {});
+      };
+      pc.onconnectionstatechange = () => {
+        log({connectionState: pc.connectionState});
+        if (pc.connectionState === 'connected') setStatus('מחובר — דבר חופשי', 'good');
+        if (['failed','closed','disconnected'].includes(pc.connectionState)) setStatus(pc.connectionState, 'bad');
+      };
+
+      dc = pc.createDataChannel('oai-events');
+      dc.onopen = () => log('data-channel open');
+      dc.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'session.output_transcript.delta' && msg.delta) {
+            transcriptEl.textContent += msg.delta;
+          }
+          if (msg.type === 'session.started') setStatus('מחובר — דבר חופשי', 'good');
+          if (msg.type === 'error') setStatus(msg.error?.message || 'OpenAI error', 'bad');
+          if (['session.started','session.output_transcript.delta','session.input_transcript.delta','error'].includes(msg.type)) log(msg);
+        } catch {
+          log(event.data);
+        }
+      };
+
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+      for (const track of stream.getTracks()) pc.addTrack(track, stream);
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIce(pc);
+
+      const response = await fetch('/api/openai-live-spike/session', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({sdp: pc.localDescription.sdp})
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Failed to create GPT-Live session');
+      await pc.setRemoteDescription({type:'answer', sdp: result.sdp});
+      disconnectBtn.disabled = false;
+    } catch (error) {
+      setStatus(error?.message || String(error), 'bad');
+      connectBtn.disabled = false;
+      disconnectBtn.disabled = true;
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      if (pc) pc.close();
+      stream = null; pc = null; dc = null;
+    }
+  };
+
+  disconnectBtn.onclick = () => {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (dc) dc.close();
+    if (pc) pc.close();
+    stream = null; pc = null; dc = null;
+    setStatus('מנותק');
+    connectBtn.disabled = false;
+    disconnectBtn.disabled = true;
+  };
+})();
+</script>
+</body>
+</html>\`);
+  });
+
+  app.post('/api/openai-live-spike/session', async (req, res) => {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey || apiKey === 'MY_OPENAI_API_KEY') {
+      return res.status(400).json({ error: 'OPENAI_API_KEY is not configured.' });
+    }
+
+    const sdp = typeof req.body?.sdp === 'string' ? req.body.sdp : '';
+    if (!sdp) {
+      return res.status(400).json({ error: 'Missing SDP offer.' });
+    }
+
+    try {
+      const openaiResponse = await fetch('https://api.openai.com/v1/live/sessions', {
+        method: 'POST',
+        headers: {
+          Authorization: \`Bearer \${apiKey}\`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          session: {
+            model: 'gpt-live-1',
+            instructions: buildJerryLanguagePrompt(JERRY_LIVE_SYSTEM_PROMPT),
+            audio: { output: { voice: 'marin' } },
+            delegation: null,
+            store: false,
+          },
+          transport: { type: 'webrtc', sdp },
+        }),
+      });
+
+      const payload: any = await openaiResponse.json().catch(() => null);
+      if (!openaiResponse.ok) {
+        const message = payload?.error?.message || payload?.message || \`OpenAI Live HTTP \${openaiResponse.status}\`;
+        return res.status(openaiResponse.status).json({ error: message });
+      }
+
+      const answerSdp = payload?.transport?.sdp;
+      if (!answerSdp) {
+        return res.status(502).json({ error: 'OpenAI Live returned no SDP answer.' });
+      }
+
+      return res.json({ ok: true, sessionId: payload?.session?.id || null, sdp: answerSdp });
+    } catch (error: any) {
+      return res.status(500).json({ error: error?.message || 'Failed to create OpenAI Live session.' });
+    }
+  });
+
   // SERVER-SIDE AI ROUTES (Gemini Voice API, TTS, Story Generation, Alignment)
   // =========================================================================
 
