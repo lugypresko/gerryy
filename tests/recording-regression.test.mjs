@@ -150,3 +150,20 @@ test('recording exposes input-device selection and rejects muted live tracks', (
   assert.match(studio, /deviceId:\s*\{\s*exact:\s*selectedAudioInputId/);
   assert.match(studio, /track\.muted/);
 });
+
+
+test('microphone acquisition falls back to the default device when selected input is stale', () => {
+  const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
+  assert.match(studio, /const acquireMicrophoneStream = useCallback/);
+  assert.match(studio, /OverconstrainedError/);
+  assert.match(studio, /NotFoundError/);
+  assert.match(studio, /mic-device-fallback/);
+  assert.match(studio, /setSelectedAudioInputId\(''\)/);
+  assert.match(studio, /return navigator\.mediaDevices\.getUserMedia\(\{ audio: baseAudio \}\)/);
+});
+
+test('live conversation and episode recording share resilient microphone acquisition', () => {
+  const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
+  const calls = studio.match(/acquireMicrophoneStream\(\)/g) || [];
+  assert.ok(calls.length >= 2, 'live and recording paths should both use the resilient mic helper');
+});
