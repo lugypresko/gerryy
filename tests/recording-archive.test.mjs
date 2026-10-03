@@ -53,6 +53,6 @@ test('studio publishes finalized recordings into the persistent archive library'
 test('recording outbox and canonical capture share the same episode id', () => {
   const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
   assert.match(studio, /const episodeId = `episode-/);
-  assert.match(studio, /createRecordingOutbox\(\{ episodeId \}\)/);
+  assert.match(studio, /createRecordingOutbox\(\{ episodeId: episodeIdRef\.current \|\| undefined \}\)/);
   assert.match(studio, /type: 'recording-start',[\s\S]*?recordingId: episodeId/);
 });
