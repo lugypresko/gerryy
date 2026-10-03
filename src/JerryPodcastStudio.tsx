@@ -2087,7 +2087,7 @@ export function JerryPodcastStudio() {
       const options: MediaRecorderOptions = chosenMime ? { mimeType: chosenMime } : {};
       const mediaRecorder = new MediaRecorder(streamToRecord, options);
       const actualMime = mediaRecorder.mimeType || chosenMime || 'audio/webm';
-      const recordingOutbox = await createRecordingOutbox({ episodeId });
+      const recordingOutbox = await createRecordingOutbox({ episodeId: episodeIdRef.current || undefined });
       recordingOutboxRef.current = recordingOutbox;
       recordingIdRef.current = recordingOutbox.episodeId;
       const extension = actualMime.includes('mp4')
