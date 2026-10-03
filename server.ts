@@ -37,8 +37,9 @@ const SLOW_BRAIN_ENABLED = process.env.JERRY_SLOW_BRAIN_ENABLED !== 'false';
 const SLOW_BRAIN_MODEL = process.env.JERRY_SLOW_BRAIN_MODEL || 'gemini-3.8-flash';
 const SLOW_BRAIN_MIN_INTERVAL_MS = Math.max(
   0,
-  Number(process.env.JERRY_SLOW_BRAIN_MIN_INTERVAL_MS || 12000),
+  Number(process.env.JERRY_SLOW_BRAIN_MIN_INTERVAL_MS || 30000),
 );
+const CONVERSATION_AUDIO_INPUT = process.env.CONVERSATION_AUDIO_INPUT === '1';
 const KEY_FILE = path.resolve(process.cwd(), '.api-key.json');
 const ALIGNMENT_LOG_FILE = path.resolve(process.cwd(), '.alignment-logs.json');
 const VOICE_LOG_FILE = path.resolve(process.cwd(), '.voice-logs.json');
@@ -1448,6 +1449,7 @@ CRITICAL RULES:
     let aiClient: GoogleGenAI | null = null;
     let guestPcmChunks: Buffer[] = [];
     let guestTurnId = 0;
+    let guestTurnState: 'idle' | 'capturing' | 'committed' | 'sent_to_live' | 'response_started' | 'response_complete' = 'idle';
     let guestTurnStartedAt = 0;
     let guestAudioChunkCount = 0;
     let guestAudioBytes = 0;
@@ -1518,6 +1520,55 @@ CRITICAL RULES:
           message: error instanceof Error ? error.message : String(error),
         });
       }
+    };
+
+    const setGuestTurnState = (state: typeof guestTurnState, details: Record<string, unknown> = {}) => {
+      guestTurnState = state;
+      recordJerryDebug('turn-state', {
+        connectionId,
+        turnId: guestTurnId,
+        state,
+        ...details,
+      });
+      void appendCanonicalEvent('conversation-event', {
+        event: 'turn-state',
+        turnId: guestTurnId,
+        state,
+        ...details,
+      });
+    };
+
+    const injectPendingSlowBrainObservation = (turnId: number) => {
+      const pendingObservation = slowBrain?.consume() || null;
+      if (!pendingObservation) return null;
+
+      const internalNote = formatSlowBrainNote(pendingObservation);
+      liveSession?.sendClientContent({
+        turns: [{ role: 'user', parts: [{ text: internalNote }] }],
+        turnComplete: false,
+      });
+      recordJerryDebug('slow-brain-observation-injected', {
+        connectionId,
+        turnId,
+        type: pendingObservation.type,
+        confidence: pendingObservation.confidence,
+      });
+      void appendCanonicalEvent('conversation-event', {
+        event: 'slow-brain-observation-used',
+        turnId,
+        type: pendingObservation.type,
+        confidence: pendingObservation.confidence,
+        evidence: pendingObservation.evidence,
+        note: pendingObservation.note,
+        suggestedMove: pendingObservation.suggestedMove,
+      });
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({
+          type: 'slow-brain-observation-used',
+          observation: pendingObservation,
+        }));
+      }
+      return pendingObservation;
     };
 
     const startJerryPcmCapture = (details: Record<string, unknown> = {}) => {
@@ -1730,33 +1781,31 @@ CRITICAL RULES:
             console.error('[Jerry STT] error:', event?.message || event);
             healthRecord('stt', 'error', 'degraded', {
               errorCode: 'stt_session_error',
-              recoveryAction: 'reconnect_full_live_session',
+              recoveryAction: 'continue_live_without_observer_transcript',
             });
             recordJerryDebug('stt-error', { connectionId, message: event?.message || String(event) });
             if (client.readyState === WebSocket.OPEN) {
               client.send(
                 JSON.stringify({
                   type: 'stt-error',
-                  message: event?.message || 'Transcription session error',
+                  message: event?.message || 'Transcription observer error',
+                  nonBlocking: CONVERSATION_AUDIO_INPUT,
                 }),
               );
-              healthRecord('stt', 'reconnect_requested', 'recovering', {
-                recoveryAction: 'browser_socket_reconnect',
-              });
-              client.close(1012, 'stt-restart');
             }
           },
           onclose: (event: any) => {
             console.info('[Jerry STT] closed:', event?.reason || '');
             healthRecord('stt', 'closed', 'degraded', {
               errorCode: 'stt_closed',
-              recoveryAction: 'reconnect_full_live_session',
+              recoveryAction: 'continue_live_without_observer_transcript',
             });
             if (client.readyState === WebSocket.OPEN) {
-              healthRecord('stt', 'reconnect_requested', 'recovering', {
-                recoveryAction: 'browser_socket_reconnect',
-              });
-              client.close(1012, 'stt-closed');
+              client.send(JSON.stringify({
+                type: 'stt-error',
+                message: 'Transcription observer closed; Live conversation continues.',
+                nonBlocking: CONVERSATION_AUDIO_INPUT,
+              }));
             }
           },
         },
@@ -1803,6 +1852,11 @@ CRITICAL RULES:
             for (const part of parts) {
               const inlineData = part?.inlineData || part?.inline_data;
               if (inlineData?.data) {
+                if (guestTurnState === 'sent_to_live') {
+                  setGuestTurnState('response_started', {
+                    firstAudioLatencyMs: guestTurnStartedAt ? Date.now() - guestTurnStartedAt : null,
+                  });
+                }
                 const actualMimeType = inlineData.mimeType || inlineData.mime_type || 'audio/pcm;rate=24000';
                 const capturedJerry = captureJerryPcmChunk(inlineData.data, actualMimeType, guestTurnId);
                 if (capturedJerry) {
@@ -1870,6 +1924,7 @@ CRITICAL RULES:
                 });
                 kickSlowBrain();
               }
+              setGuestTurnState('response_complete');
               recordJerryDebug('jerry-turn-complete', {
                 connectionId,
                 turnId: guestTurnId,
@@ -1914,6 +1969,15 @@ CRITICAL RULES:
         },
         config: {
           responseModalities: [Modality.AUDIO],
+          ...(CONVERSATION_AUDIO_INPUT
+            ? {
+                realtimeInputConfig: {
+                  automaticActivityDetection: {
+                    disabled: true,
+                  },
+                },
+              }
+            : {}),
           outputAudioTranscription: {},
           speechConfig: {
             voiceConfig: {
@@ -1934,7 +1998,9 @@ CRITICAL RULES:
             type: 'ready',
             engine: 'gemini-3.8-live',
             engineVersion: JERRY_ENGINE_VERSION,
-                    inputPath: 'push-to-talk PCM -> Live interim STT -> full-turn Gemini 3.5 Transcribe (he-IL/en-US code-switch) -> Gemini 3.8 Live -> Jerry response',
+                    inputPath: CONVERSATION_AUDIO_INPUT
+                      ? 'push-to-talk PCM -> Gemini 3.8 Live -> Jerry response; async STT observer -> Slow Brain'
+                      : 'push-to-talk PCM -> Live interim STT -> full-turn Gemini 3.5 Transcribe -> Gemini 3.8 Live -> Jerry response',
           }),
         );
             healthRecord('socket', 'ready_sent', 'healthy');
@@ -2239,18 +2305,46 @@ CRITICAL RULES:
           guestAudioChunkCount = 0;
           guestAudioBytes = 0;
           guestPcmChunks = [];
+          setGuestTurnState('capturing', {
+            route: CONVERSATION_AUDIO_INPUT ? 'direct-audio' : 'transcript-gated',
+          });
+
+          if (CONVERSATION_AUDIO_INPUT) {
+            // A note discovered from earlier closed turns is private context for
+            // the next turn. Inject it before audio begins, never after the user
+            // has already committed the current audio turn.
+            injectPendingSlowBrainObservation(guestTurnId);
+            liveSession?.sendRealtimeInput({ activityStart: {} });
+          }
+
           console.info('[Jerry Engine]', {
             engineVersion: JERRY_ENGINE_VERSION,
-              stage: 'code-switch-transcribe-start',
+            stage: CONVERSATION_AUDIO_INPUT
+              ? 'direct-audio-turn-start'
+              : 'code-switch-transcribe-start',
           });
-          recordJerryDebug('guest-turn-start', { connectionId, turnId: guestTurnId });
-          transcribeSession.sendRealtimeInput({ activityStart: {} });
+          recordJerryDebug('guest-turn-start', {
+            connectionId,
+            turnId: guestTurnId,
+            route: CONVERSATION_AUDIO_INPUT ? 'direct-audio' : 'transcript-gated',
+          });
+          transcribeSession?.sendRealtimeInput({ activityStart: {} });
         } else if (msg.type === 'audio' && typeof msg.data === 'string' && msg.data) {
           const audioChunk = Buffer.from(msg.data, 'base64');
           guestPcmChunks.push(audioChunk);
           guestAudioChunkCount += 1;
           guestAudioBytes += audioChunk.length;
-          transcribeSession.sendRealtimeInput({
+
+          if (CONVERSATION_AUDIO_INPUT) {
+            liveSession?.sendRealtimeInput({
+              audio: {
+                data: msg.data,
+                mimeType: msg.mimeType || 'audio/pcm;rate=16000',
+              },
+            });
+          }
+
+          transcribeSession?.sendRealtimeInput({
             audio: {
               data: msg.data,
               mimeType: msg.mimeType || 'audio/pcm;rate=16000',
@@ -2262,20 +2356,30 @@ CRITICAL RULES:
               connectionId,
               turnId: guestTurnId,
             });
-          void appendCanonicalEvent('conversation-event', {
-            event: msg.event.trim(),
-            category,
-            details: sanitizedDetails,
-          });
             return;
           }
+
           guestTurnEnded = true;
           const completedTurnId = guestTurnId;
           const completedTurnChunks = guestPcmChunks;
           guestPcmChunks = [];
+          setGuestTurnState('committed', {
+            audioChunks: guestAudioChunkCount,
+            audioBytes: guestAudioBytes,
+          });
+
+          if (CONVERSATION_AUDIO_INPUT) {
+            liveSession?.sendRealtimeInput({ activityEnd: {} });
+            setGuestTurnState('sent_to_live', {
+              commitToLiveMs: guestTurnStartedAt ? Date.now() - guestTurnStartedAt : null,
+            });
+          }
+
           console.info('[Jerry Engine]', {
             engineVersion: JERRY_ENGINE_VERSION,
-            stage: 'code-switch-transcribe-end-awaiting-authoritative-final',
+            stage: CONVERSATION_AUDIO_INPUT
+              ? 'direct-audio-turn-committed-stt-background'
+              : 'code-switch-transcribe-end-awaiting-authoritative-final',
           });
           recordJerryDebug('guest-turn-end', {
             connectionId,
@@ -2283,108 +2387,119 @@ CRITICAL RULES:
             durationMs: guestTurnStartedAt ? Date.now() - guestTurnStartedAt : null,
             audioChunks: guestAudioChunkCount,
             audioBytes: guestAudioBytes,
+            route: CONVERSATION_AUDIO_INPUT ? 'direct-audio' : 'transcript-gated',
           });
-          transcribeSession.sendRealtimeInput({ activityEnd: {} });
+
+          // STT is an observer in direct-audio mode. Its result feeds UI,
+          // canonical transcript, and Slow Brain, but never gates Jerry's reply.
+          transcribeSession?.sendRealtimeInput({ activityEnd: {} });
+
           void (async () => {
             let authoritativeTranscript = '';
             recordJerryDebug('authoritative-start', {
               connectionId,
               turnId: completedTurnId,
+              background: CONVERSATION_AUDIO_INPUT,
               audioBytes: completedTurnChunks.reduce((total, chunk) => total + chunk.length, 0),
             });
+
             try {
-                  if (!aiClient) throw new Error('Gemini client is not initialized');
-                  authoritativeTranscript = await withTimeout(
-                    transcribeGuestTurn(aiClient, completedTurnChunks),
-                    12000,
-                    'transcription-timeout',
-                  );
+              if (!aiClient) throw new Error('Gemini client is not initialized');
+              authoritativeTranscript = await withTimeout(
+                transcribeGuestTurn(aiClient, completedTurnChunks),
+                12000,
+                'transcription-timeout',
+              );
             } catch (err) {
-              console.warn('[Jerry STT] authoritative transcription failed; using live candidate:', err);
+              console.warn('[Jerry STT] authoritative transcription failed; observer fallback only:', err);
               recordJerryDebug('authoritative-error', {
                 connectionId,
                 turnId: completedTurnId,
+                background: CONVERSATION_AUDIO_INPUT,
                 message: err instanceof Error ? err.message : String(err),
               });
               if (err instanceof Error && err.message === 'transcription-timeout') {
-                recordJerryDebug('authoritative-timeout', { connectionId, turnId: completedTurnId });
+                recordJerryDebug('authoritative-timeout', {
+                  connectionId,
+                  turnId: completedTurnId,
+                  background: CONVERSATION_AUDIO_INPUT,
+                });
               }
             }
-            if (completedTurnId !== guestTurnId) return;
+
+            const transcriptSource = authoritativeTranscript
+              ? 'verified'
+              : lastLiveFinalCandidate
+                ? 'live_candidate'
+                : lastLiveInterimTranscript
+                  ? 'interim_fallback'
+                  : 'missing';
             const finalTranscript =
               authoritativeTranscript || lastLiveFinalCandidate || lastLiveInterimTranscript;
+
             if (!finalTranscript) {
-              recordJerryDebug('turn-aborted-no-transcript', {
+              healthRecord('stt', 'turn_transcript_missing', 'degraded', {
+                errorCode: 'observer_transcript_missing',
+                recoveryAction: 'continue_live_without_slow_brain_evidence',
+                details: { turnId: completedTurnId },
+              });
+              recordJerryDebug('observer-no-transcript', {
                 connectionId,
                 turnId: completedTurnId,
+                background: CONVERSATION_AUDIO_INPUT,
                 audioChunks: completedTurnChunks.length,
-                audioBytes: completedTurnChunks.reduce((total, chunk) => total + chunk.length, 0),
-                hadLiveFinalCandidate: Boolean(lastLiveFinalCandidate),
-                hadLiveInterimTranscript: Boolean(lastLiveInterimTranscript),
               });
-              if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify({ type: 'stt-error', message: 'No final Hebrew transcript was produced' }));
+              if (!CONVERSATION_AUDIO_INPUT && client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({
+                  type: 'stt-error',
+                  message: 'No final transcript was produced',
+                }));
               }
               return;
             }
+
             if (finalTranscript === lastFinalGuestTranscript) return;
             lastFinalGuestTranscript = finalTranscript;
+
             void appendCanonicalEvent('transcript', {
               speaker: 'human',
               text: finalTranscript,
               turnId: completedTurnId,
               source: 'stt',
+              transcriptSource,
+              verified: transcriptSource === 'verified',
             });
-            console.info('[Jerry STT] authoritative Hebrew transcript:', finalTranscript);
+
             recordJerryDebug(authoritativeTranscript ? 'authoritative-success' : 'authoritative-fallback', {
               connectionId,
               turnId: completedTurnId,
+              background: CONVERSATION_AUDIO_INPUT,
+              transcriptSource,
               elapsedMs: guestTurnStartedAt ? Date.now() - guestTurnStartedAt : null,
               textPreview: finalTranscript.slice(0, 160),
             });
+
             if (client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify({ type: 'input-transcript', text: finalTranscript }));
+              client.send(JSON.stringify({
+                type: 'input-transcript',
+                text: finalTranscript,
+                transcriptSource,
+                verified: transcriptSource === 'verified',
+              }));
             }
-            recordJerryDebug('guest-transcript-forwarded', {
-              connectionId,
-              turnId: completedTurnId,
-              textPreview: finalTranscript.slice(0, 160),
-            });
 
-            const pendingObservation = slowBrain?.consume() || null;
-            if (pendingObservation) {
-              const internalNote = formatSlowBrainNote(pendingObservation);
+            // In direct-audio mode the transcript is evidence for the observer,
+            // not conversational input for the Fast Brain.
+            if (!CONVERSATION_AUDIO_INPUT) {
+              injectPendingSlowBrainObservation(completedTurnId);
               liveSession?.sendClientContent({
-                turns: [{ role: 'user', parts: [{ text: internalNote }] }],
-                turnComplete: false,
+                turns: [{ role: 'user', parts: [{ text: finalTranscript }] }],
+                turnComplete: true,
               });
-              recordJerryDebug('slow-brain-observation-injected', {
-                connectionId,
-                turnId: completedTurnId,
-                type: pendingObservation.type,
-                confidence: pendingObservation.confidence,
+              setGuestTurnState('sent_to_live', {
+                route: 'transcript-gated',
               });
-              void appendCanonicalEvent('conversation-event', {
-                event: 'slow-brain-observation-used',
-                turnId: completedTurnId,
-                type: pendingObservation.type,
-                confidence: pendingObservation.confidence,
-                evidence: pendingObservation.evidence,
-                note: pendingObservation.note,
-                suggestedMove: pendingObservation.suggestedMove,
-              });
-              if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify({
-                  type: 'slow-brain-observation-used',
-                  observation: pendingObservation,
-                }));
-              }
             }
-
-            liveSession?.sendClientContent({
-              turns: [{ role: 'user', parts: [{ text: finalTranscript }] }],
-              turnComplete: true,
-            });
 
             addSlowBrainTurn({
               speaker: 'human',
