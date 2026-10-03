@@ -432,6 +432,43 @@ export function JerryPodcastStudio() {
     return response.json() as Promise<{ ok: true; file: string; bytes: number }>;
   };
 
+  const persistRecordingArchive = async (
+    recordingId: string,
+    master: Blob,
+    publicationStatus: RecordingPublicationStatus,
+    timeline: ConversationTurnLogEntry[],
+  ) => {
+    const masterBase64 = bytesToBase64(new Uint8Array(await master.arrayBuffer()));
+    const conversation = new Blob([JSON.stringify(timeline, null, 2)], { type: 'application/json' });
+    const conversationBase64 = bytesToBase64(new Uint8Array(await conversation.arrayBuffer()));
+    const status =
+      publicationStatus === 'publishable'
+        ? 'ready'
+        : publicationStatus === 'needs-review'
+          ? 'review'
+          : 'failed';
+    const response = await fetch('/api/recordings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        masterBase64,
+        conversationBase64,
+        status,
+        mimeTypes: {
+          master: master.type || 'audio/webm',
+          conversation: 'application/json',
+        },
+        metadata: {
+          recordingId,
+          publicationStatus,
+          turnLogEntries: timeline.length,
+        },
+      }),
+    });
+    if (!response.ok) throw new Error(`Recording archive persistence failed (${response.status})`);
+    return response.json() as Promise<{ id: string; status: 'ready' | 'review' | 'failed' }>;
+  };
+
   const resampleTo16kPcm = (input: Float32Array, inputRate: number) => {
     const targetRate = 16000;
     if (!input.length) return new Uint8Array();
@@ -2050,7 +2087,7 @@ export function JerryPodcastStudio() {
       const options: MediaRecorderOptions = chosenMime ? { mimeType: chosenMime } : {};
       const mediaRecorder = new MediaRecorder(streamToRecord, options);
       const actualMime = mediaRecorder.mimeType || chosenMime || 'audio/webm';
-      const recordingOutbox = await createRecordingOutbox({ episodeId: episodeIdRef.current || undefined });
+      const recordingOutbox = await createRecordingOutbox({ episodeId });
       recordingOutboxRef.current = recordingOutbox;
       recordingIdRef.current = recordingOutbox.episodeId;
       const extension = actualMime.includes('mp4')
@@ -2162,6 +2199,18 @@ export function JerryPodcastStudio() {
               publicationStatus: finalized.publicationStatus,
               processingMs: finalized.processingMs,
               warnings: finalized.warnings.join(' | ').slice(0, 500),
+            });
+            const archive = await persistRecordingArchive(
+              recordingId,
+              finalized.finalMaster,
+              finalized.publicationStatus,
+              [...turnLogRef.current],
+            );
+            emitRecordingDebugEvent('recording-archive-persisted', {
+              recordingId,
+              archiveId: archive.id,
+              archiveStatus: archive.status,
+              publicationStatus: finalized.publicationStatus,
             });
             emitRecordingDebugEvent('recording-finalized', {
               publicationStatus: finalized.publicationStatus,
