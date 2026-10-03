@@ -1,3 +1,5 @@
+import type { JerryCharacterStateUpdate } from './characterState';
+
 export type SlowBrainSpeaker = 'human' | 'jerry';
 
 export type SlowBrainSignalType =
@@ -22,6 +24,7 @@ export interface SlowBrainObservation {
   suggestedMove: string;
   confidence: number;
   expiresAfterTurns: number;
+  stateUpdate?: JerryCharacterStateUpdate;
 }
 
 export interface SlowBrainAnalyzer {
@@ -55,6 +58,28 @@ If the note is stale or irrelevant, ignore it.
 
 function cleanText(value: unknown, max = 600): string {
   return typeof value === 'string' ? value.trim().slice(0, max) : '';
+}
+
+function parseStateUpdate(value: unknown): JerryCharacterStateUpdate | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as Record<string, unknown>;
+  const update: JerryCharacterStateUpdate = {};
+
+  const assignString = (key: keyof JerryCharacterStateUpdate, source: unknown, max = 260) => {
+    const cleaned = cleanText(source, max);
+    if (cleaned) (update as Record<string, unknown>)[key] = cleaned;
+  };
+  assignString('belief', raw.belief);
+  assignString('currentHypothesis', raw.currentHypothesis ?? raw.current_hypothesis);
+  assignString('unresolvedCuriosity', raw.unresolvedCuriosity ?? raw.unresolved_curiosity);
+  assignString('resolvedCuriosity', raw.resolvedCuriosity ?? raw.resolved_curiosity);
+  assignString('lastCorrection', raw.lastCorrection ?? raw.last_correction);
+  assignString('relationshipNote', raw.relationshipNote ?? raw.relationship_note);
+  assignString('emotionalStance', raw.emotionalStance ?? raw.emotional_stance, 120);
+  assignString('callbackCandidate', raw.callbackCandidate ?? raw.callback_candidate);
+  assignString('clearCallback', raw.clearCallback ?? raw.clear_callback);
+
+  return Object.keys(update).length ? update : undefined;
 }
 
 export function parseSlowBrainObservation(raw: string): SlowBrainObservation | null {
@@ -102,6 +127,7 @@ export function parseSlowBrainObservation(raw: string): SlowBrainObservation | n
     suggestedMove,
     confidence,
     expiresAfterTurns,
+    stateUpdate: parseStateUpdate(parsed.stateUpdate ?? parsed.state_update),
   };
 }
 
@@ -132,6 +158,9 @@ Rules:
 - Prefer exact short evidence from the transcript.
 - Do not suggest a speech, insight, or conclusion. Suggest one conversational move.
 - Most windows should return NO_SIGNAL. Only surface something genuinely worth revisiting.
+- You may also propose a SMALL Jerry state update, but only when directly supported by the conversation.
+- State is Jerry's working continuity, not a profile of the guest. Never infer personality, motive, diagnosis, or private facts.
+- Prefer one state field over filling many fields. Leave stateUpdate out when nothing genuinely changed.
 - Hebrew and English technical terms may be mixed. Preserve the meaning.
 - Return JSON only.
 
@@ -145,7 +174,18 @@ Otherwise:
   "note":"factual tension or observation, without verdict",
   "suggestedMove":"one short move/question Jerry could use later",
   "confidence":0.0,
-  "expiresAfterTurns":3
+  "expiresAfterTurns":3,
+  "stateUpdate":{
+    "belief":"optional working belief",
+    "currentHypothesis":"optional provisional theory",
+    "unresolvedCuriosity":"optional question Jerry still holds",
+    "resolvedCuriosity":"optional exact curiosity to clear",
+    "lastCorrection":"optional place Jerry was corrected or changed his mind",
+    "relationshipNote":"optional interaction-specific continuity with Itay",
+    "emotionalStance":"optional Jerry stance such as curious, amused, uncertain",
+    "callbackCandidate":"optional detail worth revisiting later",
+    "clearCallback":"optional exact callback to clear"
+  }
 }
 
 Conversation window:
