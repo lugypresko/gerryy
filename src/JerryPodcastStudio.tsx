@@ -2111,6 +2111,7 @@ export function JerryPodcastStudio() {
       };
 
       mediaRecorder.ondataavailable = (e) => {
+        if (e.data?.size) recordedChunksRef.current.push(e.data);
         console.info('[Podcast Recorder] dataavailable', { size: e.data?.size || 0, type: e.data?.type });
         sendDebugEvent('recording-data', 'recording', { size: e.data?.size || 0, type: e.data?.type });
       };
@@ -2138,9 +2139,15 @@ export function JerryPodcastStudio() {
             sendDebugEvent('recording-levels', 'recording', recordingTelemetryDetails(finalMetrics, finalPublicationStatus));
           }
           sendDebugEvent('recording-publication', 'recording', { publicationStatus: finalPublicationStatus });
-          const blob = recordingSessionRef.current
+          const sessionBlob = recordingSessionRef.current
             ? await recordingSessionRef.current.stopAndCollect()
-            : new Blob(recordedChunksRef.current, { type: actualMime });
+            : new Blob([], { type: actualMime });
+          // MediaRecorder's final dataavailable event is also mirrored into
+          // recordedChunksRef. If a browser fires stop before the session listener
+          // observes its final chunk, preserve the shadow recording instead of
+          // publishing a zero-byte blob.
+          const fallbackBlob = new Blob(recordedChunksRef.current, { type: actualMime });
+          const blob = sessionBlob.size > 0 ? sessionBlob : fallbackBlob;
           console.info('[Podcast Recorder] finalized', {
             chunks: recordedChunksRef.current.length,
             blobSize: blob.size,
