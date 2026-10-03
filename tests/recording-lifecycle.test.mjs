@@ -102,3 +102,25 @@ test('finalize waits behind an in-flight STOP control message', async () => {
   }`);
   assert.deepEqual(result, { stopFinished: true, state: 'finalized' });
 });
+
+
+test('canonical stop boundary is established only after Jerry capture is frozen and drained', () => {
+  const stopBlock = serverSource.match(/msg\.type === 'recording-stop-request'[\s\S]*?msg\.type === 'recording-finalize'/)?.[0] || '';
+  const freeze = stopBlock.indexOf("await finalizeJerryPcmCapture('recording-stop-request')");
+  const drain = stopBlock.indexOf('await canonicalAppendQueue');
+  const boundary = stopBlock.indexOf('canonicalCaptureStore.requestStop');
+  assert.ok(freeze >= 0, 'Jerry capture should freeze on stop request');
+  assert.ok(drain > freeze, 'canonical append queue should drain after Jerry capture freezes');
+  assert.ok(boundary > drain, 'canonical stop boundary should be written only after queued audio drains');
+});
+
+test('client debug events do not control server recording lifecycle', () => {
+  assert.doesNotMatch(serverSource, /clientEvent === 'recording-start-request'[\s\S]{0,250}startJerryPcmCapture/);
+  assert.doesNotMatch(serverSource, /msg\.event\.trim\(\) === 'recording-stop-request'[\s\S]{0,250}finalizeJerryPcmCapture/);
+});
+
+test('canonical Jerry chunks keep their capture-time timestamp while queued', () => {
+  assert.match(serverSource, /captureAtMs:\s*Date\.now\(\)/);
+  assert.match(serverSource, /captureStartMs:\s*captured\.captureAtMs/);
+  assert.match(serverSource, /captureEndMs:\s*captured\.captureAtMs/);
+});
