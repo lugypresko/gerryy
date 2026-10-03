@@ -1439,6 +1439,7 @@ CRITICAL RULES:
     let aiClient: GoogleGenAI | null = null;
     let guestPcmChunks: Buffer[] = [];
     let guestTurnId = 0;
+    let lastClientAudioUnderruns = 0;
     let guestTurnState: 'idle' | 'capturing' | 'committed' | 'sent_to_live' | 'response_started' | 'response_complete' = 'idle';
     let guestTurnStartedAt = 0;
     let guestAudioChunkCount = 0;
@@ -2220,7 +2221,9 @@ CRITICAL RULES:
             const eventLoopLagMs = Number((details as Record<string, unknown>).eventLoopLagMs) || 0;
             const maxLongTaskMs = Number((details as Record<string, unknown>).maxLongTaskMs) || 0;
             const audioUnderruns = Number((details as Record<string, unknown>).audioUnderruns) || 0;
-            const degraded = eventLoopLagMs > 150 || maxLongTaskMs > 200 || audioUnderruns > 0;
+            const newAudioUnderruns = Math.max(0, audioUnderruns - lastClientAudioUnderruns);
+            lastClientAudioUnderruns = audioUnderruns;
+            const degraded = eventLoopLagMs > 150 || maxLongTaskMs > 200 || newAudioUnderruns > 0;
             healthRecord('client_runtime', 'runtime_sample', degraded ? 'degraded' : 'healthy', {
               ...(degraded
                 ? {
@@ -2232,6 +2235,7 @@ CRITICAL RULES:
                 eventLoopLagMs,
                 maxLongTaskMs,
                 audioUnderruns,
+                newAudioUnderruns,
                 heapUsedMb: Number((details as Record<string, unknown>).heapUsedMb) || 0,
                 audioQueueMs: Number((details as Record<string, unknown>).audioQueueMs) || 0,
               },
