@@ -149,6 +149,9 @@ export function JerryPodcastStudio() {
   const [isLiveReady, setIsLiveReady] = useState(false);
   const [isPcmDebugRecording, setIsPcmDebugRecording] = useState(false);
   const [pcmDebugAudioUrl, setPcmDebugAudioUrl] = useState<string | null>(null);
+  const [isSmokeRecording, setIsSmokeRecording] = useState(false);
+  const [smokeRecordingUrl, setSmokeRecordingUrl] = useState<string | null>(null);
+  const [smokeRecordingNotice, setSmokeRecordingNotice] = useState<string | null>(null);
   const messagesRef = useRef<PodcastMessage[]>(messages);
 
   useEffect(() => {
@@ -165,6 +168,10 @@ export function JerryPodcastStudio() {
 
   // Mixer refs for recording both Mic + Jerry
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const smokeMediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const smokeStreamRef = useRef<MediaStream | null>(null);
+  const smokeChunksRef = useRef<Blob[]>([]);
+  const smokeAutoStopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recordingSessionRef = useRef<RecordingSession | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const jerryTrackRecorderRef = useRef<MediaRecorder | null>(null);
@@ -689,6 +696,97 @@ export function JerryPodcastStudio() {
       return navigator.mediaDevices.getUserMedia({ audio: baseAudio });
     }
   }, [selectedAudioInputId, sendDebugEvent]);
+
+  const runRecordingSmokeTest = useCallback(async () => {
+    if (isSmokeRecording) {
+      if (smokeMediaRecorderRef.current?.state === 'recording') {
+        smokeMediaRecorderRef.current.stop();
+      }
+      return;
+    }
+
+    setSmokeRecordingNotice('בדיקת שמירה: מקליט 10 שניות...');
+    setSmokeRecordingUrl(null);
+
+    try {
+      const stream = await acquireMicrophoneStream();
+      smokeStreamRef.current = stream;
+      smokeChunksRef.current = [];
+
+      const preferredMime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']
+        .find((mime) => MediaRecorder.isTypeSupported(mime));
+      const recorder = new MediaRecorder(stream, preferredMime ? { mimeType: preferredMime } : undefined);
+      smokeMediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data?.size) smokeChunksRef.current.push(event.data);
+      };
+
+      recorder.onerror = (event: any) => {
+        setSmokeRecordingNotice(`בדיקת שמירה נכשלה: ${event?.error?.message || 'MediaRecorder error'}`);
+        sendDebugEvent('recording-smoke-error', 'recording', {
+          message: event?.error?.message || event?.error?.name || 'MediaRecorder error',
+        });
+      };
+
+      recorder.onstop = async () => {
+        if (smokeAutoStopRef.current) {
+          clearTimeout(smokeAutoStopRef.current);
+          smokeAutoStopRef.current = null;
+        }
+        setIsSmokeRecording(false);
+        const mimeType = recorder.mimeType || preferredMime || 'audio/webm';
+        const blob = new Blob(smokeChunksRef.current, { type: mimeType });
+        smokeStreamRef.current?.getTracks().forEach((track) => track.stop());
+        smokeStreamRef.current = null;
+        smokeMediaRecorderRef.current = null;
+
+        if (blob.size === 0) {
+          setSmokeRecordingNotice('בדיקת שמירה נכשלה: התקבל קובץ ריק.');
+          sendDebugEvent('recording-smoke-empty', 'recording', {});
+          return;
+        }
+
+        try {
+          const response = await fetch('/api/recording-smoke', {
+            method: 'POST',
+            headers: { 'Content-Type': mimeType },
+            body: blob,
+          });
+          const result = await response.json();
+          if (!response.ok || !result?.playbackUrl) {
+            throw new Error(result?.error || 'smoke upload failed');
+          }
+          const playbackUrl = `${result.playbackUrl}?t=${Date.now()}`;
+          setSmokeRecordingUrl(playbackUrl);
+          setSmokeRecordingNotice(`נשמרו ${Math.round(result.bytes / 1024)}KB. לחץ Play כדי לוודא שאפשר לשמוע.`);
+          sendDebugEvent('recording-smoke-saved', 'recording', {
+            id: result.id,
+            bytes: result.bytes,
+            playbackUrl: result.playbackUrl,
+          });
+        } catch (error: any) {
+          setSmokeRecordingNotice(`בדיקת שמירה נכשלה: ${error?.message || 'לא ניתן לשמור את הקובץ'}`);
+          sendDebugEvent('recording-smoke-upload-error', 'recording', { message: error?.message || '' });
+        }
+      };
+
+      recorder.start(250);
+      setIsSmokeRecording(true);
+      sendDebugEvent('recording-smoke-started', 'recording', { mimeType: recorder.mimeType || preferredMime || '' });
+      smokeAutoStopRef.current = setTimeout(() => {
+        if (smokeMediaRecorderRef.current?.state === 'recording') {
+          smokeMediaRecorderRef.current.stop();
+        }
+      }, 10000);
+    } catch (error: any) {
+      setIsSmokeRecording(false);
+      smokeStreamRef.current?.getTracks().forEach((track) => track.stop());
+      smokeStreamRef.current = null;
+      setSmokeRecordingNotice(`בדיקת שמירה נכשלה: ${error?.message || 'לא ניתן לפתוח מיקרופון'}`);
+      sendDebugEvent('recording-smoke-setup-error', 'recording', { message: error?.message || '' });
+    }
+  }, [acquireMicrophoneStream, isSmokeRecording, sendDebugEvent]);
 
   const startLiveMic = useCallback(async () => {
     if (!isLiveReady || liveSocketRef.current?.readyState !== WebSocket.OPEN) return;
@@ -2684,6 +2782,13 @@ export function JerryPodcastStudio() {
             </div>
           )}
 
+          {smokeRecordingNotice && (
+            <div className="text-[11px] bg-sky-950/60 text-sky-200 border border-sky-800/60 rounded-[6px] px-3 py-2 flex flex-col gap-2">
+              <span>{smokeRecordingNotice}</span>
+              {smokeRecordingUrl && <audio controls preload="metadata" src={smokeRecordingUrl} className="w-full h-8" />}
+            </div>
+          )}
+
           <div className="flex items-center justify-between bg-[#232321] p-2.5 rounded-[10px] border border-[#383835] flex-wrap gap-2">
             <div className="flex items-center gap-2.5">
                   {audioInputDevices.length > 0 && (
@@ -2726,6 +2831,15 @@ export function JerryPodcastStudio() {
                   <span>REC {formatTime(recordingSeconds)}</span>
                 </div>
               )}
+
+              <button
+                onClick={runRecordingSmokeTest}
+                disabled={isEpisodeRecording}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-[6px] text-[11px] font-semibold bg-sky-950/70 hover:bg-sky-900/80 text-sky-200 border border-sky-800/70 disabled:opacity-40 disabled:cursor-not-allowed"
+                title="מקליט 10 שניות מהמיקרופון, שומר לשרת המקומי ומאפשר Play"
+              >
+                <span>{isSmokeRecording ? 'עצור בדיקת שמירה' : 'בדיקת שמירה 10 שנ׳'}</span>
+              </button>
 
               {(isEpisodeRecording || episodeAudioUrl) && (
                 <div className={`text-[11px] rounded-[6px] px-3 py-1.5 border ${
