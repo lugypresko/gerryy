@@ -167,3 +167,21 @@ test('live conversation and episode recording share resilient microphone acquisi
   const calls = studio.match(/acquireMicrophoneStream\(\)/g) || [];
   assert.ok(calls.length >= 2, 'live and recording paths should both use the resilient mic helper');
 });
+
+
+test('recording smoke test persists a non-empty browser recording and exposes playback', () => {
+  const studio = fs.readFileSync('src/JerryPodcastStudio.tsx', 'utf8');
+  const server = fs.readFileSync('server.ts', 'utf8');
+
+  assert.match(studio, /runRecordingSmokeTest/);
+  assert.match(studio, /recorder\.start\(250\)/);
+  assert.match(studio, /setTimeout\([\s\S]*?10000\)/);
+  assert.match(studio, /fetch\('\/api\/recording-smoke'/);
+  assert.match(studio, /<audio controls preload="metadata" src=\{smokeRecordingUrl\}/);
+
+  assert.match(server, /app\.post\('\/api\/recording-smoke'/);
+  assert.match(server, /recording_smoke_empty/);
+  assert.match(server, /fs\.writeFileSync\(filePath, body\)/);
+  assert.match(server, /app\.get\('\/api\/recording-smoke\/:id'/);
+  assert.match(server, /createReadStream\(filePath\)\.pipe\(res\)/);
+});
