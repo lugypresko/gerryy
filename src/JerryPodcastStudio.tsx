@@ -660,6 +660,36 @@ export function JerryPodcastStudio() {
     setIsRecordingMic(false);
   }, [endRecordedTurn, sendDebugEvent]);
 
+  const acquireMicrophoneStream = useCallback(async () => {
+    const baseAudio = { ...MICROPHONE_CAPTURE_CONSTRAINTS };
+    if (!selectedAudioInputId) {
+      return navigator.mediaDevices.getUserMedia({ audio: baseAudio });
+    }
+
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        audio: {
+          ...baseAudio,
+          deviceId: { exact: selectedAudioInputId },
+        },
+      });
+    } catch (error: any) {
+      const recoverable =
+        error?.name === 'OverconstrainedError' ||
+        error?.name === 'NotFoundError' ||
+        error?.name === 'DevicesNotFoundError';
+      if (!recoverable) throw error;
+
+      sendDebugEvent('mic-device-fallback', 'mic', {
+        requestedDeviceId: selectedAudioInputId,
+        errorName: error?.name || 'unknown',
+        message: error?.message || '',
+      });
+      setSelectedAudioInputId('');
+      return navigator.mediaDevices.getUserMedia({ audio: baseAudio });
+    }
+  }, [selectedAudioInputId, sendDebugEvent]);
+
   const startLiveMic = useCallback(async () => {
     if (!isLiveReady || liveSocketRef.current?.readyState !== WebSocket.OPEN) return;
 
@@ -693,12 +723,7 @@ export function JerryPodcastStudio() {
         } catch {}
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          ...MICROPHONE_CAPTURE_CONSTRAINTS,
-          ...(selectedAudioInputId ? { deviceId: { exact: selectedAudioInputId } } : {}),
-        },
-      });
+      const stream = await acquireMicrophoneStream();
       if (requestId !== getUserMediaRequestRef.current || !liveMicActiveRef.current) {
         stream.getTracks().forEach((track) => track.stop());
         return;
@@ -1959,12 +1984,7 @@ export function JerryPodcastStudio() {
           episodeOwnsMicRef.current = false;
           console.info('[Podcast Recorder] reusing live conversation microphone');
         } else {
-          micStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              ...MICROPHONE_CAPTURE_CONSTRAINTS,
-              ...(selectedAudioInputId ? { deviceId: { exact: selectedAudioInputId } } : {}),
-            },
-          });
+          micStream = await acquireMicrophoneStream();
           episodeOwnsMicRef.current = true;
         }
 
