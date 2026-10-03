@@ -839,7 +839,7 @@ async function startServer() {
   // Temporary GPT-Live-1 spike. Deliberately isolated from the production Jerry path.
   // Purpose: answer one question quickly — does GPT-Live-1 sound more naturally conversational?
   app.get('/openai-live-spike', (_req, res) => {
-    res.type('html').send(\`<!doctype html>
+    res.type('html').send(`<!doctype html>
 <html lang="he" dir="rtl">
 <head>
   <meta charset="utf-8" />
@@ -973,7 +973,7 @@ async function startServer() {
 })();
 </script>
 </body>
-</html>\`);
+</html>`);
   });
 
   app.post('/api/openai-live-spike/session', async (req, res) => {
@@ -991,7 +991,7 @@ async function startServer() {
       const openaiResponse = await fetch('https://api.openai.com/v1/live/sessions', {
         method: 'POST',
         headers: {
-          Authorization: \`Bearer \${apiKey}\`,
+          Authorization: `Bearer \${apiKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
@@ -1008,7 +1008,7 @@ async function startServer() {
 
       const payload: any = await openaiResponse.json().catch(() => null);
       if (!openaiResponse.ok) {
-        const message = payload?.error?.message || payload?.message || \`OpenAI Live HTTP \${openaiResponse.status}\`;
+        const message = payload?.error?.message || payload?.message || `OpenAI Live HTTP \${openaiResponse.status}`;
         return res.status(openaiResponse.status).json({ error: message });
       }
 
