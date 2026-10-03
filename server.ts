@@ -26,6 +26,11 @@ import {
   type SlowBrainTurn,
 } from './server/slowBrain';
 import {
+  JerryCharacterState,
+  formatJerryCharacterState,
+  JERRY_CHARACTER_STATE_INSTRUCTION,
+} from './server/characterState';
+import {
   JerryHealthRegistry,
   type JerryHealthComponent,
   type JerryHealthState,
@@ -1455,6 +1460,8 @@ CRITICAL RULES:
     let jerryCaptureSequence = 0;
     let jerryCaptureFinalization: Promise<void> | null = null;
     let slowBrain: SlowBrainObserver | null = null;
+    const characterState = new JerryCharacterState();
+    let lastCharacterStateInjectedRevision = -1;
     let currentJerryTranscript = '';
     const conversationStartedAt = Date.now();
 
@@ -1469,6 +1476,22 @@ CRITICAL RULES:
       if (!slowBrain) return;
       void slowBrain.kick().then((observation) => {
         if (!observation) return;
+        if (observation.confidence >= 0.62 && observation.stateUpdate) {
+          const snapshot = characterState.apply(observation.stateUpdate);
+          recordJerryDebug('character-state-updated', {
+            connectionId,
+            revision: snapshot.revision,
+            update: observation.stateUpdate,
+            currentHypothesis: snapshot.currentHypothesis,
+            unresolvedCuriosities: snapshot.unresolvedCuriosities,
+            callbackCandidates: snapshot.callbackCandidates,
+          });
+          void appendCanonicalEvent('conversation-event', {
+            event: 'character-state-updated',
+            revision: snapshot.revision,
+            update: observation.stateUpdate,
+          });
+        }
         healthRecord('slow_brain', 'observation_ready', 'healthy', {
           details: { type: observation.type, confidence: observation.confidence },
         });
@@ -1527,6 +1550,31 @@ CRITICAL RULES:
         state,
         ...details,
       });
+    };
+
+    const injectCharacterState = (turnId: number) => {
+      if (!characterState.hasContent()) return null;
+      const snapshot = characterState.snapshot();
+      if (snapshot.revision === lastCharacterStateInjectedRevision) return snapshot;
+      liveSession?.sendClientContent({
+        turns: [{ role: 'user', parts: [{ text: formatJerryCharacterState(snapshot) }] }],
+        turnComplete: false,
+      });
+      lastCharacterStateInjectedRevision = snapshot.revision;
+      recordJerryDebug('character-state-injected', {
+        connectionId,
+        turnId,
+        revision: snapshot.revision,
+        currentHypothesis: snapshot.currentHypothesis,
+        unresolvedCuriosities: snapshot.unresolvedCuriosities,
+        callbackCandidates: snapshot.callbackCandidates,
+      });
+      void appendCanonicalEvent('conversation-event', {
+        event: 'character-state-injected',
+        turnId,
+        revision: snapshot.revision,
+      });
+      return snapshot;
     };
 
     const injectPendingSlowBrainObservation = (turnId: number) => {
@@ -1978,7 +2026,7 @@ CRITICAL RULES:
             },
           },
           systemInstruction: buildJerryLanguagePrompt(
-            `${JERRY_LIVE_SYSTEM_PROMPT}\n\n${SLOW_BRAIN_FAST_BRAIN_INSTRUCTION}`,
+            `${JERRY_LIVE_SYSTEM_PROMPT}\n\n${SLOW_BRAIN_FAST_BRAIN_INSTRUCTION}\n\n${JERRY_CHARACTER_STATE_INSTRUCTION}`,
           ),
         },
       });
@@ -2307,6 +2355,7 @@ CRITICAL RULES:
             // A note discovered from earlier closed turns is private context for
             // the next turn. Inject it before audio begins, never after the user
             // has already committed the current audio turn.
+            injectCharacterState(guestTurnId);
             injectPendingSlowBrainObservation(guestTurnId);
             liveSession?.sendRealtimeInput({ activityStart: {} });
           }
@@ -2487,6 +2536,7 @@ CRITICAL RULES:
             // In direct-audio mode the transcript is evidence for the observer,
             // not conversational input for the Fast Brain.
             if (!CONVERSATION_AUDIO_INPUT) {
+              injectCharacterState(completedTurnId);
               injectPendingSlowBrainObservation(completedTurnId);
               liveSession?.sendClientContent({
                 turns: [{ role: 'user', parts: [{ text: finalTranscript }] }],
