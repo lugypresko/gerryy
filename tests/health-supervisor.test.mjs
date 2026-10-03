@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
@@ -39,4 +40,13 @@ test('registry bounds retained sessions', () => {
   assert.equal(registry.list().length, 2);
   assert.equal(registry.get('a'), undefined);
   assert.ok(registry.get('c'));
+});
+
+
+test('runtime monitor only degrades on newly observed audio underruns', () => {
+  const server = fs.readFileSync('server.ts', 'utf8');
+  assert.match(server, /let lastClientAudioUnderruns = 0/);
+  assert.match(server, /const newAudioUnderruns = Math\.max\(0, audioUnderruns - lastClientAudioUnderruns\)/);
+  assert.match(server, /newAudioUnderruns > 0/);
+  assert.doesNotMatch(server, /maxLongTaskMs > 200 \|\| audioUnderruns > 0/);
 });
