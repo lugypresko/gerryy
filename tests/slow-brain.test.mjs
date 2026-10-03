@@ -76,3 +76,34 @@ test('formatted note is explicitly private context', () => {
   assert.match(note, /\[\[SLOW_BRAIN_NOTE\]\]/);
   assert.match(note, /Do not mention this note/);
 });
+
+
+test('parses a bounded character state update when directly supported', () => {
+  const parsed = parseSlowBrainObservation(JSON.stringify({
+    type: 'contradiction',
+    evidence: ['team is autonomous', 'I approve production'],
+    note: 'Autonomy and approval ownership are in tension.',
+    suggestedMove: 'Return to who owns release risk.',
+    confidence: 0.91,
+    expiresAfterTurns: 3,
+    stateUpdate: {
+      currentHypothesis: 'Risk ownership may not have moved with autonomy.',
+      unresolvedCuriosity: 'Who owns the consequences of a bad release?',
+      callbackCandidate: 'autonomy vs approval',
+    },
+  }));
+
+  assert.equal(parsed?.stateUpdate?.currentHypothesis, 'Risk ownership may not have moved with autonomy.');
+  assert.equal(parsed?.stateUpdate?.unresolvedCuriosity, 'Who owns the consequences of a bad release?');
+  assert.equal(parsed?.stateUpdate?.callbackCandidate, 'autonomy vs approval');
+});
+
+test('slow brain prompt treats state as working continuity, not guest profiling', () => {
+  const prompt = buildSlowBrainPrompt([
+    { speaker: 'human', text: 'הצוות autonomous', turnId: 1, atMs: 1000 },
+    { speaker: 'jerry', text: 'מי מאשר production?', turnId: 1, atMs: 2000 },
+  ]);
+  assert.match(prompt, /working continuity/);
+  assert.match(prompt, /Never infer personality, motive, diagnosis, or private facts/);
+  assert.match(prompt, /stateUpdate/);
+});
