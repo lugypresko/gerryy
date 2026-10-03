@@ -24,3 +24,14 @@ test('studio has one explicit recording-session owner', () => {
   assert.match(studio, /createRecordingSession/);
   assert.match(studio, /recordingSessionRef/);
 });
+
+
+test('studio mirrors MediaRecorder data into a shadow chunk buffer', () => {
+  assert.match(studio, /mediaRecorder\.ondataavailable[\s\S]*?recordedChunksRef\.current\.push\(e\.data\)/);
+});
+
+test('studio falls back to the shadow blob if session collection is empty', () => {
+  assert.match(studio, /const sessionBlob =[\s\S]*?stopAndCollect\(\)/);
+  assert.match(studio, /const fallbackBlob = new Blob\(recordedChunksRef\.current/);
+  assert.match(studio, /sessionBlob\.size > 0 \? sessionBlob : fallbackBlob/);
+});
